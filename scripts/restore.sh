@@ -130,13 +130,14 @@ done <<<"${device_listing}"
 chown retailprintguard-worker:retailprintguard-spool "${RPG_ARCHIVE_ROOT}"
 chmod 2770 "${RPG_ARCHIVE_ROOT}"
 
-[[ -x "${RPG_CURRENT_LINK}/.venv/bin/alembic" ]] || rpg_die "installed Alembic is missing"
+[[ -x "${RPG_CURRENT_LINK}/.venv/bin/python" ]] || rpg_die "installed Python is missing"
 # The restored application account remains local and retains its database-level grant.
 database_url="$(awk -F= '$1 == "RPG_DATABASE_URL" {print substr($0, index($0, "=") + 1)}' \
     "${RPG_DATABASE_ENV}")"
 [[ -n "${database_url}" ]] || rpg_die "RPG_DATABASE_URL is missing from database.env"
 export RPG_DATABASE_URL="${database_url}"
-"${RPG_CURRENT_LINK}/.venv/bin/alembic" -c "${RPG_CURRENT_LINK}/alembic.ini" upgrade head
+"${RPG_CURRENT_LINK}/.venv/bin/python" -m alembic \
+    -c "${RPG_CURRENT_LINK}/alembic.ini" upgrade head
 unset RPG_DATABASE_URL
 
 for service in retailprintguard-ingestion.service retailprintguard-parser.service \

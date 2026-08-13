@@ -175,31 +175,47 @@ release_path="${RPG_RELEASES_DIR}/${release_hash}"
 rpg_assert_managed_path "${release_path}"
 
 if [[ ! -d "${release_path}" ]]; then
-    stage="$(mktemp -d "${RPG_RELEASES_DIR}/.stage.XXXXXXXX")"
-    cleanup_stage() { rm -rf -- "${stage}"; }
-    trap cleanup_stage EXIT
+    # Virtualenv console scripts contain absolute shebangs and cannot be
+    # relocated safely. Build at the final content-addressed path; the global
+    # installer lock and .release-complete marker keep it unpublished until
+    # construction succeeds, while the trap removes incomplete releases.
+    install -d -m 0755 -o root -g root -- "${release_path}"
+    cleanup_release() { rm -rf -- "${release_path}"; }
+    trap cleanup_release EXIT
     rsync -a \
         --exclude=.git --exclude=.venv --exclude=.pytest_cache --exclude=.ruff_cache \
         --exclude=node_modules --exclude=__pycache__ --exclude='*.pyc' \
-        --exclude=alembic_autogen.db -- "${SOURCE_ROOT}/" "${stage}/"
-    python3 -m venv "${stage}/.venv"
-    if [[ -f "${stage}/requirements/production.lock" && \
-          -f "${stage}/requirements/build.lock" ]]; then
-        "${stage}/.venv/bin/pip" install --require-hashes \
-            -r "${stage}/requirements/build.lock"
-        "${stage}/.venv/bin/pip" install --require-hashes \
-            -r "${stage}/requirements/production.lock"
-        "${stage}/.venv/bin/pip" install --no-deps --no-build-isolation "${stage}"
+        --exclude=alembic_autogen.db -- "${SOURCE_ROOT}/" "${release_path}/"
+    python3 -m venv "${release_path}/.venv"
+    if [[ -f "${release_path}/requirements/production.lock" && \
+          -f "${release_path}/requirements/build.lock" ]]; then
+        "${release_path}/.venv/bin/pip" install --require-hashes \
+            -r "${release_path}/requirements/build.lock"
+        "${release_path}/.venv/bin/pip" install --require-hashes \
+            -r "${release_path}/requirements/production.lock"
+        "${release_path}/.venv/bin/pip" install --no-deps --no-build-isolation \
+            "${release_path}"
     elif [[ "${allow_unlocked}" == yes ]]; then
         rpg_note "WARNING: installing unpinned dependencies by explicit request"
-        "${stage}/.venv/bin/pip" install "${stage}"
+        "${release_path}/.venv/bin/pip" install "${release_path}"
     else
         rpg_die "requirements/build.lock or production.lock is missing; refusing an unreproducible install"
     fi
-    chmod 0755 "${stage}"/scripts/*.sh "${stage}/scripts/validate_site_config.py"
-    touch "${stage}/.release-complete"
-    chmod -R go-w "${stage}"
-    mv -- "${stage}" "${release_path}"
+    for entrypoint in alembic retailprintguard-api retailprintguard-correlate \
+        retailprintguard-fraud retailprintguard-ingestion retailprintguard-parser \
+        retailprintguard-proxy; do
+        entrypoint_path="${release_path}/.venv/bin/${entrypoint}"
+        [[ -x "${entrypoint_path}" ]] || rpg_die "installed entrypoint is missing: ${entrypoint}"
+        IFS= read -r entrypoint_shebang <"${entrypoint_path}"
+        case "${entrypoint_shebang}" in
+            "#!${release_path}/.venv/bin/python"|"#!${release_path}/.venv/bin/python3") ;;
+            *) rpg_die "installed entrypoint has a non-final shebang: ${entrypoint}" ;;
+        esac
+    done
+    chmod 0755 "${release_path}"/scripts/*.sh \
+        "${release_path}/scripts/validate_site_config.py"
+    touch "${release_path}/.release-complete"
+    chmod -R go-w "${release_path}"
     trap - EXIT
 else
     [[ -f "${release_path}/.release-complete" ]] || \
@@ -296,7 +312,8 @@ GRANT ALL PRIVILEGES ON ${RPG_DATABASE_NAME}.*
 FLUSH PRIVILEGES;
 SQL
 RPG_DATABASE_URL="mysql+pymysql://retailprintguard_migrate:${migration_password}@127.0.0.1:3306/${RPG_DATABASE_NAME}?charset=utf8mb4" \
-    "${release_path}/.venv/bin/alembic" -c "${release_path}/alembic.ini" upgrade head
+    "${release_path}/.venv/bin/python" -m alembic \
+        -c "${release_path}/alembic.ini" upgrade head
 cleanup_migration_user
 trap - EXIT
 

@@ -100,8 +100,8 @@ def test_installer_never_mutates_host_networking_and_requires_site_validation() 
     assert "--require-assigned-listeners" in install
     assert "requirements/production.lock" in install
     assert "requirements/build.lock" in install
-    assert install.index('-r "${stage}/requirements/build.lock"') < install.index(
-        '-r "${stage}/requirements/production.lock"'
+    assert install.index('-r "${release_path}/requirements/build.lock"') < install.index(
+        '-r "${release_path}/requirements/production.lock"'
     )
     assert 'pip\" install --require-hashes' in install
     build_lock = (ROOT / "requirements" / "build.lock").read_text(encoding="utf-8")
@@ -109,6 +109,15 @@ def test_installer_never_mutates_host_networking_and_requires_site_validation() 
     assert "wheel==0.45.1" in build_lock
     assert build_lock.count("--hash=sha256:") == 3
     assert "--require-hashes" in install
+
+
+def test_virtualenv_is_built_at_final_path_and_entrypoints_are_verified() -> None:
+    install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
+    assert 'python3 -m venv "${release_path}/.venv"' in install
+    assert 'python3 -m venv "${stage}/.venv"' not in install
+    assert 'mv -- "${stage}" "${release_path}"' not in install
+    assert "installed entrypoint has a non-final shebang" in install
+    assert '"${release_path}/.venv/bin/python" -m alembic' in install
 
 
 def test_no_start_stages_without_switching_current_release() -> None:

@@ -5,6 +5,16 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-13
+
+### Fixed
+
+- la virtualenv Debian viene ora costruita direttamente nel percorso definitivo
+  della release content-addressed: gli shebang di Alembic e degli entrypoint
+  systemd non fanno più riferimento alla directory temporanea `.stage.*`;
+- installer e restore invocano Alembic tramite il Python della release e
+  l'installer verifica preventivamente tutti gli entrypoint di servizio.
+
 ## [0.1.5] — 2026-08-13
 
 ### Fixed
