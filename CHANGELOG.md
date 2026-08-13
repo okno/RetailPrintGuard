@@ -5,6 +5,13 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-08-13
+
+### Fixed
+
+- pnpm è fissato alla versione usata dal progetto e `esbuild` è l'unica
+  dipendenza frontend autorizzata a eseguire il proprio script di build.
+
 ## [0.1.2] — 2026-08-13
 
 ### Fixed
