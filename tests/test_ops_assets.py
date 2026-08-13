@@ -118,6 +118,9 @@ def test_virtualenv_is_built_at_final_path_and_entrypoints_are_verified() -> Non
     assert 'mv -- "${stage}" "${release_path}"' not in install
     assert "installed entrypoint has a non-final shebang" in install
     assert '"${release_path}/.venv/bin/python" -m alembic' in install
+    assert 'chmod -R a+rX,go-w "${release_path}"' in install
+    assert 'runuser -u "${service_identity}"' in install
+    assert "release is not executable by" in install
 
 
 def test_no_start_stages_without_switching_current_release() -> None:

@@ -89,7 +89,7 @@ apt-get install -y --no-install-recommends \
     ca-certificates curl gzip iproute2 logrotate mariadb-client mariadb-server \
     nginx openssl python3 python3-pip python3-venv rsync tar util-linux
 
-for command in flock install mariadb openssl python3 rsync sha256sum systemctl; do
+for command in flock install mariadb openssl python3 rsync runuser sha256sum systemctl; do
     rpg_require_command "${command}"
 done
 
@@ -201,6 +201,10 @@ if [[ ! -d "${release_path}" ]]; then
     else
         rpg_die "requirements/build.lock or production.lock is missing; refusing an unreproducible install"
     fi
+    # The installer runs with umask 027, while isolated service identities do
+    # not share root's group. Release code contains no secrets and must be
+    # readable/traversable (but never writable) by those identities.
+    chmod -R a+rX,go-w "${release_path}"
     for entrypoint in alembic retailprintguard-api retailprintguard-correlate \
         retailprintguard-fraud retailprintguard-ingestion retailprintguard-parser \
         retailprintguard-proxy; do
@@ -214,8 +218,13 @@ if [[ ! -d "${release_path}" ]]; then
     done
     chmod 0755 "${release_path}"/scripts/*.sh \
         "${release_path}/scripts/validate_site_config.py"
+    for service_identity in retailprintguard-pos-proxy retailprintguard-rch-proxy; do
+        runuser -u "${service_identity}" -- \
+            "${release_path}/.venv/bin/python" -c \
+            'import retailprintguard; assert retailprintguard.__version__' || \
+            rpg_die "release is not executable by ${service_identity}"
+    done
     touch "${release_path}/.release-complete"
-    chmod -R go-w "${release_path}"
     trap - EXIT
 else
     [[ -f "${release_path}/.release-complete" ]] || \

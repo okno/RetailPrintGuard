@@ -5,6 +5,14 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-08-13
+
+### Fixed
+
+- la release e la virtualenv sono ora leggibili e attraversabili, ma non
+  scrivibili, dagli account systemd isolati; l'installer verifica realmente
+  l'import del package come utenti POS e RCH prima di pubblicare la release.
+
 ## [0.1.6] — 2026-08-13
 
 ### Fixed
