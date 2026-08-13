@@ -99,6 +99,15 @@ def test_installer_never_mutates_host_networking_and_requires_site_validation() 
     assert all(command not in install for command in forbidden)
     assert "--require-assigned-listeners" in install
     assert "requirements/production.lock" in install
+    assert "requirements/build.lock" in install
+    assert install.index('-r "${stage}/requirements/build.lock"') < install.index(
+        '-r "${stage}/requirements/production.lock"'
+    )
+    assert 'pip\" install --require-hashes' in install
+    build_lock = (ROOT / "requirements" / "build.lock").read_text(encoding="utf-8")
+    assert "setuptools==80.9.0" in build_lock
+    assert "wheel==0.45.1" in build_lock
+    assert build_lock.count("--hash=sha256:") == 3
     assert "--require-hashes" in install
 
 

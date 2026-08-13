@@ -5,6 +5,14 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-08-13
+
+### Fixed
+
+- l'installer Debian installa da un lock SHA-256 separato `setuptools`,
+  `wheel` e `packaging` prima del package con `--no-build-isolation`, evitando
+  l'incompatibilità del `setuptools` incluso nella venv Debian 12.
+
 ## [0.1.3] — 2026-08-13
 
 ### Fixed

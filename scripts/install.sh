@@ -183,7 +183,10 @@ if [[ ! -d "${release_path}" ]]; then
         --exclude=node_modules --exclude=__pycache__ --exclude='*.pyc' \
         --exclude=alembic_autogen.db -- "${SOURCE_ROOT}/" "${stage}/"
     python3 -m venv "${stage}/.venv"
-    if [[ -f "${stage}/requirements/production.lock" ]]; then
+    if [[ -f "${stage}/requirements/production.lock" && \
+          -f "${stage}/requirements/build.lock" ]]; then
+        "${stage}/.venv/bin/pip" install --require-hashes \
+            -r "${stage}/requirements/build.lock"
         "${stage}/.venv/bin/pip" install --require-hashes \
             -r "${stage}/requirements/production.lock"
         "${stage}/.venv/bin/pip" install --no-deps --no-build-isolation "${stage}"
@@ -191,7 +194,7 @@ if [[ ! -d "${release_path}" ]]; then
         rpg_note "WARNING: installing unpinned dependencies by explicit request"
         "${stage}/.venv/bin/pip" install "${stage}"
     else
-        rpg_die "requirements/production.lock is missing; refusing an unreproducible install"
+        rpg_die "requirements/build.lock or production.lock is missing; refusing an unreproducible install"
     fi
     chmod 0755 "${stage}"/scripts/*.sh "${stage}/scripts/validate_site_config.py"
     touch "${stage}/.release-complete"

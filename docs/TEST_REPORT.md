@@ -9,7 +9,7 @@ documentazione di provenienza dei repository congelati.
 | Controllo | Ambiente | Risultato |
 |---|---|---|
 | baseline `python -m pytest -q` prima dei worker DB finali | Windows, CPython 3.12.13 | `61 passed, 13 skipped`, 1 warning deprecazione Starlette/httpx; non è il risultato finale della release |
-| `.venv\\Scripts\\python -m pytest -q -p no:cacheprovider` sul monorepo `0.1.3` prima della pubblicazione | Windows, CPython 3.12.13 | `92 passed, 14 skipped`, 1 warning Starlette/httpx; gate rieseguito dopo l'hardening dell'handover di rete |
+| `.venv\\Scripts\\python -m pytest -q -p no:cacheprovider` sul monorepo `0.1.4` prima della pubblicazione | Windows, CPython 3.12.13 | `92 passed, 14 skipped`, 1 warning Starlette/httpx; gate rieseguito dopo l'hardening dell'handover di rete |
 | `.venv\\Scripts\\python -m pytest -q tests/test_parsers.py` | Windows, ambiente virtuale del worktree | `3 passed`; parser puri ESC/POS e RCH |
 | `.venv\\Scripts\\python -m pytest -q tests/test_parser_worker_db.py` | stesso ambiente | `3 passed`; persistenza/idempotenza, response RAW, reparse append-only e failure lifecycle |
 | `.venv\\Scripts\\python -m pytest -q tests/test_analysis_workers.py` | stesso ambiente | `7 passed`; worker DB, scenari A/B, late arrival, regole A→B→A, watermark e attivazione/rollback parser su SQLite |
@@ -23,7 +23,7 @@ documentazione di provenienza dei repository congelati.
 | `scripts/test_ops.sh` | Debian 13/WSL | PASS: sintassi dei 13 script Bash, ShellCheck e `systemd-analyze verify` |
 | `tests/test_structured_logging.py` | Windows | `3 passed`; sink lento non blocca il relay, coda bounded/drop accounting e shutdown limitato |
 | installazione editable `--no-deps --no-build-isolation` + `--help` | Windows | PASS per tutti i 9 entry point console dichiarati |
-| `requirements/production.lock` + `pip check` | Windows/Linux | 29 pin esatti con hash; installazione Linux `--require-hashes` già verificata e ambiente Windows coerente |
+| lock `build`/`production` + `pip check` | Windows/Linux | 3 build pin e 29 runtime pin esatti con hash; il build lock corregge esplicitamente la venv Debian 12 |
 | frontend Vitest | Windows, runtime Node bundled | `1 passed` (`StatusChip`); invocazione diretta del runner perché il wrapper pnpm locale applica una policy build-script |
 | frontend TypeScript/Vite | stesso ambiente | `tsc -b` PASS; build Vite PASS in 3m29s, con warning chunk principale 540,05 kB |
 | frontend ESLint | stesso ambiente | PASS con ESLint 9.39.5 e configurazione flat; invocazione diretta del runner per la policy build-script del wrapper pnpm locale |

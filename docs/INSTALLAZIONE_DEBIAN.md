@@ -15,6 +15,7 @@ reali non è attestata. Prima del go-live chiudere i blocker in
 - repository sorgente su commit verificato;
 - frontend `frontend/dist/index.html` precompilato;
 - `requirements/production.lock` con hash presente;
+- `requirements/build.lock` con hash presente per il backend di packaging;
 - backup/rollback e finestra operativa;
 - nessun altro servizio in ascolto sugli endpoint proxy.
 
