@@ -155,6 +155,9 @@ def test_legacy_cleanup_is_dry_run_backup_first_and_non_destructive() -> None:
     assert "gzip --test" in cleanup
     assert "tar --list --gzip" in cleanup
     assert "files.jsonl" in cleanup
+    assert "Preserved /etc state is evidence" in cleanup
+    assert "-e /etc/printproxy/install-state" not in cleanup
+    assert "-e /etc/commercialrchproxy ||" not in cleanup
     assert 'removal_started=yes' in cleanup
     assert cleanup.index('systemctl stop printproxy-vip-watch.timer') < cleanup.index(
         '"${rch_network_helper}" uninstall --yes'

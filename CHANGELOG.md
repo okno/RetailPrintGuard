@@ -1,9 +1,18 @@
 # Changelog
 
 Tutte le modifiche rilevanti sono documentate in questo file. Il progetto segue
-la struttura di Keep a Changelog; la versione iniziale è ancora in sviluppo.
+la struttura di Keep a Changelog.
 
 ## [Unreleased]
+
+## [0.1.1] — 2026-08-13
+
+### Fixed
+
+- il cleanup legacy distingue i runtime installati dalle configurazioni ed
+  evidenze preservate, rendendo una seconda esecuzione un no-op sicuro.
+
+## [0.1.0] — 2026-08-13
 
 ### Added
 
@@ -62,8 +71,3 @@ la struttura di Keep a Changelog; la versione iniziale è ancora in sviluppo.
   orchestrazione avanzata dei ricalcoli non ancora complete;
 - collaudi hardware, PCAP, runtime DB/restore e Debian 12 target non attestati;
 - vedere [docs/LIMITI_NOTI.md](docs/LIMITI_NOTI.md).
-
-## [0.1.0] — non rilasciata
-
-Versione dichiarata dal package durante la fase iniziale. Nessun tag di release
-è implicato da questa voce.

@@ -232,12 +232,19 @@ done
 
 printproxy_installed=no
 rch_installed=no
-if [[ -e /opt/printproxy || -e /etc/printproxy/install-state || \
-      -e /etc/systemd/system/printproxy.service ]]; then
+# Preserved /etc state is evidence, not an installed executable runtime.  This
+# distinction makes a second cleanup invocation a harmless no-op.
+if [[ -e /opt/printproxy || -e /etc/systemd/system/printproxy.service || \
+      -e /usr/local/sbin/printproxyctl || \
+      -e /usr/local/libexec/printproxy-vip || \
+      -e /usr/local/libexec/printproxy-firewall ]]; then
     printproxy_installed=yes
 fi
-if [[ -e /opt/commercialrchproxy || -e /etc/commercialrchproxy || \
-      -e /etc/systemd/system/commercialrchproxy-dumper.service ]]; then
+if [[ -e /opt/commercialrchproxy || \
+      -e /etc/systemd/system/commercialrchproxy-dumper.service || \
+      -e /etc/systemd/system/commercialrchproxy-parser.service || \
+      -e /usr/local/libexec/commercialrchproxy || \
+      -e /usr/local/libexec/commercialrchproxy-network ]]; then
     rch_installed=yes
 fi
 

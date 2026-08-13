@@ -9,7 +9,7 @@ documentazione di provenienza dei repository congelati.
 | Controllo | Ambiente | Risultato |
 |---|---|---|
 | baseline `python -m pytest -q` prima dei worker DB finali | Windows, CPython 3.12.13 | `61 passed, 13 skipped`, 1 warning deprecazione Starlette/httpx; non è il risultato finale della release |
-| `.venv\\Scripts\\python -m pytest -q -p no:cacheprovider` sul monorepo prima della pubblicazione | Windows, CPython 3.12.13 | `92 passed, 14 skipped`, 1 warning Starlette/httpx in 57,90 s |
+| `.venv\\Scripts\\python -m pytest -q -p no:cacheprovider` sul monorepo `0.1.1` prima della pubblicazione | Windows, CPython 3.12.13 | `92 passed, 14 skipped`, 1 warning Starlette/httpx in 39,57 s |
 | `.venv\\Scripts\\python -m pytest -q tests/test_parsers.py` | Windows, ambiente virtuale del worktree | `3 passed`; parser puri ESC/POS e RCH |
 | `.venv\\Scripts\\python -m pytest -q tests/test_parser_worker_db.py` | stesso ambiente | `3 passed`; persistenza/idempotenza, response RAW, reparse append-only e failure lifecycle |
 | `.venv\\Scripts\\python -m pytest -q tests/test_analysis_workers.py` | stesso ambiente | `7 passed`; worker DB, scenari A/B, late arrival, regole A→B→A, watermark e attivazione/rollback parser su SQLite |
