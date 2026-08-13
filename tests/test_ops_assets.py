@@ -28,6 +28,12 @@ SERVICE_NAMES = {
 BACKUP_SERVICE = "retailprintguard-backup.service"
 
 
+def test_healthcheck_uses_compatible_gnu_df_options() -> None:
+    healthcheck = (SCRIPTS / "healthcheck.sh").read_text(encoding="utf-8")
+    assert 'df -B1 --output=avail "${RPG_DATA_ROOT}"' in healthcheck
+    assert "df -PB1 --output=avail" not in healthcheck
+
+
 def test_expected_services_are_separate_and_hardened() -> None:
     assert {path.name for path in SYSTEMD.glob("*.service")} == SERVICE_NAMES | {
         BACKUP_SERVICE

@@ -5,6 +5,13 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-08-13
+
+### Fixed
+
+- `status.sh` e `healthcheck.sh` producono nuovamente output su Debian: il
+  comando `df` non combina più le opzioni GNU incompatibili `-P` e `--output`.
+
 ## [0.1.7] — 2026-08-13
 
 ### Fixed

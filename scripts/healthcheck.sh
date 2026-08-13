@@ -52,7 +52,9 @@ fi
 spool_bytes="$(du -sb -- "${RPG_SPOOL_ROOT}" 2>/dev/null | awk '{print $1}' || printf '0')"
 ready_jobs="$(find "${RPG_SPOOL_ROOT}" -type f -name .ready 2>/dev/null | wc -l)"
 partial_jobs="$(find "${RPG_SPOOL_ROOT}" -type d -name '*.partial' 2>/dev/null | wc -l)"
-free_bytes="$(df -PB1 --output=avail "${RPG_DATA_ROOT}" 2>/dev/null | tail -n 1 | tr -d ' ')"
+# GNU df rejects the POSIX layout option (-P) together with --output. Use the
+# explicit byte block size and selected column so Debian 12/13 reach rendering.
+free_bytes="$(df -B1 --output=avail "${RPG_DATA_ROOT}" 2>/dev/null | tail -n 1 | tr -d ' ')"
 spool_bytes="${spool_bytes:-0}"
 ready_jobs="${ready_jobs//[[:space:]]/}"
 partial_jobs="${partial_jobs//[[:space:]]/}"
