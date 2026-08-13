@@ -8,7 +8,7 @@ artefatti di esempio forniti. I dump originali e le immagini non sono copiati
 in questo repository perché possono contenere dati commerciali, fiscali,
 personali e di rete.
 
-Questa distinzione di provenienza è essenziale:
+Questa distinzione storica di provenienza è essenziale:
 
 - `printproxy` era sul tag `v3.0.0`, commit applicativo documentato e worktree
   pulito;
@@ -16,6 +16,14 @@ Questa distinzione di provenienza è essenziale:
   `0.3.0` era composta da numerosi file modificati e non tracciati. Le
   osservazioni sulla nuova architettura Dumper/Parser descrivono quindi quel
   **worktree**, non una release immutabile.
+
+Al termine dell'integrazione, il worktree RCH è stato revisionato e congelato
+nella release `v0.3.0` al commit
+`7bb17f81276144c2ae4a255066f8e4dfa0241478`. `printproxy` è stato congelato al
+commit `1291b847ce589c4a336369ccd81165b702035dba`, tag
+`standalone-final-2026-08-13`. I due repository GitHub sono archiviati in sola
+lettura; questa sezione mantiene intenzionalmente lo stato rilevato prima del
+congelamento per garantire la catena di provenienza.
 
 ## Inventario sintetico
 
@@ -120,8 +128,8 @@ autorizzati, al momento non disponibili come evidenza verificata.
 
 | Repository/snapshot | Evidenza disponibile | Interpretazione |
 |---|---|---|
-| `commercialRCHproxy` worktree 0.3 | report interno: Windows `200 passed, 15 skipped`; Debian/WSL `215 passed` | risultato dichiarato nel worktree, non tag immutabile |
-| `printproxy` v3.0.0 | report CI del tag: 145 test su Ubuntu e Windows, Python 3.11/3.13; 4 skip Windows | baseline versionata; hardware escluso |
+| `commercialRCHproxy` `v0.3.0` | Windows `200 passed, 15 skipped`; precedente gate Debian/WSL `215 passed` | commit/tag finale immutabile; hardware escluso |
+| `printproxy` `v3.0.0` / tag standalone finale | baseline CI del progetto più gate locale descritto in `TEST_REPORT.md` | sorgente immutabile; hardware escluso |
 | RetailPrintGuard durante l'integrazione | suite locale sintetica eseguita e registrata in `TEST_REPORT.md` | copre software, non apparati reali |
 
 Non è corretto sommare questi numeri o usarli come attestazione del sistema
@@ -144,8 +152,8 @@ integrato sul target finale.
 
 - Il reverse RAW storico POS non è ricostruibile oltre il preview disponibile;
   il nuovo relay canonico conserva entrambe le direzioni per i nuovi job.
-- La variante RCH 0.3 deve essere congelata prima di una migrazione ripetibile;
-  l'adapter verifica comunque schema, marker e hash.
+- La variante RCH 0.3 è stata congelata prima della migrazione; l'adapter
+  verifica comunque schema, marker e hash di ogni sorgente importata.
 - Gli IP virtuali dei progetti legacy non vengono hardcoded nel nuovo codice;
   tutte le route sono in YAML e validate.
 - La disponibilità di un parser non autorizza a cambiare il data plane: gli

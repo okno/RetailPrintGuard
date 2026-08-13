@@ -128,12 +128,20 @@ Il progetto integra concetti e formati dei repository esistenti
 adapter storici sono read-only. La migrazione deve essere eseguita per route,
 con rollback pronto e verifica byte-exact su dati sintetici autorizzati.
 
-La variante RCH `0.3.0` analizzata era presente in un worktree non committato;
-non va trattata come una release immutabile finché non viene congelata in un
-commit/tag. `printproxy` `v3.0.0` conserva autorevolmente il RAW in direzione
-client→stampante, mentre il reverse storico è solo metadata/preview e può essere
-troncato. Il nuovo spool canonico RetailPrintGuard conserva entrambe le
-direzioni integralmente per i nuovi job.
+I due progetti standalone sono stati congelati e archiviati in sola lettura il
+13 agosto 2026:
+
+- `commercialRCHproxy` release finale `v0.3.0`, commit
+  `7bb17f81276144c2ae4a255066f8e4dfa0241478`;
+- `printproxy` tag finale `standalone-final-2026-08-13`, commit
+  `1291b847ce589c4a336369ccd81165b702035dba` (la release applicativa resta
+  `v3.0.0`).
+
+Entrambi restano software autonomi utilizzabili per audit e rollback
+controllato; ogni sviluppo futuro avviene qui. `printproxy` conserva
+autorevolmente il RAW storico client→stampante, mentre il reverse storico è
+solo metadata/preview e può essere troncato. Il nuovo spool canonico conserva
+entrambe le direzioni integralmente per i nuovi job.
 
 ## Licenza
 

@@ -61,8 +61,9 @@ Stato verificato sul worktree del 13 agosto 2026.
 
 - `printproxy` v3 conserva RAW autorevole solo client→stampante; il reverse è
   preview e può essere troncato. Non è recuperabile a posteriori.
-- La variante `commercialRCHproxy` 0.3 analizzata non è committata/taggata: una
-  sorgente di produzione deve essere congelata e identificata prima dell'import.
+- `commercialRCHproxy` è congelato a `v0.3.0` e `printproxy` al tag
+  `standalone-final-2026-08-13`; un archivio operativo va comunque associato al
+  relativo commit e verificato prima dell'import.
 - Fotografie e scontrini ricostruiti non dimostrano i byte, il protocollo o la
   ricezione fisica.
 - `local_write_drain_completed` prova solo avanzamento locale del socket.

@@ -2,8 +2,9 @@
 
 ## Snapshot
 
-Data: 13 agosto 2026. Repository in sviluppo senza commit iniziale; i risultati
-sono riferiti al worktree e vanno rieseguiti sul commit/tag di release.
+Data: 13 agosto 2026. Il gate RetailPrintGuard è stato eseguito immediatamente
+prima del commit iniziale `fffb8d3`; le sole modifiche successive sono
+documentazione di provenienza dei repository congelati.
 
 | Controllo | Ambiente | Risultato |
 |---|---|---|
@@ -92,10 +93,12 @@ disponibile.
 Questi numeri provengono dai report dei relativi repository e non sono stati
 rieseguiti come parte della suite RetailPrintGuard:
 
-- `commercialRCHproxy` worktree 0.3: Windows `200 passed, 15 skipped` e
-  Debian/WSL `215 passed`; worktree non committato;
-- `printproxy` tag v3.0.0: CI documentata 145 test su Ubuntu/Windows Python
-  3.11/3.13, con quattro skip di piattaforma Windows.
+- `commercialRCHproxy` release finale `v0.3.0`, commit `7bb17f8`: Windows
+  `200 passed, 15 skipped`; precedente gate Debian/WSL `215 passed`;
+- `printproxy` tag finale `standalone-final-2026-08-13`, commit `1291b84`:
+  rerun Windows finale `140 passed, 5 skipped` in 75,22 s, incluso il test
+  stress byte-exact da 2 MiB; la baseline Linux documentata del progetto resta
+  verde.
 
 ## Matrice di collaudo ancora obbligatoria
 

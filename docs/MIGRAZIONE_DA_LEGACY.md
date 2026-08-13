@@ -23,6 +23,16 @@ riconfigurare accidentalmente la rete del server.
 
 ## 1. Congelare e identificare le sorgenti
 
+Le sorgenti standalone ufficiali sono già congelate e archiviate:
+
+- `commercialRCHproxy` `v0.3.0` →
+  `7bb17f81276144c2ae4a255066f8e4dfa0241478`;
+- `printproxy` `standalone-final-2026-08-13` →
+  `1291b847ce589c4a336369ccd81165b702035dba`.
+
+Usare questi tag per recuperare gli uninstaller e per documentare la
+provenienza. Non usare una copia locale modificata.
+
 Annotare commit/tag finali dei due standalone e il commit RetailPrintGuard:
 
 ```bash
