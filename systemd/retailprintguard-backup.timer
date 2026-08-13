@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily RetailPrintGuard verified backup
+
+[Timer]
+OnCalendar=*-*-* 02:17:00
+RandomizedDelaySec=20m
+Persistent=yes
+Unit=retailprintguard-backup.service
+
+[Install]
+WantedBy=timers.target

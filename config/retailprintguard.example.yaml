@@ -1,0 +1,87 @@
+version: 1
+timezone: Europe/Rome
+spool_root: /var/lib/retailprintguard/spool
+archive_root: /var/lib/retailprintguard/archive
+log_root: /var/log/retailprintguard
+database_url_env: RPG_DATABASE_URL
+proxy:
+  connect_timeout_seconds: 30
+  forward_timeout_seconds: 30
+  response_tail_timeout_seconds: 10
+  session_idle_timeout_seconds: 300
+  shutdown_grace_seconds: 15
+  read_chunk_bytes: 65536
+  capture_queue_max_events: 4096
+  max_connections: 128
+  fsync_each_event: true
+  # continue keeps printing and marks evidence incomplete; abort stops the
+  # affected TCP session after a capture failure is detected.
+  storage_failure_policy: continue
+devices:
+  - id: pos_1
+    name: POS Cucina
+    type: pos
+    listen_ip: 192.0.2.220
+    listen_port: 9100
+    target_ip: 192.0.2.200
+    target_port: 9100
+    parser: escpos
+    bidirectional: true
+    enabled: true
+    allowed_networks: [192.0.2.0/24]
+  - id: pos_2
+    name: POS Bar
+    type: pos
+    listen_ip: 192.0.2.221
+    listen_port: 9100
+    target_ip: 192.0.2.201
+    target_port: 9100
+    parser: escpos
+    bidirectional: true
+    enabled: true
+    allowed_networks: [192.0.2.0/24]
+  - id: pos_3
+    name: POS Secondaria
+    type: pos
+    listen_ip: 192.0.2.222
+    listen_port: 9100
+    target_ip: 192.0.2.202
+    target_port: 9100
+    parser: escpos
+    bidirectional: true
+    enabled: true
+    allowed_networks: [192.0.2.0/24]
+  - id: rch_1
+    name: RCH Print! F
+    type: rch
+    listen_ip: 192.0.2.231
+    listen_port: 23
+    target_ip: 192.0.2.251
+    target_port: 23
+    parser: rch_observed
+    bidirectional: true
+    enabled: true
+    allowed_networks: [192.0.2.0/24]
+ingestion:
+  scan_interval_seconds: 3
+  retry_initial_seconds: 2
+  retry_max_seconds: 300
+  max_batch_jobs: 100
+  spool_warning_bytes: 1073741824
+correlation:
+  time_window_seconds: 7200
+  minimum_score: 60
+fraud:
+  default_amount_drop_percent: 20
+  order_without_fiscal_close_minutes: 120
+  extreme_price_change_percent: 70
+api:
+  bind_host: 127.0.0.1
+  bind_port: 8080
+  access_token_minutes: 30
+  failed_login_limit: 5
+  failed_login_delay_seconds: 2
+  allowed_origins: []
+retention:
+  database_days: 0
+  spool_days: 0

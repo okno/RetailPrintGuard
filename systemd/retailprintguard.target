@@ -1,0 +1,11 @@
+[Unit]
+Description=RetailPrintGuard platform
+Wants=retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service
+Wants=retailprintguard-ingestion.service retailprintguard-correlation.service
+Wants=retailprintguard-parser.service
+Wants=retailprintguard-fraud.service retailprintguard-api.service
+Wants=retailprintguard-backup.timer
+After=network-online.target mariadb.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retailprintguard"
+version = "0.1.0"
+description = "Resilient print evidence ingestion, correlation and fraud analysis platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "alembic>=1.15,<2",
+  "argon2-cffi>=23.1,<26",
+  "fastapi>=0.115,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "PyJWT>=2.10,<3",
+  "PyMySQL>=1.1,<2",
+  "PyYAML>=6.0,<7",
+  "sqlalchemy>=2.0,<3",
+  "tzdata>=2025.2",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+retailprintguard-api = "retailprintguard.api.main:cli"
+retailprintguard-admin = "retailprintguard.admin.main:cli"
+retailprintguard-ingestion = "retailprintguard.ingestion.main:cli"
+retailprintguard-parser = "retailprintguard.parser.main:cli"
+retailprintguard-correlate = "retailprintguard.correlation.main:cli"
+retailprintguard-import = "retailprintguard.importer.main:cli"
+retailprintguard-fraud = "retailprintguard.fraud.main:cli"
+retailprintguard-proxy = "retailprintguard.proxy.main:cli"
+retailprintguard-compile-legacy = "retailprintguard.proxy.legacy_config:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]
+"src/retailprintguard/api/schemas.py" = ["S105"]
