@@ -5,6 +5,15 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-13
+
+### Changed
+
+- nginx espone esplicitamente la webapp su `0.0.0.0:8081`, mantenendo FastAPI
+  su loopback; documentati firewall e HTTPS richiesti;
+- aggiunti comandi operativi protetti per start, stop, restart e log unificati,
+  oltre all'inventario delle directory dati e al troubleshooting rapido.
+
 ## [0.1.8] — 2026-08-13
 
 ### Fixed

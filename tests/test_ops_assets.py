@@ -84,12 +84,23 @@ def test_expected_services_are_separate_and_hardened() -> None:
         assert "CapabilityBoundingSet=\n" in content
 
 
-def test_nginx_is_loopback_only_by_default() -> None:
+def test_nginx_exposes_ui_on_ipv4_while_api_remains_loopback_only() -> None:
     content = (ROOT / "deploy/nginx/retailprintguard.conf").read_text(encoding="utf-8")
-    assert "listen 127.0.0.1:8081;" in content
+    assert "listen 0.0.0.0:8081;" in content
     assert "proxy_pass http://127.0.0.1:8080;" in content
-    assert "listen 0.0.0.0" not in content
     assert "add_header Content-Security-Policy" in content
+
+
+def test_operational_lifecycle_scripts_are_present_and_guard_restart() -> None:
+    start = (SCRIPTS / "start.sh").read_text(encoding="utf-8")
+    stop = (SCRIPTS / "stop.sh").read_text(encoding="utf-8")
+    restart = (SCRIPTS / "restart.sh").read_text(encoding="utf-8")
+    logs = (SCRIPTS / "logs.sh").read_text(encoding="utf-8")
+    assert "systemctl start mariadb.service nginx.service retailprintguard.target" in start
+    assert "rpg_stop_control_plane" in stop
+    assert "active printer session belongs to" in restart
+    assert "--force-active-sessions" in restart
+    assert "journalctl" in logs and "--follow" in logs
 
 
 def test_installer_never_mutates_host_networking_and_requires_site_validation() -> None:

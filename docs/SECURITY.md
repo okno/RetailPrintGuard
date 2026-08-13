@@ -125,11 +125,11 @@ control plane.
 
 - MariaDB è configurata su `127.0.0.1`;
 - API su `127.0.0.1:8080`;
-- nginx di default su `127.0.0.1:8081`;
-- gli unici listener LAN intenzionali sono quelli dei proxy;
+- nginx espone intenzionalmente la UI su `0.0.0.0:8081`;
+- il firewall deve limitare TCP/8081 alla sola rete amministrativa autorizzata;
 - ACL applicativa e firewall devono limitare i gestionali autorizzati;
-- l'accesso UI remoto richiede reverse proxy HTTPS approvato o tunnel
-  amministrativo, non un semplice cambio del bind pubblico.
+- la pubblicazione definitiva richiede reverse proxy HTTPS approvato; il bind
+  pubblico IPv4 da solo non fornisce cifratura o controllo perimetrale.
 
 Non usare gli indirizzi RFC 5737 dell'esempio. Gli IP reali vengono mantenuti
 solo nella configurazione locale protetta.

@@ -48,6 +48,57 @@ curl --fail --silent http://127.0.0.1:8080/api/v1/system/health
 Il body deve essere letto: `status=degraded` può comunque arrivare con HTTP
 200.
 
+Webapp dalla rete amministrativa:
+
+```text
+http://<indirizzo-server>:8081/
+```
+
+Nginx ascolta su `0.0.0.0:8081`, mentre l'API resta su loopback. Limitare la
+porta 8081 via firewall e predisporre HTTPS prima dell'esposizione ordinaria.
+
+## Avvio, arresto e riavvio
+
+Gli script sotto acquisiscono il lock di manutenzione e mantengono MariaDB e
+nginx come servizi distro separati:
+
+```bash
+sudo /opt/retailprintguard/current/scripts/start.sh
+sudo /opt/retailprintguard/current/scripts/stop.sh
+sudo /opt/retailprintguard/current/scripts/restart.sh
+```
+
+`restart.sh` rifiuta il riavvio se rileva sessioni TCP appartenenti ai proxy.
+L'opzione `--force-active-sessions` interrompe quelle sessioni ed è ammessa solo
+in emergenza autorizzata, accettando job parziali e stampa interrotta.
+
+Log recenti o in tempo reale:
+
+```bash
+sudo /opt/retailprintguard/current/scripts/logs.sh --since "-30 minutes"
+sudo /opt/retailprintguard/current/scripts/logs.sh --follow
+```
+
+## Directory operative
+
+| Percorso | Contenuto |
+|---|---|
+| `/etc/retailprintguard` | configurazione e secret protetti; non copiarli nei ticket |
+| `/opt/retailprintguard/releases` | release applicative immutabili |
+| `/opt/retailprintguard/current` | symlink alla release attiva |
+| `/var/www/retailprintguard/releases` | build frontend versionate |
+| `/var/www/retailprintguard/current` | frontend attivo |
+| `/var/lib/retailprintguard/spool` | RAW e manifest canonici append-only per dispositivo/job |
+| `/var/lib/retailprintguard/archive` | import e archivi gestiti |
+| `/var/lib/retailprintguard/state` | stato manutenzione, release e worker |
+| `/var/log/retailprintguard/proxy` | directory log proxy riservata; log principali in journald |
+| `/var/log/retailprintguard/worker` | directory log worker; log principali in journald |
+| `/var/backups/retailprintguard` | backup applicativi e bundle migrazione |
+| `/var/lib/mysql` | dati fisici MariaDB; usare dump/restore, non copiare a caldo |
+
+Non cancellare manualmente `.partial`, `.ready`, RAW, manifest, state file o
+directory release. Usare backup, restore, update e uninstall documentati.
+
 ## Dove vengono salvate le copie
 
 Il relay salva immediatamente ogni nuova sessione in:

@@ -155,8 +155,10 @@ sudo systemctl start retailprintguard-api.service
 sudo systemctl reload nginx.service
 ```
 
-Nginx ascolta per default su `127.0.0.1:8081`. L'accesso remoto richiede un
-reverse proxy HTTPS approvato.
+Nginx espone la webapp su `0.0.0.0:8081`; aprire la porta esclusivamente dalla
+rete amministrativa autorizzata. FastAPI resta confinata su
+`127.0.0.1:8080`. Prima dell'uso ordinario configurare HTTPS tramite reverse
+proxy approvato e una regola firewall LAN esplicita.
 
 ## Aggiornamento
 

@@ -1,5 +1,33 @@
 # Troubleshooting
 
+## Checklist rapida
+
+```bash
+sudo /opt/retailprintguard/current/scripts/status.sh --json
+sudo /opt/retailprintguard/current/scripts/logs.sh --since "-15 minutes"
+systemctl --failed --no-pager
+ss -Hltpn
+df -h /var/lib/retailprintguard /var/lib/mysql
+df -i /var/lib/retailprintguard /var/lib/mysql
+```
+
+Verificare nell'ordine: configurazione, servizi, listener, spazio/inode, spool,
+MariaDB, API e solo infine i target fisici. Non inviare probe o byte casuali a
+una RCH e non cancellare evidenze per liberare la coda.
+
+## Webapp non raggiungibile
+
+```bash
+ss -Hltpn | grep ':8081'
+nginx -t
+systemctl status nginx.service retailprintguard-api.service --no-pager
+curl --fail http://127.0.0.1:8081/
+curl --fail http://127.0.0.1:8080/api/v1/system/health
+```
+
+Se loopback funziona ma la LAN no, controllare il firewall per TCP/8081 e il
+percorso di rete. Non esporre direttamente la porta API 8080.
+
 ## L'installer rifiuta un indirizzo RFC 5737
 
 Messaggio tipico: configurazione con indirizzo di documentazione. Gli IP

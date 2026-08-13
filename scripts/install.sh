@@ -404,4 +404,4 @@ systemctl reload nginx.service
 
 rpg_note "Installed release ${release_hash}"
 rpg_note "No address, route, DNS or firewall setting was changed."
-rpg_note "UI default: http://127.0.0.1:8081/"
+rpg_note "UI listener: http://<server-ip>:8081/ (0.0.0.0:8081; restrict with firewall)"

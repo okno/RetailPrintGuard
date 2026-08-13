@@ -9,7 +9,7 @@ documentazione di provenienza dei repository congelati.
 | Controllo | Ambiente | Risultato |
 |---|---|---|
 | baseline `python -m pytest -q` prima dei worker DB finali | Windows, CPython 3.12.13 | `61 passed, 13 skipped`, 1 warning deprecazione Starlette/httpx; non è il risultato finale della release |
-| `.venv\\Scripts\\python -m pytest -q -p no:cacheprovider` sul monorepo `0.1.8` prima della pubblicazione | Windows, CPython 3.12.13 | `95 passed, 14 skipped`, 1 warning Starlette/httpx; include regressioni Debian per installazione e healthcheck |
+| `.venv\\Scripts\\python -m pytest -q -p no:cacheprovider` sul monorepo `0.1.9` prima della pubblicazione | Windows, CPython 3.12.13 | `96 passed, 18 skipped`, 1 warning Starlette/httpx; include bind UI e lifecycle operativo |
 | `.venv\\Scripts\\python -m pytest -q tests/test_parsers.py` | Windows, ambiente virtuale del worktree | `3 passed`; parser puri ESC/POS e RCH |
 | `.venv\\Scripts\\python -m pytest -q tests/test_parser_worker_db.py` | stesso ambiente | `3 passed`; persistenza/idempotenza, response RAW, reparse append-only e failure lifecycle |
 | `.venv\\Scripts\\python -m pytest -q tests/test_analysis_workers.py` | stesso ambiente | `7 passed`; worker DB, scenari A/B, late arrival, regole A→B→A, watermark e attivazione/rollback parser su SQLite |
@@ -20,7 +20,7 @@ documentazione di provenienza dei repository congelati.
 | `.venv\\Scripts\\python -m ruff check src tests migrations` | stesso ambiente | PASS sul worktree congelato |
 | `python -m bandit -q -r src -c pyproject.toml` | stesso ambiente | PASS |
 | `.venv\\Scripts\\python -m compileall -q src migrations` | stesso ambiente | PASS |
-| `scripts/test_ops.sh` | Debian 13/WSL | PASS: sintassi dei 13 script Bash, ShellCheck e `systemd-analyze verify` |
+| `scripts/test_ops.sh` | Debian 13/WSL | PASS: sintassi dei 17 script Bash, ShellCheck e `systemd-analyze verify` |
 | `tests/test_structured_logging.py` | Windows | `3 passed`; sink lento non blocca il relay, coda bounded/drop accounting e shutdown limitato |
 | installazione editable `--no-deps --no-build-isolation` + `--help` | Windows | PASS per tutti i 9 entry point console dichiarati |
 | lock `build`/`production` + `pip check` | Windows/Linux | 3 build pin e 29 runtime pin esatti con hash; il build lock corregge esplicitamente la venv Debian 12 |
@@ -30,7 +30,7 @@ documentazione di provenienza dei repository congelati.
 | Alembic su MariaDB reale | Debian 13, ambiente temporaneo poi rimosso | PASS: upgrade a `29517f373309`, downgrade a zero tabelle applicative, re-upgrade con revision marker presente; non è il target Debian 12 |
 | hardware/PCAP | — | non eseguito |
 
-I 14 skip dipendono principalmente dalla parametrizzazione sui 13 script Bash quando un Bash
+I 18 skip dipendono principalmente dalla parametrizzazione sui 17 script Bash quando un Bash
 POSIX non è disponibile sul runner Windows e, nell'altro caso condizionale,
 dalla disponibilità di symlink di directory.
 La warning FastAPI segnala la deprecazione dell'uso `httpx` con
@@ -84,7 +84,7 @@ test stack in una release compatibile.
 
 I test statici verificano unità separate/hardenizzate, nginx loopback, assenza
 di mutazioni rete nell'installer, presenza del requisito lock e validatore sito.
-Sono presenti 14 file nella directory `scripts/`: 13 script Bash e un validatore
+Sono presenti 18 file nella directory `scripts/`: 17 script Bash e un validatore
 Python; la sintassi Bash viene verificata quando un Bash POSIX è
 disponibile.
 
