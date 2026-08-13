@@ -150,6 +150,22 @@ python3 /srv/RetailPrintGuard/scripts/validate_site_config.py \
   --require-assigned-listeners --require-deployment-layout
 ```
 
+Preparare inoltre un piccolo helper **specifico del sito**, root-owned e non
+scrivibile da gruppo/altri, che riapplichi il profilo già approvato senza
+modificare gateway, DNS o indirizzo primario. Esempi del solo comando finale:
+
+```bash
+# NetworkManager: exec nmcli device reapply <INTERFACCIA>
+# networkd:       exec networkctl reconfigure <INTERFACCIA>
+# ifupdown:       usare il comando approvato dall'amministratore del sito
+```
+
+Salvarlo come
+`/root/retailprintguard-migration/reapply-listeners.sh`, verificarlo a vista e
+impostare `root:root` `0700`. Il cleanup lo esegue soltanto dopo che gli
+uninstaller hanno rimosso i VIP legacy e prima di controllare i quattro
+indirizzi; non accetta una command line interpolata.
+
 ## 5. Preparare il firewall sostitutivo
 
 Se `FIREWALL_OWNED=yes` nello state printproxy, il suo uninstall rimuoverà la
@@ -221,6 +237,8 @@ cd /srv/RetailPrintGuard
 sudo ./scripts/cleanup_legacy.sh \
   --execute \
   --network-handover-confirmed \
+  --network-reapply-helper \
+    /root/retailprintguard-migration/reapply-listeners.sh \
   --firewall-handover-confirmed \
   --printproxy-uninstaller \
     /root/retailprintguard-migration/printproxy-uninstall.sh
@@ -228,7 +246,9 @@ sudo ./scripts/cleanup_legacy.sh \
 
 Omettere `--firewall-handover-confirmed` se il dry-run dichiara esplicitamente
 che il legacy non possiede la tabella. Omettere
-`--network-handover-confirmed` soltanto se nessun indirizzo risulta posseduto.
+`--network-handover-confirmed` soltanto se nessun indirizzo risulta posseduto;
+in tal caso si omette anche `--network-reapply-helper`. Se gli indirizzi sono
+posseduti, entrambi sono obbligatori.
 
 Lo script:
 

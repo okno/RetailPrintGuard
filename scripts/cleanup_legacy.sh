@@ -42,6 +42,7 @@ firewall_handover=no
 backup_root="${DEFAULT_BACKUP_ROOT}"
 printproxy_uninstaller=""
 rch_uninstaller=""
+network_reapply_helper=""
 removal_started=no
 services_stopped=no
 recovery_archive=""
@@ -68,6 +69,7 @@ Options:
   --printproxy-uninstaller FILE
   --rch-uninstaller FILE
   --network-handover-confirmed   required when legacy services own listener IPs
+  --network-reapply-helper FILE  root-owned site helper run after VIP removal
   --firewall-handover-confirmed  required when printproxy owns its nft table
   -h, --help
 
@@ -91,6 +93,10 @@ while (( $# > 0 )); do
         --rch-uninstaller)
             (( $# >= 2 )) || die "--rch-uninstaller requires a file"
             rch_uninstaller="$2"; shift 2
+            ;;
+        --network-reapply-helper)
+            (( $# >= 2 )) || die "--network-reapply-helper requires a file"
+            network_reapply_helper="$2"; shift 2
             ;;
         --network-handover-confirmed) network_handover=yes; shift ;;
         --firewall-handover-confirmed) firewall_handover=yes; shift ;;
@@ -292,6 +298,11 @@ print_owned="$(config_value /etc/printproxy/install-state VIP_OWNED_LIST)"
 rch_owned="$(config_value /run/commercialrchproxy-secondary-ip/state OWNED)"
 [[ "${print_owned}" == *yes* || "${rch_owned}" == 1 ]] && network_owned=yes
 [[ "$(config_value /etc/printproxy/install-state FIREWALL_OWNED)" == yes ]] && firewall_owned=yes
+if [[ -n "${network_reapply_helper}" ]]; then
+    network_reapply_helper="$(realpath -m -- "${network_reapply_helper}")"
+    secure_executable "${network_reapply_helper}"
+    add_source "${network_reapply_helper}"
+fi
 
 legacy_present=no
 [[ "${printproxy_installed}" == yes || "${rch_installed}" == yes ]] && legacy_present=yes
@@ -325,6 +336,8 @@ fi
 
 [[ "${network_owned}" != yes || "${network_handover}" == yes ]] || \
     die "legacy owns listener IPs; configure them persistently, then pass --network-handover-confirmed"
+[[ "${network_owned}" != yes || -n "${network_reapply_helper}" ]] || \
+    die "legacy owns listener IPs; provide a reviewed --network-reapply-helper"
 [[ "${firewall_owned}" != yes || "${firewall_handover}" == yes ]] || \
     die "legacy owns its nft table; install an approved replacement, then pass --firewall-handover-confirmed"
 for service in retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service; do
@@ -485,6 +498,10 @@ if [[ "${rch_installed}" == yes ]]; then
 fi
 if [[ "${printproxy_installed}" == yes ]]; then
     "${printproxy_uninstaller}"
+fi
+if [[ "${network_owned}" == yes ]]; then
+    note "Reapplying the approved persistent listener configuration."
+    "${network_reapply_helper}"
 fi
 
 # Remove only exact known leftovers; never recursively delete an administrator's

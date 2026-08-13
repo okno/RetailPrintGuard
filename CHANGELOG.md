@@ -5,6 +5,13 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-08-13
+
+### Fixed
+
+- il cutover richiede ed esegue un helper di rete root-owned specifico del
+  sito dopo la rimozione dei VIP legacy e prima del postcheck dei listener.
+
 ## [0.1.1] — 2026-08-13
 
 ### Fixed

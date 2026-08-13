@@ -150,6 +150,7 @@ def test_legacy_cleanup_is_dry_run_backup_first_and_non_destructive() -> None:
     assert 'execute=no' in cleanup
     assert 'if [[ "${execute}" != yes ]]' in cleanup
     assert "--network-handover-confirmed" in cleanup
+    assert "--network-reapply-helper" in cleanup
     assert "--firewall-handover-confirmed" in cleanup
     assert "active TCP session belongs to" in cleanup
     assert "gzip --test" in cleanup
@@ -164,6 +165,9 @@ def test_legacy_cleanup_is_dry_run_backup_first_and_non_destructive() -> None:
     )
     assert cleanup.index('sha256sum --check --strict') < cleanup.index(
         'removal_started=yes'
+    )
+    assert cleanup.index('Reapplying the approved persistent listener') < cleanup.index(
+        'listener ${listener} disappeared'
     )
     assert '"${rch_uninstaller}"' in cleanup
     assert '"${printproxy_uninstaller}"' in cleanup
