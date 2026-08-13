@@ -141,9 +141,12 @@ def test_backup_and_restore_fail_closed_for_evidence() -> None:
 
 
 def test_restore_reapplies_isolated_proxy_owners() -> None:
+    install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
     restore = (SCRIPTS / "restore.sh").read_text(encoding="utf-8")
     assert "retailprintguard-proxy:" not in restore
     assert "--list-device-directories" in restore
+    assert "while IFS=$'\\t' read -r device_type device_id; do" in install
+    assert "while IFS=$'\\t' read -r device_type device_id; do" in restore
     assert "device_owner=retailprintguard-pos-proxy" in restore
     assert "device_owner=retailprintguard-rch-proxy" in restore
 

@@ -5,6 +5,14 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-08-13
+
+### Fixed
+
+- il contratto tra validatore, installer e restore usa ora un separatore TAB
+  esplicito per tipo e ID dispositivo, evitando che l'`IFS` shell sicuro
+  interpreti valori come `pos pos_1` come un unico tipo non supportato.
+
 ## [0.1.4] — 2026-08-13
 
 ### Fixed

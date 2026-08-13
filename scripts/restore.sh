@@ -108,7 +108,7 @@ device_listing="$(
         --config "${RPG_CONFIG_PATH}" --require-deployment-layout \
         --list-device-directories
 )"
-while read -r device_type device_id; do
+while IFS=$'\t' read -r device_type device_id; do
     case "${device_type}" in
         pos) device_owner=retailprintguard-pos-proxy ;;
         rch) device_owner=retailprintguard-rch-proxy ;;

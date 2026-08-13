@@ -101,7 +101,10 @@ def cli() -> int:
     parser.add_argument(
         "--list-device-directories",
         action="store_true",
-        help="after validation, print one trusted '<type> <id>' line per enabled device",
+        help=(
+            "after validation, print one trusted tab-separated "
+            "'<type><TAB><id>' line per enabled device"
+        ),
     )
     arguments = parser.parse_args()
     try:
@@ -115,7 +118,7 @@ def cli() -> int:
             settings = load_settings(arguments.config)
             for device in settings.devices:
                 if device.enabled:
-                    print(f"{device.type.value} {device.id}")
+                    print(f"{device.type.value}\t{device.id}")
         return result
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

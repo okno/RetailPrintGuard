@@ -7,6 +7,7 @@ import yaml
 from pydantic import ValidationError
 
 from retailprintguard.common.config import load_settings
+from scripts.validate_site_config import cli as validate_site_config_cli
 
 
 def _base(tmp_path: Path) -> dict[str, object]:
@@ -60,6 +61,25 @@ def test_loads_strict_multi_device_configuration(tmp_path: Path) -> None:
     assert [device.id for device in settings.devices] == ["pos_1", "rch_1"]
     assert settings.devices[1].bidirectional is True
     assert settings.timezone == "Europe/Rome"
+
+
+def test_device_directory_listing_uses_shell_safe_tab_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write(tmp_path, _base(tmp_path))
+    monkeypatch.setattr("scripts.validate_site_config.validate", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "validate_site_config.py",
+            "--config",
+            str(config_path),
+            "--list-device-directories",
+        ],
+    )
+
+    assert validate_site_config_cli() == 0
+    assert capsys.readouterr().out.splitlines() == ["pos\tpos_1", "rch\trch_1"]
 
 
 @pytest.mark.parametrize(
