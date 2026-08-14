@@ -89,7 +89,10 @@ def cli(argv: Sequence[str] | None = None) -> int:
         if args.reparse_all and not args.once:
             raise ValueError("--reparse-all requires --once")
         settings = load_settings(args.config)
-        worker = ParserWorker(create_parser_repository(settings))
+        worker = ParserWorker(
+            create_parser_repository(settings),
+            timezone_name=settings.timezone,
+        )
         if args.once:
             report = worker.run_once(limit=args.limit, reparse=args.reparse_all)
             _report(report, as_json=args.json)

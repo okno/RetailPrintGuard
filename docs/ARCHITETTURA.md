@@ -125,12 +125,17 @@ Rappresenta il risultato di un parser specifico e versionato: tipo, riferimenti,
 righe, importi, pagamenti, confidenza, warning e span nel payload. Ogni nuova
 elaborazione crea una `document_version`.
 
-I parser nativi `retailprintguard-escpos` e
-`retailprintguard-rch-observed`, entrambi versione `1.0.0`, sono funzioni pure:
+I parser nativi `retailprintguard-escpos` `1.2.0` e
+`retailprintguard-rch-observed` `1.1.0` operano nel control plane:
 ricevono byte e metadati già acquisiti e restituiscono documenti immutabili.
 Non aprono socket, non modificano lo spool e non importano il relay. La
 segmentazione applicativa avviene sul flusso ricostruito, mai sui confini delle
 letture TCP.
+
+L'OCR opzionale del tavolo ESC/POS viene eseguito soltanto dal worker parser
+con risorse bounded e isolamento systemd. Versione/lingua del backend entrano
+nel fingerprint della build; un errore OCR non cambia la disponibilità del
+proxy né i byte acquisiti.
 
 ### Correlated transaction
 
@@ -146,7 +151,7 @@ append-only.
 
 ## Correlazione
 
-L'algoritmo correttivo `rpg-correlation-1.1.0` usa, quando disponibili, codice
+L'algoritmo correttivo `rpg-correlation-1.2.0` usa, quando disponibili, codice
 ordine, codice documento, riferimenti embedded, tavolo, operatore, terminale,
 sessione, data operativa, prossimità temporale, totale, similarità righe,
 sequenza e dispositivo. I gruppi sono deterministici e il punteggio è limitato

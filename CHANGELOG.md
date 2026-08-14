@@ -3,6 +3,31 @@
 Tutte le modifiche rilevanti sono documentate in questo file. Il progetto segue
 la struttura di Keep a Changelog.
 
+## [Unreleased]
+
+### Added
+
+- parser ESC/POS `1.2.0` con ricostruzione bounded delle bande raster `ESC *` e
+  OCR Tesseract confinato al worker parser, per estrarre il tavolo senza
+  coinvolgere il relay o modificare il RAW;
+- semantica POS versionata per portata, quantità firmate, descrizioni mandate
+  a capo, timestamp documento e campi identificativi; una variazione `-1x`
+  resta un delta e diventa rimozione solo quando lo stato derivato arriva a
+  zero;
+- correlazione `rpg-correlation-1.2.0` per dispatch simultanei su reparti POS
+  differenti e per variazioni recenti sullo stesso tavolo/dispositivo, con
+  overlap articolo obbligatorio e criteri leggibili;
+- migrazione append-only dei campi semantici in `document_versions` e della
+  portata in `document_lines`, con selezione della versione parser attiva.
+
+### Changed
+
+- l'identità immutabile della build ESC/POS include anche versione e lingua
+  del runtime OCR disponibile; il reparse crea una nuova versione senza
+  sovrascrivere RAW o interpretazioni precedenti;
+- l'installer Debian aggiunge i pacchetti Tesseract italiano e inglese soltanto
+  al control plane parser. I servizi proxy restano privi di OCR e database.
+
 ## [0.2.1] — 2026-08-14
 
 ### Fixed

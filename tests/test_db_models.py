@@ -12,7 +12,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import inspect, select
+from sqlalchemy import MetaData, Table, inspect, select
 from sqlalchemy.dialects import mysql
 from sqlalchemy.schema import CreateTable
 
@@ -27,6 +27,7 @@ from retailprintguard.db.models import (
     ProxySession,
     RawPayload,
 )
+from retailprintguard.db.types import UUIDBinary
 
 REQUIRED_TABLES = {
     "active_parser_versions",
@@ -448,6 +449,191 @@ def test_alert_duplicate_migration_preserves_and_links_historical_rows(
     engine.dispose()
 
 
+def test_document_version_semantics_migration_backfills_legacy_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    database = tmp_path / "version-semantics.sqlite"
+    configuration = Config(root / "alembic.ini")
+    configuration.set_main_option("sqlalchemy.url", f"sqlite:///{database.as_posix()}")
+    monkeypatch.delenv("RPG_DATABASE_URL", raising=False)
+    command.upgrade(configuration, "8d4c2a91f7b0")
+
+    engine = create_db_engine(f"sqlite:///{database.as_posix()}")
+    metadata = MetaData()
+    devices = Table("devices", metadata, autoload_with=engine)
+    sessions = Table("proxy_sessions", metadata, autoload_with=engine)
+    jobs = Table("print_jobs", metadata, autoload_with=engine)
+    parsers = Table("parser_versions", metadata, autoload_with=engine)
+    documents = Table("documents", metadata, autoload_with=engine)
+    versions = Table("document_versions", metadata, autoload_with=engine)
+    for table, columns in (
+        (devices, ("id",)),
+        (sessions, ("id", "device_id")),
+        (jobs, ("id", "device_id", "session_id")),
+        (parsers, ("id",)),
+        (documents, ("id", "device_id", "session_id", "job_id")),
+        (
+            versions,
+            ("id", "document_id", "parser_version_id", "raw_payload_id", "parse_run_id"),
+        ),
+    ):
+        for column_name in columns:
+            table.c[column_name].type = UUIDBinary()
+    now = datetime(2042, 5, 6, 12, 30)
+    device_id, session_id, job_id = uuid4(), uuid4(), uuid4()
+    parser_id, document_id, version_id = uuid4(), uuid4(), uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            devices.insert(),
+            {
+                "id": device_id,
+                "external_id": "pos_legacy",
+                "name": "POS legacy",
+                "device_type": "pos",
+                "parser_kind": "escpos",
+                "enabled": True,
+                "bidirectional": False,
+                "listen_ip": "192.0.2.10",
+                "listen_port": 9100,
+                "target_ip": "192.0.2.20",
+                "target_port": 9100,
+                "non_sensitive_config": {},
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+        connection.execute(
+            sessions.insert(),
+            {
+                "id": session_id,
+                "device_id": device_id,
+                "source_system": "test",
+                "source_instance": "migration",
+                "source_scope": "legacy",
+                "source_session_id": "legacy-session",
+                "listen_ip": "192.0.2.10",
+                "listen_port": 9100,
+                "target_ip": "192.0.2.20",
+                "target_port": 9100,
+                "started_at": now,
+                "status": "CLOSED",
+                "client_fin_received": True,
+                "device_fin_received": True,
+                "bytes_to_device": 10,
+                "bytes_to_client": 0,
+                "capture_complete": True,
+            },
+        )
+        connection.execute(
+            jobs.insert(),
+            {
+                "id": job_id,
+                "device_id": device_id,
+                "session_id": session_id,
+                "source_key": "test:migration:legacy:job",
+                "source_system": "test",
+                "source_instance": "migration",
+                "source_scope": "legacy",
+                "source_job_id": "legacy-job",
+                "source_schema": "legacy.v1",
+                "manifest_sha256": _sha("a"),
+                "manifest_path": "/legacy/manifest.json",
+                "started_at": now,
+                "captured_at": now,
+                "status": "COMPLETE",
+                "capture_complete": True,
+                "timeline_complete": True,
+                "import_status": "PARSED",
+                "warnings": [],
+                "errors": [],
+            },
+        )
+        connection.execute(
+            parsers.insert(),
+            {
+                "id": parser_id,
+                "name": "legacy-parser",
+                "version": "1.0.0",
+                "build_sha256": _sha("b"),
+                "protocol": "escpos",
+                "configuration": {},
+                "installed_at": now,
+            },
+        )
+        connection.execute(
+            documents.insert(),
+            {
+                "id": document_id,
+                "device_id": device_id,
+                "session_id": session_id,
+                "job_id": job_id,
+                "source_document_key": "legacy-document",
+                "document_type": "KITCHEN_ORDER",
+                "subtype": "TICKET_POS_INFERRED",
+                "external_document_code": "DOC-LEGACY",
+                "order_code": "ORDER-LEGACY",
+                "table_code": "25-B",
+                "operator_code": "OP-LEGACY",
+                "terminal_code": "TERM-LEGACY",
+                "document_timestamp": now,
+                "captured_at": now,
+                "created_at": now,
+            },
+        )
+        connection.execute(
+            versions.insert(),
+            {
+                "id": version_id,
+                "document_id": document_id,
+                "parser_version_id": parser_id,
+                "parse_run_id": uuid4(),
+                "version_sequence": 1,
+                "parsed_at": now,
+                "status": "COMPLETE",
+                "normalized_text": "legacy",
+                "parse_confidence": 80,
+                "evidence_level": "INFERRED",
+                "source_manifest_sha256": _sha("a"),
+                "source_payload_sha256": _sha("c"),
+                "source_path": "/legacy/client.raw",
+                "complete": True,
+                "warnings": [],
+                "errors": [],
+                "raw_metadata": {},
+                "chain_scope": f"document:{document_id}",
+                "chain_sequence": 1,
+                "previous_record_hash": _sha("0"),
+                "record_hash": _sha("d"),
+            },
+        )
+    engine.dispose()
+
+    command.upgrade(configuration, "head")
+    engine = create_db_engine(f"sqlite:///{database.as_posix()}")
+    factory = session_factory(engine)
+    with factory() as session:
+        version = session.get(DocumentVersion, version_id)
+        assert version is not None
+        assert version.document_type == "KITCHEN_ORDER"
+        assert version.subtype == "TICKET_POS_INFERRED"
+        assert version.external_document_code == "DOC-LEGACY"
+        assert version.order_code == "ORDER-LEGACY"
+        assert version.table_code == "25-B"
+        assert version.operator_code == "OP-LEGACY"
+        assert version.terminal_code == "TERM-LEGACY"
+        assert version.document_timestamp == datetime(2042, 5, 6, 12, 30, tzinfo=UTC)
+    assert {
+        "ix_document_versions_order_document",
+        "ix_document_versions_external_document",
+        "ix_document_versions_table_document",
+    } <= {index["name"] for index in inspect(engine).get_indexes("document_versions")}
+    assert "course_code" in {
+        column["name"] for column in inspect(engine).get_columns("document_lines")
+    }
+    engine.dispose()
+
+
 def test_mariadb_offline_migration_ddl_is_renderable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -468,3 +654,7 @@ def test_mariadb_offline_migration_ddl_is_renderable(
     assert "ALTER TABLE fraud_alerts ADD COLUMN is_canonical BOOL" in ddl
     assert "FOREIGN KEY(duplicate_of_alert_id) REFERENCES fraud_alerts (id)" in ddl
     assert "ix_fraud_alerts_operational_status_opened" in ddl
+    assert "ALTER TABLE document_versions ADD COLUMN document_type VARCHAR(48)" in ddl
+    assert "UPDATE document_versions SET" in ddl
+    assert "ix_document_versions_order_document" in ddl
+    assert "ALTER TABLE document_lines ADD COLUMN course_code VARCHAR(64)" in ddl

@@ -38,6 +38,7 @@ from retailprintguard.correlation.engine import (
     CorrelationEngine,
     LineChange,
     LineChangeType,
+    apply_order_change_lines,
     compare_document_lines,
 )
 from retailprintguard.db.models import (
@@ -107,6 +108,17 @@ def _evidence(value: str) -> EvidenceLevel:
         return EvidenceLevel(value)
     except ValueError:
         return EvidenceLevel.UNKNOWN
+
+
+def _versioned_semantic(
+    version: DocumentVersion,
+    legacy_projection: Document,
+    attribute: str,
+) -> Any:
+    """Read immutable version data, falling back only for pre-migration rows."""
+
+    version_value = getattr(version, attribute)
+    return version_value if version_value is not None else getattr(legacy_projection, attribute)
 
 
 def activate_parser_version(
@@ -350,6 +362,7 @@ def load_latest_documents(
             lines.append(
                 DomainLine(
                     sequence=line.sequence,
+                    course_code=line.course_code,
                     item_code=line.item_code,
                     description=line.description,
                     quantity=line.quantity,
@@ -388,14 +401,14 @@ def load_latest_documents(
             source_device_id=device.external_id,
             source_session_id=proxy_session.source_session_id,
             source_job_id=job.source_job_id,
-            type=_document_type(document.document_type),
-            subtype=document.subtype or "UNKNOWN",
-            external_document_code=document.external_document_code,
-            order_code=document.order_code,
-            table_code=document.table_code,
-            operator_code=document.operator_code,
-            terminal_code=document.terminal_code,
-            document_timestamp=document.document_timestamp,
+            type=_document_type(_versioned_semantic(version, document, "document_type")),
+            subtype=_versioned_semantic(version, document, "subtype") or "UNKNOWN",
+            external_document_code=_versioned_semantic(version, document, "external_document_code"),
+            order_code=_versioned_semantic(version, document, "order_code"),
+            table_code=_versioned_semantic(version, document, "table_code"),
+            operator_code=_versioned_semantic(version, document, "operator_code"),
+            terminal_code=_versioned_semantic(version, document, "terminal_code"),
+            document_timestamp=_versioned_semantic(version, document, "document_timestamp"),
             captured_at=document.captured_at,
             gross_total=version.gross_total,
             net_total=version.net_total,
@@ -511,11 +524,35 @@ def _candidate_batch(
     source_job_ids = {item.value.source_job_id for item in loaded_seeds if item.value.source_job_id}
     strong_blocks = []
     if order_codes:
-        strong_blocks.append(Document.order_code.in_(order_codes))
+        strong_blocks.append(
+            or_(
+                DocumentVersion.order_code.in_(order_codes),
+                and_(
+                    DocumentVersion.order_code.is_(None),
+                    Document.order_code.in_(order_codes),
+                ),
+            )
+        )
     if external_codes:
-        strong_blocks.append(Document.external_document_code.in_(external_codes))
+        strong_blocks.append(
+            or_(
+                DocumentVersion.external_document_code.in_(external_codes),
+                and_(
+                    DocumentVersion.external_document_code.is_(None),
+                    Document.external_document_code.in_(external_codes),
+                ),
+            )
+        )
     if table_codes:
-        strong_blocks.append(Document.table_code.in_(table_codes))
+        strong_blocks.append(
+            or_(
+                DocumentVersion.table_code.in_(table_codes),
+                and_(
+                    DocumentVersion.table_code.is_(None),
+                    Document.table_code.in_(table_codes),
+                ),
+            )
+        )
     if session_ids:
         strong_blocks.append(ProxySession.source_session_id.in_(session_ids))
     if source_job_ids:
@@ -864,11 +901,27 @@ class CorrelationWorker:
         self,
         transaction: CorrelatedTransaction,
         loaded_by_id: dict[UUID, LoadedDocument],
-    ) -> list[tuple[datetime, OrderEventType, NormalizedDocument, UUID, dict[str, Any]]]:
+    ) -> list[
+        tuple[
+            datetime,
+            OrderEventType,
+            NormalizedDocument,
+            UUID,
+            dict[str, Any],
+            tuple[DomainLine, ...],
+        ]
+    ]:
         documents = list(transaction.documents)
         sources = [document for document in documents if document.type in _SOURCE_TYPES]
         desired: list[
-            tuple[datetime, OrderEventType, NormalizedDocument, UUID, dict[str, Any]]
+            tuple[
+                datetime,
+                OrderEventType,
+                NormalizedDocument,
+                UUID,
+                dict[str, Any],
+                tuple[DomainLine, ...],
+            ]
         ] = []
         if sources:
             first = min(sources, key=lambda item: (_document_time(item), str(item.id)))
@@ -879,6 +932,7 @@ class CorrelationWorker:
                     first,
                     loaded_by_id[first.id].version_id,
                     {"document_type": first.type.value, "total": str(first.gross_total)},
+                    first.lines,
                 )
             )
         for document in documents:
@@ -902,6 +956,7 @@ class CorrelationWorker:
                             "external_document_code": document.external_document_code,
                             "total": str(document.gross_total),
                         },
+                        document.lines,
                     )
                 )
             if document.payments and document.type is not DocumentType.PAYMENT:
@@ -916,12 +971,39 @@ class CorrelationWorker:
                                 payment.model_dump(mode="json") for payment in document.payments
                             ]
                         },
+                        document.lines,
                     )
                 )
 
         ordered_sources = sorted(sources, key=lambda item: (_document_time(item), str(item.id)))
-        comparisons: list[tuple[NormalizedDocument, NormalizedDocument]] = list(
-            zip(ordered_sources, ordered_sources[1:], strict=False)
+        comparisons: list[
+            tuple[tuple[DomainLine, ...], tuple[DomainLine, ...], NormalizedDocument]
+        ] = []
+
+        # Department tickets are partial views of one dispatch, not successive
+        # snapshots.  Comparing BAR lines with CUCINA lines would manufacture
+        # removals.  Keep an independent state per device/table and apply only
+        # explicit ORDER_CHANGE deltas to that state.
+        pos_state: dict[tuple[str, str], tuple[DomainLine, ...]] = {}
+        non_pos_sources: list[NormalizedDocument] = []
+        for document in ordered_sources:
+            table = document.table_code.strip().upper() if document.table_code else ""
+            state_key = (document.source_device_id, table)
+            if document.type is DocumentType.KITCHEN_ORDER:
+                if table:
+                    pos_state[state_key] = document.lines
+                continue
+            if document.type is DocumentType.ORDER_CHANGE:
+                before_lines = pos_state.get(state_key) if table else None
+                if before_lines is not None:
+                    after_lines = apply_order_change_lines(before_lines, document.lines)
+                    comparisons.append((before_lines, after_lines, document))
+                    pos_state[state_key] = after_lines
+                continue
+            non_pos_sources.append(document)
+        comparisons.extend(
+            (before.lines, after.lines, after)
+            for before, after in zip(non_pos_sources, non_pos_sources[1:], strict=False)
         )
         prebill = next(
             (
@@ -936,10 +1018,10 @@ class CorrelationWorker:
             None,
         )
         if prebill is not None and fiscal is not None:
-            comparisons.append((prebill, fiscal))
+            comparisons.append((prebill.lines, fiscal.lines, fiscal))
         seen_changes: set[str] = set()
-        for before, after in comparisons:
-            for change in compare_document_lines(before.lines, after.lines):
+        for before_lines, after_lines, after in comparisons:
+            for change in compare_document_lines(before_lines, after_lines):
                 event_type = _line_change_event(change)
                 if event_type is None:
                     continue
@@ -955,6 +1037,7 @@ class CorrelationWorker:
                         after,
                         loaded_by_id[after.id].version_id,
                         details,
+                        after_lines,
                     )
                 )
         if any(document.type in _FISCAL_TYPES for document in documents):
@@ -969,6 +1052,7 @@ class CorrelationWorker:
                     final,
                     loaded_by_id[final.id].version_id,
                     {"fiscal_total": str(transaction.fiscal_total)},
+                    final.lines,
                 )
             )
         desired.sort(key=lambda item: (item[0], item[1].value, str(item[2].id)))
@@ -1002,9 +1086,14 @@ class CorrelationWorker:
         snapshot_hash = ZERO_HASH if latest_snapshot is None else latest_snapshot.record_hash
         events_inserted = 0
         snapshots_inserted = 0
-        for occurred_at, event_type, document, version_id, details in self._desired_events(
-            transaction, loaded_by_id
-        ):
+        for (
+            occurred_at,
+            event_type,
+            document,
+            version_id,
+            details,
+            snapshot_lines,
+        ) in self._desired_events(transaction, loaded_by_id):
             detail_digest = hashlib.sha256(canonical_json(details)).hexdigest()
             event_id = uuid5(
                 NAMESPACE_URL,
@@ -1045,7 +1134,7 @@ class CorrelationWorker:
             if session.get(OrderSnapshot, snapshot_id) is not None:
                 continue
             snapshot_sequence += 1
-            line_state = [line.model_dump(mode="json") for line in document.lines]
+            line_state = [line.model_dump(mode="json") for line in snapshot_lines]
             snapshot_payload = {
                 "id": str(snapshot_id),
                 "order_id": str(order.id),

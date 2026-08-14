@@ -84,6 +84,7 @@ class DocumentLine(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     sequence: Annotated[int, Field(ge=0)]
+    course_code: str | None = None
     item_code: str | None = None
     description: str | None = None
     quantity: Money | None = None

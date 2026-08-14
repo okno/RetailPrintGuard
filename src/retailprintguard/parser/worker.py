@@ -21,8 +21,14 @@ class ParserRunReport:
 
 
 class ParserWorker:
-    def __init__(self, repository: SqlAlchemyParserRepository) -> None:
+    def __init__(
+        self,
+        repository: SqlAlchemyParserRepository,
+        *,
+        timezone_name: str = "Europe/Rome",
+    ) -> None:
         self.repository = repository
+        self.timezone_name = timezone_name
 
     def run_once(self, *, limit: int = 100, reparse: bool = False) -> ParserRunReport:
         job_ids = self.repository.pending_jobs(limit=limit, reparse=reparse)
@@ -44,7 +50,11 @@ class ParserWorker:
                 }
                 parser_kind = source["parser_kind"]
                 if parser_kind == "escpos":
-                    documents = parse_escpos(source["request"], **common)
+                    documents = parse_escpos(
+                        source["request"],
+                        timezone_name=self.timezone_name,
+                        **common,
+                    )
                 elif parser_kind == "rch_observed":
                     documents = parse_rch(
                         source["request"],

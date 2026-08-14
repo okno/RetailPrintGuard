@@ -7,13 +7,16 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, update
 
+from retailprintguard.common.hashchain import canonical_json
 from retailprintguard.correlation.worker import (
     CorrelationWorker,
+    _candidate_batch,
     activate_parser_version,
     load_latest_documents,
 )
 from retailprintguard.db import Base, create_db_engine, session_factory
 from retailprintguard.db.models import (
+    ActiveParserVersion,
     AnalysisWatermark,
     AuditLog,
     Device,
@@ -83,6 +86,9 @@ def _document(
     when: datetime,
     lines: tuple[tuple[str, str], ...],
     payment: str | None = None,
+    order_code: str = "ORDER-80",
+    table_code: str = "25-B",
+    operator_code: str = "OP-1",
 ) -> UUID:
     session_id, job_id, document_id = uuid4(), uuid4(), uuid4()
     session.add(  # type: ignore[attr-defined]
@@ -155,9 +161,9 @@ def _document(
             document_type=document_type,
             subtype=document_type,
             external_document_code=f"DOC-{source}",
-            order_code="ORDER-80",
-            table_code="25-B",
-            operator_code="OP-1",
+            order_code=order_code,
+            table_code=table_code,
+            operator_code=operator_code,
             document_timestamp=when,
             captured_at=when,
         )
@@ -168,6 +174,13 @@ def _document(
         parser_version_id=parser_id,
         raw_payload_id=raw.id,
         version_sequence=1,
+        document_type=document_type,
+        subtype=document_type,
+        external_document_code=f"DOC-{source}",
+        order_code=order_code,
+        table_code=table_code,
+        operator_code=operator_code,
+        document_timestamp=when,
         gross_total=Decimal(total),
         status="COMPLETE",
         normalized_text=f"{document_type} {total}",
@@ -320,6 +333,121 @@ def test_database_workers_persist_scenario_a_idempotently() -> None:
     engine.dispose()
 
 
+def test_worker_persists_pos_change_as_residual_quantity_not_removal() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        pos_id = _device(session, "pos_2", "pos", 9100)
+        parser = ParserVersion(
+            name="synthetic-pos",
+            version="1.0.0",
+            build_sha256=_sha("synthetic-pos-parser"),
+            protocol="escpos",
+        )
+        session.add(parser)
+        session.flush()
+        initial_id = _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="pos-quantity-two",
+            document_type="KITCHEN_ORDER",
+            total="16.00",
+            when=NOW,
+            lines=(("Pietanza mista", "8.00"),),
+        )
+        change_id = _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="pos-minus-one",
+            document_type="ORDER_CHANGE",
+            total="-8.00",
+            when=NOW + timedelta(seconds=20),
+            lines=(("Pietanza mista", "-8.00"),),
+        )
+        session.flush()
+        initial_version = session.scalar(
+            select(DocumentVersion.id).where(DocumentVersion.document_id == initial_id)
+        )
+        change_version = session.scalar(
+            select(DocumentVersion.id).where(DocumentVersion.document_id == change_id)
+        )
+        session.execute(
+            update(DocumentLine)
+            .where(DocumentLine.document_version_id == initial_version)
+            .values(quantity=Decimal("2"), line_total=Decimal("16.00"))
+        )
+        session.execute(
+            update(DocumentLine)
+            .where(DocumentLine.document_version_id == change_version)
+            .values(quantity=Decimal("-1"), line_total=Decimal("-8.00"))
+        )
+
+    report = CorrelationWorker(factory).run_once()
+    assert report.correlations_inserted == 1
+    with factory() as session:
+        correlation = session.scalar(select(DocumentCorrelation))
+        assert correlation is not None
+        assert "SAME_TABLE_CHANGE_SEQUENCE" in correlation.matched_criteria
+        events = session.scalars(select(OrderEvent).order_by(OrderEvent.sequence)).all()
+        quantity_events = [event for event in events if event.event_type == "QUANTITY_CHANGED"]
+        assert len(quantity_events) == 1
+        assert Decimal(quantity_events[0].details["before_quantity"]) == Decimal("2")
+        assert Decimal(quantity_events[0].details["after_quantity"]) == Decimal("1")
+        assert all(event.event_type != "ITEM_REMOVED" for event in events)
+        snapshot = session.scalar(
+            select(OrderSnapshot).where(OrderSnapshot.order_event_id == quantity_events[0].id)
+        )
+        assert snapshot is not None
+        assert Decimal(snapshot.lines[0]["quantity"]) == Decimal("1")
+    engine.dispose()
+
+
+def test_worker_groups_cross_department_dispatch_without_fake_line_changes() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        devices = (
+            _device(session, "pos_1", "pos", 9100),
+            _device(session, "pos_2", "pos", 9101),
+            _device(session, "pos_3", "pos", 9102),
+        )
+        parser = ParserVersion(
+            name="synthetic-pos-dispatch",
+            version="1.0.0",
+            build_sha256=_sha("synthetic-pos-dispatch-parser"),
+            protocol="escpos",
+        )
+        session.add(parser)
+        session.flush()
+        for index, (device_id, description) in enumerate(
+            zip(devices, ("Bibita", "Pietanza", "Pizza"), strict=True)
+        ):
+            _document(
+                session,
+                device_id=device_id,
+                parser_id=parser.id,
+                source=f"department-dispatch-{index}",
+                document_type="KITCHEN_ORDER",
+                total="0.00",
+                when=NOW + timedelta(seconds=index * 10),
+                lines=((description, "0.00"),),
+                order_code="ORDER-DISPATCH",
+                table_code="LAB-20",
+            )
+
+    report = CorrelationWorker(factory).run_once()
+    assert report.correlations_inserted == 1
+    with factory() as session:
+        correlation = session.scalar(select(DocumentCorrelation))
+        assert correlation is not None
+        assert "CROSS_DEPARTMENT_DISPATCH" in correlation.matched_criteria
+        assert session.scalar(select(func.count()).select_from(DocumentCorrelationMember)) == 3
+        event_types = set(session.scalars(select(OrderEvent.event_type)))
+        assert "ITEM_ADDED" not in event_types
+        assert "ITEM_REMOVED" not in event_types
+    engine.dispose()
+
+
 def test_order_without_fiscal_close_remains_idempotent_across_worker_polls() -> None:
     engine, factory = _database()
     _seed_scenario(factory, split=False)
@@ -327,10 +455,19 @@ def test_order_without_fiscal_close_remains_idempotent_across_worker_polls() -> 
         # Leave only the source/pre-bill side of the transaction and make it old
         # enough for ORDER_WITHOUT_FISCAL_CLOSE.  Re-evaluation time must not be
         # part of the stable finding identity.
+        fiscal_ids = select(Document.id).where(Document.document_type == "COMMERCIAL_DOCUMENT")
+        session.execute(
+            update(DocumentVersion)
+            .where(DocumentVersion.document_id.in_(fiscal_ids))
+            .values(document_type="UNKNOWN")
+        )
         session.execute(
             update(Document)
             .where(Document.document_type == "COMMERCIAL_DOCUMENT")
             .values(document_type="UNKNOWN")
+        )
+        session.execute(
+            update(DocumentVersion).values(document_timestamp=datetime(2000, 1, 1, tzinfo=UTC))
         )
         session.execute(
             update(Document).values(
@@ -639,6 +776,12 @@ def test_correlation_watermark_reprocesses_late_evidence_and_blocks_unrelated_ro
         assert stored is not None
         stored.order_code = "ORDER-UNRELATED"
         stored.table_code = "TABLE-UNRELATED"
+        stored_version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == unrelated)
+        )
+        assert stored_version is not None
+        stored_version.order_code = "ORDER-UNRELATED"
+        stored_version.table_code = "TABLE-UNRELATED"
 
     worker = CorrelationWorker(factory)
     first = worker.run_once(max_documents=1)
@@ -667,6 +810,11 @@ def test_correlation_watermark_reprocesses_late_evidence_and_blocks_unrelated_ro
         late = session.get(Document, late_id)
         assert late is not None
         late.external_document_code = "DOC-LATE"
+        late_version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == late_id)
+        )
+        assert late_version is not None
+        late_version.external_document_code = "DOC-LATE"
 
     second = worker.run_once(max_documents=10)
     assert second.correlations_inserted >= 1
@@ -726,6 +874,14 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
                 parser_version_id=new.id,
                 raw_payload_id=first.raw_payload_id,
                 version_sequence=2,
+                document_type="ORDER_CHANGE",
+                subtype="ORDER_CHANGE_REPARSED",
+                external_document_code="DOC-rollback-v2",
+                order_code="ORDER-V2",
+                table_code="TABLE-V2",
+                operator_code="OP-V2",
+                terminal_code="TERM-V2",
+                document_timestamp=NOW + timedelta(seconds=30),
                 gross_total=Decimal("1.00"),
                 status="COMPLETE",
                 normalized_text="new build result",
@@ -746,6 +902,9 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         assert len(loaded) == 1
         assert loaded[0].value.parser_version == "2.0.0"
         assert loaded[0].value.gross_total == Decimal("1.0000")
+        assert loaded[0].value.type.value == "ORDER_CHANGE"
+        assert loaded[0].value.table_code == "TABLE-V2"
+        assert loaded[0].value.operator_code == "OP-V2"
     with factory.begin() as session:
         session.add(
             AnalysisWatermark(
@@ -780,6 +939,167 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         assert len(loaded) == 1
         assert loaded[0].value.parser_version == "1.0.0"
         assert loaded[0].value.gross_total == Decimal("100.0000")
+        assert loaded[0].value.type.value == "PRE_BILL"
+        assert loaded[0].value.table_code == "25-B"
+        assert loaded[0].value.operator_code == "OP-1"
+    engine.dispose()
+
+
+def test_candidate_blocking_uses_semantics_from_selected_parser_version() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        device_id = _device(session, "pos_1", "pos", 9100)
+        old = ParserVersion(
+            name="escpos",
+            version="1.0.0",
+            build_sha256=_sha("candidate-old-build"),
+            protocol="escpos",
+        )
+        new = ParserVersion(
+            name="escpos",
+            version="2.0.0",
+            build_sha256=_sha("candidate-new-build"),
+            protocol="escpos",
+        )
+        session.add_all((old, new))
+        session.flush()
+        seed_id = _document(
+            session,
+            device_id=device_id,
+            parser_id=old.id,
+            source="candidate-seed",
+            document_type="PRE_BILL",
+            total="20.00",
+            when=NOW,
+            lines=(("Seed", "20.00"),),
+            order_code="ORDER-OLD",
+            table_code="TABLE-OLD",
+            operator_code="OP-OLD",
+        )
+        old_candidate_id = _document(
+            session,
+            device_id=device_id,
+            parser_id=old.id,
+            source="candidate-old",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="20.00",
+            when=NOW,
+            lines=(("Old", "20.00"),),
+            order_code="ORDER-OLD",
+            table_code="TABLE-OLD",
+            operator_code="OP-OLD",
+        )
+        new_candidate_id = _document(
+            session,
+            device_id=device_id,
+            parser_id=new.id,
+            source="candidate-new",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="20.00",
+            when=NOW,
+            lines=(("New", "20.00"),),
+            order_code="ORDER-NEW",
+            table_code="TABLE-NEW",
+            operator_code="OP-NEW",
+        )
+        first = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == seed_id)
+        )
+        assert first is not None
+        second = DocumentVersion(
+            document_id=seed_id,
+            parser_version_id=new.id,
+            raw_payload_id=first.raw_payload_id,
+            version_sequence=2,
+            document_type="ORDER_CHANGE",
+            subtype="ORDER_CHANGE_REPARSED",
+            external_document_code="DOC-candidate-seed-v2",
+            order_code="ORDER-NEW",
+            table_code="TABLE-NEW",
+            operator_code="OP-NEW",
+            terminal_code="TERM-NEW",
+            document_timestamp=NOW,
+            gross_total=Decimal("20.00"),
+            status="COMPLETE",
+            normalized_text="new selected semantics",
+            parse_confidence=100,
+            evidence_level="CONFIRMED",
+            source_manifest_sha256=first.source_manifest_sha256,
+            source_payload_sha256=first.source_payload_sha256,
+            source_path=first.source_path,
+            complete=True,
+            chain_scope=first.chain_scope,
+            chain_sequence=2,
+            previous_record_hash=first.record_hash,
+            record_hash=_sha("candidate-seed-v2-record"),
+            parsed_at=NOW + timedelta(minutes=10),
+        )
+        session.add(second)
+        # Deliberately make the legacy/current projection point at v2.  A v1
+        # activation must still use v1 fields for loading and SQL blocking.
+        projected = session.get(Document, seed_id)
+        assert projected is not None
+        projected.document_type = "ORDER_CHANGE"
+        projected.subtype = "ORDER_CHANGE_REPARSED"
+        projected.external_document_code = "DOC-candidate-seed-v2"
+        projected.order_code = "ORDER-NEW"
+        projected.table_code = "TABLE-NEW"
+        projected.operator_code = "OP-NEW"
+        projected.terminal_code = "TERM-NEW"
+        session.add(
+            ActiveParserVersion(
+                parser_name="escpos",
+                parser_version_id=old.id,
+                activation_reason="candidate test v1",
+            )
+        )
+        for version in session.scalars(
+            select(DocumentVersion).where(DocumentVersion.document_id != seed_id)
+        ):
+            version.parsed_at = NOW - timedelta(minutes=10)
+        first.parsed_at = NOW + timedelta(minutes=10)
+
+    def install_watermark(session, parser_id: UUID) -> None:
+        fingerprint = hashlib.sha256(
+            canonical_json([{"name": "escpos", "parser_version_id": str(parser_id)}])
+        ).hexdigest()
+        session.add(
+            AnalysisWatermark(
+                service="correlation",
+                cursor_timestamp=NOW,
+                cursor_id=uuid4(),
+                processed_count=0,
+                metadata_json={"parser_activation_fingerprint": fingerprint},
+            )
+        )
+
+    with factory.begin() as session:
+        old_id = session.scalar(select(ParserVersion.id).where(ParserVersion.version == "1.0.0"))
+        assert old_id is not None
+        install_watermark(session, old_id)
+        session.flush()
+        loaded, seeds = _candidate_batch(session, limit=10, lookback_seconds=60)
+        assert seeds == {seed_id}
+        assert {item.value.id for item in loaded} == {seed_id, old_candidate_id}
+        assert next(item.value for item in loaded if item.value.id == seed_id).table_code == (
+            "TABLE-OLD"
+        )
+
+    with factory.begin() as session:
+        session.delete(session.get(AnalysisWatermark, "correlation"))
+        pointer = session.get(ActiveParserVersion, "escpos")
+        new_id = session.scalar(select(ParserVersion.id).where(ParserVersion.version == "2.0.0"))
+        assert pointer is not None and new_id is not None
+        pointer.parser_version_id = new_id
+        install_watermark(session, new_id)
+        session.flush()
+        loaded, seeds = _candidate_batch(session, limit=10, lookback_seconds=60)
+        assert seeds == {seed_id}
+        assert {item.value.id for item in loaded} == {seed_id, new_candidate_id}
+        selected = next(item.value for item in loaded if item.value.id == seed_id)
+        assert selected.type.value == "ORDER_CHANGE"
+        assert selected.table_code == "TABLE-NEW"
+        assert selected.operator_code == "OP-NEW"
     engine.dispose()
 
 

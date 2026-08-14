@@ -89,6 +89,7 @@ export interface Diagnostics {
 
 export interface DocumentLine {
   sequence: number
+  course_code?: string
   item_code?: string
   description?: string
   quantity?: string

@@ -213,6 +213,7 @@ def _seed_api(factory):
             DocumentLine(
                 document_version_id=version.id,
                 sequence=1,
+                course_code="2",
                 description="Crudo e melone",
                 quantity=Decimal("1"),
                 unit_price=Decimal("100.00"),
@@ -352,6 +353,7 @@ def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> Non
         limit=20, offset=0, filters={"order_code": "ORD-80"}
     )
     assert total == 1 and documents[0].lines[0].description == "Crudo e melone"
+    assert documents[0].lines[0].course_code == "2"
     assert repository.get_document_raw(ids["document"]).content == b"PRECONTO 100,00"
     hits, hit_count = repository.search(query="melone", limit=10, offset=0)
     assert hit_count == 1 and hits[0].entity_id == ids["document"]

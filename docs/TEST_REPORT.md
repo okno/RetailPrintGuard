@@ -6,6 +6,27 @@
 > risultati finali saranno consolidati in
 > [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
+## Candidato parser POS e correlazione `1.2.0`
+
+**Stato:** gate offline completato il 14 agosto 2026; nessun RAW o dato
+operativo è incluso nelle fixture pubbliche.
+
+| Controllo | Risultato |
+|---|---|
+| suite Python completa | `135 passed`, `24 skipped`, `0 failed` |
+| parser/versioning/correlazione mirati | `53 passed`, `23 skipped`, `0 failed` |
+| stress idle-tail attivo | `10/10 passed`; risposta sintetica 800 ms, idle 500 ms |
+| Ruff e compileall | PASS |
+| Alembic SQLite + DDL offline MariaDB | `4 passed` |
+| `install.sh` Bash/ShellCheck | PASS |
+| `git diff --check` | PASS |
+
+La matrice sintetica copre bande raster multi-strip, OCR bounded, descrizioni
+mandate a capo, portate, quantità `2x` e delta `-1x`, rollback della versione
+attiva, dispatch su tre reparti, riuso tavolo e variazione con articolo non
+corrispondente. Gli skip sono 23 test POSIX non disponibili sul runner Windows
+e un test symlink condizionale.
+
 ## Hotfix 0.2.1
 
 **Stato:** completato offline il 14 agosto 2026; hardware e produzione esclusi.

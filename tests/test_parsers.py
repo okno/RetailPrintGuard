@@ -5,11 +5,16 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from retailprintguard.common.domain import DocumentType
-from retailprintguard.parser.escpos import parse_escpos
+from retailprintguard.parser.escpos import RasterOcrResult, parse_escpos
 from retailprintguard.parser.rch import frame_stream, parse_rch
 
 CAPTURED_AT = datetime(2042, 6, 7, 12, 0, tzinfo=UTC)
 MANIFEST_HASH = hashlib.sha256(b"synthetic-manifest").hexdigest()
+
+
+def _synthetic_table_raster(*, width: int = 8, strips: int = 4) -> bytes:
+    band = b"\x1b*\x21" + bytes((width, 0)) + (b"\x00" * (width * 3))
+    return b"\x1bJ\x30".join(band for _ in range(strips))
 
 
 def _rch_frame(
@@ -253,3 +258,137 @@ def test_escpos_legacy_cut_marks_document_complete_and_visible() -> None:
     assert len(change) == 1
     assert change[0].type is DocumentType.ORDER_CHANGE
     assert change[0].complete is True
+
+
+def test_escpos_pos_ticket_recovers_table_quantity_course_and_wrapped_item() -> None:
+    payload = (
+        b"\x1b@Operatore: 07/06/42  14:00\n"
+        + _synthetic_table_raster()
+        + b"\nPortata: 1\n--------------------------\n"
+        b"2x Pietanza m\n    ista\nCoperti: 1\n\x1bm"
+    )
+    original_hash = hashlib.sha256(payload).hexdigest()
+    seen: list[tuple[int, int, int]] = []
+
+    def ocr(image: object) -> RasterOcrResult:
+        seen.append((image.width, image.height, image.strip_count))  # type: ignore[attr-defined]
+        return RasterOcrResult("Tavolo: LAB-22", 96.5, (0, 0, 8, 96))
+
+    document = parse_escpos(
+        payload,
+        device_id="pos_synthetic",
+        session_id="session-pos-ticket",
+        job_id="job-pos-ticket",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=ocr,
+    )[0]
+
+    assert hashlib.sha256(payload).hexdigest() == original_hash
+    assert seen == [(8, 96, 4)]
+    assert document.type is DocumentType.KITCHEN_ORDER
+    assert document.table_code == "LAB-22"
+    assert document.operator_code is None
+    assert document.document_timestamp == CAPTURED_AT
+    assert document.gross_total is None
+    assert document.raw_metadata["covers"] == 1
+    assert document.raw_metadata["table_code_evidence"] == "ESC_POS_RASTER_OCR_INFERRED"
+    assert "<OCR:ESC_STAR:96.50>Tavolo: LAB-22</OCR:ESC_STAR>" in document.normalized_text
+    assert len(document.lines) == 1
+    assert document.lines[0].description == "Pietanza mista"
+    assert document.lines[0].quantity == 2
+    assert document.lines[0].course_code == "1"
+    assert document.lines[0].state == "ACTIVE"
+    assert document.lines[0].raw_text == "2x Pietanza m\n    ista"
+    assert document.lines[0].source is not None
+    assert document.lines[0].source.offset >= 0
+    assert document.lines[0].source.offset + document.lines[0].source.length <= len(payload)
+
+
+def test_escpos_quantity_decrease_is_a_signed_delta_not_an_invented_removal() -> None:
+    document = parse_escpos(
+        b"\x1b@Portata: 1\n-1x Pietanza \n    mista\nCoperti: 1\n\x1bm",
+        device_id="pos_synthetic",
+        session_id="session-pos-change",
+        job_id="job-pos-change",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=lambda _image: None,
+    )[0]
+
+    assert document.type is DocumentType.ORDER_CHANGE
+    assert len(document.lines) == 1
+    assert document.lines[0].description == "Pietanza mista"
+    assert document.lines[0].quantity == -1
+    assert document.lines[0].state == "QUANTITY_DECREASE"
+    assert document.lines[0].removed is False
+
+
+def test_escpos_wrap_rules_and_multiple_courses_preserve_business_lines_only() -> None:
+    document = parse_escpos(
+        (
+            b"\x1b@Operatore: OP-LAB 07/06/42 14:00\n"
+            b"Portata: 1\n--------------------------\n"
+            b"1x Dessert\n    agli Agrum\n    i\n"
+            b"1x Bevanda 33\n    cl\n"
+            b"Portata: 2\n--------------------------\n"
+            b"1x Acqua natu\n    rale grand\n    e\n"
+            b"Coperti: 2\n\x1bm"
+        ),
+        device_id="pos_synthetic",
+        session_id="session-pos-courses",
+        job_id="job-pos-courses",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=lambda _image: None,
+    )[0]
+
+    assert document.operator_code == "OP-LAB"
+    assert document.document_timestamp == CAPTURED_AT
+    assert document.raw_metadata["covers"] == 2
+    assert [line.description for line in document.lines] == [
+        "Dessert agli Agrumi",
+        "Bevanda 33 cl",
+        "Acqua naturale grande",
+    ]
+    assert [line.course_code for line in document.lines] == ["1", "1", "2"]
+    assert all(line.quantity == 1 for line in document.lines)
+
+
+def test_escpos_raster_ocr_failure_and_low_confidence_are_non_fatal() -> None:
+    payload = b"\x1b@" + _synthetic_table_raster() + b"\nPortata: 1\n1x Voce\n\x1bm"
+
+    low = parse_escpos(
+        payload,
+        device_id="pos_synthetic",
+        session_id="session-low-ocr",
+        job_id="job-low-ocr",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=lambda _image: RasterOcrResult("Tavolo: LAB-LOW", 42.0),
+    )[0]
+
+    def failing_ocr(_image: object) -> RasterOcrResult:
+        raise RuntimeError("synthetic OCR failure")
+
+    failed = parse_escpos(
+        payload,
+        device_id="pos_synthetic",
+        session_id="session-failed-ocr",
+        job_id="job-failed-ocr",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=failing_ocr,
+    )[0]
+
+    assert low.table_code is None
+    assert "raster_table_ocr_below_confidence_threshold" in low.warnings
+    assert low.complete is True
+    assert failed.table_code is None
+    assert "raster_ocr_backend_error" in failed.warnings
+    assert failed.complete is True

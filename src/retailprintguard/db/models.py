@@ -300,6 +300,9 @@ class DocumentVersion(Base):
         UniqueConstraint("chain_scope", "chain_sequence"),
         Index("ix_document_versions_parser", "parser_version_id", "parsed_at"),
         Index("ix_document_versions_parsed_cursor", "parsed_at", "id"),
+        Index("ix_document_versions_order_document", "order_code", "document_id"),
+        Index("ix_document_versions_external_document", "external_document_code", "document_id"),
+        Index("ix_document_versions_table_document", "table_code", "document_id"),
     )
 
     id: Mapped[UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid4)
@@ -315,6 +318,18 @@ class DocumentVersion(Base):
     parse_run_id: Mapped[UUID] = mapped_column(UUIDBinary(), nullable=False, default=uuid4)
     version_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     parsed_at: Mapped[Any] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+    # Semantic identity is parser output and therefore belongs to the immutable
+    # version, not only to the mutable ``documents`` read projection.  These
+    # columns remain nullable so databases created by older releases and rows
+    # imported by legacy tooling can be read through the documented fallback.
+    document_type: Mapped[str | None] = mapped_column(String(48))
+    subtype: Mapped[str | None] = mapped_column(String(128))
+    external_document_code: Mapped[str | None] = mapped_column(String(128))
+    order_code: Mapped[str | None] = mapped_column(String(128))
+    table_code: Mapped[str | None] = mapped_column(String(128))
+    operator_code: Mapped[str | None] = mapped_column(String(128))
+    terminal_code: Mapped[str | None] = mapped_column(String(128))
+    document_timestamp: Mapped[Any | None] = mapped_column(UTCDateTime())
     gross_total: Mapped[Decimal | None] = mapped_column(MONEY)
     net_total: Mapped[Decimal | None] = mapped_column(MONEY)
     discount_total: Mapped[Decimal | None] = mapped_column(MONEY)
@@ -350,6 +365,7 @@ class DocumentLine(Base):
         UUIDBinary(), ForeignKey("document_versions.id", ondelete="RESTRICT"), nullable=False
     )
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    course_code: Mapped[str | None] = mapped_column(String(64))
     item_code: Mapped[str | None] = mapped_column(String(128))
     description: Mapped[str | None] = mapped_column(String(512))
     quantity: Mapped[Decimal | None] = mapped_column(MONEY)

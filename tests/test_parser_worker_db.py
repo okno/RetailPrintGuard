@@ -2,20 +2,26 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import uuid4
 
 from sqlalchemy import func, select
 
+from retailprintguard.common.domain import DocumentLine as DomainLine
 from retailprintguard.common.domain import DocumentType
+from retailprintguard.correlation.worker import load_latest_documents
 from retailprintguard.db import Base, create_db_engine, session_factory
 from retailprintguard.db.models import (
     Device,
     Document,
+    DocumentLine,
     DocumentVersion,
     PrintJob,
     ProxySession,
     RawPayload,
 )
+from retailprintguard.parser import escpos as escpos_parser
+from retailprintguard.parser import repository as parser_repository
 from retailprintguard.parser.escpos import parse_escpos
 from retailprintguard.parser.repository import SqlAlchemyParserRepository
 from retailprintguard.parser.worker import ParserWorker
@@ -214,7 +220,32 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         source_path="/spool/synthetic/client.raw",
     )
     assert repository.store_documents(str(job_id), parsed) == 1
-    revised = tuple(document.model_copy(update={"parser_version": "2.0.0"}) for document in parsed)
+    revised = tuple(
+        document.model_copy(
+            update={
+                "parser_version": "2.0.0",
+                "type": DocumentType.ORDER_CHANGE,
+                "subtype": "ORDER_CHANGE_REPARSED",
+                "external_document_code": "DOC-V2",
+                "order_code": "ORDER-V2",
+                "table_code": "TABLE-V2",
+                "operator_code": "OP-V2",
+                "terminal_code": "TERM-V2",
+                "document_timestamp": NOW,
+                "lines": (
+                    DomainLine(
+                        sequence=1,
+                        course_code="2",
+                        description="Crudo e melone",
+                        quantity=Decimal("-1"),
+                        state="QUANTITY_DECREASE",
+                        removed=False,
+                    ),
+                ),
+            }
+        )
+        for document in parsed
+    )
     assert repository.store_documents(str(job_id), revised) == 1
 
     with factory() as session:
@@ -225,6 +256,29 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         assert [version.version_sequence for version in versions] == [1, 2]
         assert versions[1].previous_record_hash == versions[0].record_hash
         assert versions[0].chain_scope == versions[1].chain_scope
+        assert versions[0].document_type == DocumentType.PRE_BILL.value
+        assert versions[1].document_type == DocumentType.ORDER_CHANGE.value
+        assert versions[1].subtype == "ORDER_CHANGE_REPARSED"
+        assert versions[1].order_code == "ORDER-V2"
+        assert versions[1].table_code == "TABLE-V2"
+        assert versions[1].operator_code == "OP-V2"
+        assert versions[1].terminal_code == "TERM-V2"
+        projection = session.scalar(select(Document))
+        assert projection is not None
+        assert projection.document_type == DocumentType.ORDER_CHANGE.value
+        assert projection.table_code == "TABLE-V2"
+        revised_line = session.scalar(
+            select(DocumentLine).where(DocumentLine.document_version_id == versions[1].id)
+        )
+        assert revised_line is not None
+        assert revised_line.course_code == "2"
+        assert revised_line.quantity == Decimal("-1.0000")
+        assert revised_line.line_state == "QUANTITY_DECREASE"
+        assert revised_line.removed is False
+        selected = load_latest_documents(session, document_ids={projection.id})
+        assert len(selected) == 1
+        assert selected[0].value.lines[0].course_code == "2"
+        assert selected[0].value.lines[0].quantity == Decimal("-1.0000")
     assert repository.pending_jobs(limit=10) == ()
     assert repository.pending_jobs(limit=10, reparse=True) == ()
     engine.dispose()
@@ -246,3 +300,21 @@ def test_parser_failures_back_off_and_eventually_require_explicit_retry() -> Non
     assert repository.pending_jobs(limit=10) == ()
     assert repository.pending_jobs(limit=10, reparse=True) == (str(job_id),)
     engine.dispose()
+
+
+def test_parser_build_identity_includes_optional_runtime_fingerprint(monkeypatch) -> None:
+    monkeypatch.setattr(
+        escpos_parser,
+        "PARSER_RUNTIME_FINGERPRINT",
+        "ocr-runtime-a",
+        raising=False,
+    )
+    first = parser_repository._parser_build_sha256(escpos_parser.PARSER_NAME)
+    monkeypatch.setattr(
+        escpos_parser,
+        "PARSER_RUNTIME_FINGERPRINT",
+        lambda: b"ocr-runtime-b",
+    )
+    second = parser_repository._parser_build_sha256(escpos_parser.PARSER_NAME)
+    assert first != second
+    assert len(first) == len(second) == 64

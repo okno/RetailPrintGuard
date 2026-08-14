@@ -706,6 +706,7 @@ class SqlAlchemyApiRepository:
                     lines=[
                         DocumentLineView(
                             sequence=line.sequence,
+                            course_code=line.course_code,
                             item_code=line.item_code,
                             description=line.description,
                             quantity=line.quantity,

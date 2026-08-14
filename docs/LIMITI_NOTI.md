@@ -17,6 +17,12 @@ Stato verificato sul worktree del 13 agosto 2026.
   Le pure function, la persistenza, il collegamento response-RAW, il reparse
   append-only e il backoff sono testati su SQLite/fixture sintetiche; la
   copertura dei dialetti/device reali resta da attestare.
+- L'OCR ESC/POS è un derivato inferenziale: una lettura del tavolo sotto soglia,
+  conflittuale o non disponibile resta vuota/warning. Non sostituisce il RAW,
+  la fotografia autorizzata o un identificativo testuale esplicito.
+- Il backfill della migrazione semantica non può ricostruire differenze tra
+  vecchie versioni che in precedenza non memorizzavano tipo/tavolo/operatore:
+  copia la proiezione legacy disponibile senza modificare hash o RAW.
 - `--once --reparse-all` è volutamente globale entro `--limit`: non espone
   ancora filtri per device, data, batch o versione sorgente, né orchestra da
   solo il ricalcolo selettivo di correlazioni e alert. Usarlo prima su un

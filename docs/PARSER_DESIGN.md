@@ -41,6 +41,20 @@ Classificazioni minime: comanda, modifica comanda, preconto e documento non
 fiscale sconosciuto. Quantità negative/rimozioni devono diventare eventi
 espliciti e mantenere la riga sorgente.
 
+Il parser ESC/POS `1.2.0` interpreta una riga articolo soltanto in presenza di
+un prefisso quantità esplicito, esclude intestazioni/separatori e conserva
+frammenti e span quando una descrizione viene mandata a capo. `Portata` viene
+associata alle righe successive. Una quantità negativa è un delta osservato:
+il parser non inventa una rimozione completa; il correlatore applica il delta
+allo snapshot precedente e marca la rimozione solo a quantità residua zero.
+
+I banner raster composti da bande `ESC *` coerenti possono essere passati a un
+OCR bounded nel solo worker parser. Il limite è di quattro immagini e quattro
+milioni di pixel, con timeout e output limitati; il tavolo viene accettato solo
+da un match stretto sopra la soglia di confidenza. Backend assente, timeout,
+output eccessivo o bassa confidenza degradano a metadato/warning. Nessuna di
+queste condizioni modifica il RAW o il forwarding.
+
 ## RCH osservato
 
 Il parser RCH è evidence-driven e non deduce il protocollo dal numero di porta.
@@ -92,6 +106,9 @@ dry-run e solo su backup/staging. Il reprocessing non modifica i file RAW.
 - status errore separato dal documento;
 - annullo esplicito;
 - cut ESC/POS legacy;
+- bande raster multi-strip, OCR assente/errore/bassa confidenza e tavolo ad alta
+  confidenza;
+- descrizioni mandate a capo, portate e quantità firmate con stato derivato;
 - encoding e caratteri di controllo;
 - limite input/malformed senza crash;
 - determinismo e versioni append-only;

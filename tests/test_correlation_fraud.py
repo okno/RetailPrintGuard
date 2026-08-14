@@ -15,7 +15,13 @@ from retailprintguard.common.domain import (
     PaymentRecord,
 )
 from retailprintguard.common.hashchain import verify_chain
-from retailprintguard.correlation import CorrelationEngine, LineChangeType
+from retailprintguard.correlation import (
+    ALGORITHM_VERSION,
+    CorrelationEngine,
+    LineChangeType,
+    apply_order_change_lines,
+    compare_document_lines,
+)
 from retailprintguard.fraud import (
     DEFAULT_RULES,
     FraudContext,
@@ -425,3 +431,171 @@ def test_device_response_is_correlated_by_exact_duplex_job_without_business_code
     correlation = transactions[0].correlation
     assert correlation is not None
     assert "response_job_context" in correlation.matched_criteria
+
+
+def _pos_evidence(
+    name: str,
+    document_type: DocumentType,
+    *,
+    device: str,
+    table: str,
+    second: int,
+    lines: tuple[DocumentLine, ...],
+) -> NormalizedDocument:
+    document = _document(
+        name,
+        document_type,
+        "0.00",
+        lines,
+        minute=0,
+        device=device,
+        external_code=f"IGNORED-{name}",
+    )
+    return document.model_copy(
+        update={
+            "source_session_id": f"session-{name}",
+            "external_document_code": None,
+            "order_code": None,
+            "table_code": table,
+            "operator_code": None,
+            "terminal_code": None,
+            "document_timestamp": BASE_TIME + timedelta(seconds=second),
+            "captured_at": BASE_TIME + timedelta(seconds=second, milliseconds=10),
+            "gross_total": None,
+            "net_total": None,
+            "raw_metadata": {},
+        }
+    )
+
+
+def test_cross_department_pos_dispatch_uses_narrow_explainable_table_window() -> None:
+    bar = _pos_evidence(
+        "dispatch-bar",
+        DocumentType.KITCHEN_ORDER,
+        device="pos_1",
+        table="LAB-20",
+        second=0,
+        lines=(_line(1, "BAR", "4.00"),),
+    )
+    kitchen = _pos_evidence(
+        "dispatch-kitchen",
+        DocumentType.KITCHEN_ORDER,
+        device="pos_2",
+        table="lab-20",
+        second=12,
+        lines=(_line(1, "FOOD", "9.00"),),
+    )
+    pizzeria = _pos_evidence(
+        "dispatch-pizzeria",
+        DocumentType.KITCHEN_ORDER,
+        device="pos_3",
+        table="LAB-20",
+        second=24,
+        lines=(_line(1, "PIZZA", "8.00"),),
+    )
+
+    transactions = CorrelationEngine().correlate((pizzeria, bar, kitchen))
+
+    assert len(transactions) == 1
+    correlation = transactions[0].correlation
+    assert correlation is not None
+    assert correlation.algorithm_version == ALGORITHM_VERSION
+    assert "CROSS_DEPARTMENT_DISPATCH" in correlation.matched_criteria
+    assert "CROSS_DEPARTMENT_DISPATCH" in correlation.explanation
+
+    reused_later = _pos_evidence(
+        "dispatch-reused-table",
+        DocumentType.KITCHEN_ORDER,
+        device="pos_2",
+        table="LAB-20",
+        second=600,
+        lines=(_line(1, "OTHER", "3.00"),),
+    )
+    separated = CorrelationEngine().correlate((bar, reused_later))
+    assert len(separated) == 2
+    assert all(transaction.correlation is None for transaction in separated)
+
+    same_device = kitchen.model_copy(
+        update={"id": _id("dispatch-same-device"), "source_device_id": "pos_1"}
+    )
+    not_cross_department = CorrelationEngine().correlate((bar, same_device))
+    assert len(not_cross_department) == 2
+
+
+def test_same_table_change_sequence_applies_signed_quantity_as_delta() -> None:
+    initial_line = DocumentLine(
+        sequence=1,
+        item_code="SALAD",
+        description="Pietanza mista",
+        quantity=Decimal("2"),
+        unit_price=Decimal("8.00"),
+        line_total=Decimal("16.00"),
+    )
+    decrement = DocumentLine(
+        sequence=1,
+        item_code="SALAD",
+        description="Pietanza mista",
+        quantity=Decimal("-1"),
+        unit_price=Decimal("8.00"),
+        line_total=Decimal("-8.00"),
+        raw_text="-1x Pietanza mista",
+    )
+    kitchen = _pos_evidence(
+        "change-initial",
+        DocumentType.KITCHEN_ORDER,
+        device="pos_2",
+        table="LAB-22",
+        second=0,
+        lines=(initial_line,),
+    )
+    change = _pos_evidence(
+        "change-minus-one",
+        DocumentType.ORDER_CHANGE,
+        device="pos_2",
+        table="LAB-22",
+        second=20,
+        lines=(decrement,),
+    )
+
+    transaction = CorrelationEngine().correlate((change, kitchen))[0]
+    assert transaction.correlation is not None
+    assert "SAME_TABLE_CHANGE_SEQUENCE" in transaction.correlation.matched_criteria
+
+    effective = apply_order_change_lines(kitchen.lines, change.lines)
+    assert len(effective) == 1
+    assert effective[0].quantity == Decimal("1")
+    changes = compare_document_lines(kitchen.lines, effective)
+    assert len(changes) == 1
+    assert changes[0].change_type is LineChangeType.QUANTITY_CHANGED
+    assert changes[0].before_quantity == Decimal("2")
+    assert changes[0].after_quantity == Decimal("1")
+    assert all(item.change_type is not LineChangeType.REMOVED for item in changes)
+
+    wrong_device = change.model_copy(
+        update={"id": _id("change-wrong-device"), "source_device_id": "pos_1"}
+    )
+    late_change = change.model_copy(
+        update={
+            "id": _id("change-too-late"),
+            "document_timestamp": BASE_TIME + timedelta(seconds=301),
+            "captured_at": BASE_TIME + timedelta(seconds=301, milliseconds=10),
+        }
+    )
+    unrelated_item_change = change.model_copy(
+        update={
+            "id": _id("change-unrelated-item"),
+            "lines": (
+                DocumentLine(
+                    sequence=1,
+                    item_code="PIZZA",
+                    description="Pizza margherita",
+                    quantity=Decimal("-1"),
+                    raw_text="-1x Pizza margherita",
+                ),
+            ),
+        }
+    )
+    for incompatible in (wrong_device, late_change, unrelated_item_change):
+        unlinked = CorrelationEngine().correlate((kitchen, incompatible))
+        assert len(unlinked) == 2
+        assert all(item.correlation is None for item in unlinked)

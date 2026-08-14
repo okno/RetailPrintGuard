@@ -128,6 +128,22 @@ def test_installer_never_mutates_host_networking_and_requires_site_validation() 
     assert "wheel==0.45.1" in build_lock
     assert build_lock.count("--hash=sha256:") == 3
     assert "--require-hashes" in install
+    assert "tesseract-ocr" in install
+    assert "tesseract-ocr-eng" in install
+    assert "tesseract-ocr-ita" in install
+    assert "systemctl" in install and "tesseract" in install
+
+
+def test_parser_ocr_is_control_plane_only_and_has_a_reproducible_language() -> None:
+    parser = (SYSTEMD / "retailprintguard-parser.service").read_text(encoding="utf-8")
+    assert "Environment=RPG_POS_OCR_LANG=ita+eng" in parser
+    for proxy_name in (
+        "retailprintguard-pos-proxy.service",
+        "retailprintguard-rch-proxy.service",
+    ):
+        proxy = (SYSTEMD / proxy_name).read_text(encoding="utf-8")
+        assert "tesseract" not in proxy.lower()
+        assert "RPG_POS_OCR" not in proxy
 
 
 def test_virtualenv_is_built_at_final_path_and_entrypoints_are_verified() -> None:

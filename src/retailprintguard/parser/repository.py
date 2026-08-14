@@ -327,6 +327,14 @@ class SqlAlchemyParserRepository:
                         parser_version_id=parser.id,
                         raw_payload_id=source_raw.id if source_raw is not None else None,
                         version_sequence=version_sequence,
+                        document_type=parsed.type.value,
+                        subtype=parsed.subtype,
+                        external_document_code=parsed.external_document_code,
+                        order_code=parsed.order_code,
+                        table_code=parsed.table_code,
+                        operator_code=parsed.operator_code,
+                        terminal_code=parsed.terminal_code,
+                        document_timestamp=parsed.document_timestamp,
                         gross_total=parsed.gross_total,
                         net_total=parsed.net_total,
                         discount_total=parsed.discount_total,
@@ -351,12 +359,24 @@ class SqlAlchemyParserRepository:
                     )
                     session.add(version)
                     session.flush()
+                    # ``documents`` is a convenient current read projection.
+                    # Historical parser semantics remain append-only in
+                    # ``document_versions`` and are never overwritten here.
+                    document.document_type = parsed.type.value
+                    document.subtype = parsed.subtype
+                    document.external_document_code = parsed.external_document_code
+                    document.order_code = parsed.order_code
+                    document.table_code = parsed.table_code
+                    document.operator_code = parsed.operator_code
+                    document.terminal_code = parsed.terminal_code
+                    document.document_timestamp = parsed.document_timestamp
                     for line in parsed.lines:
                         source = line.source
                         session.add(
                             DocumentLine(
                                 document_version_id=version.id,
                                 sequence=line.sequence,
+                                course_code=line.course_code,
                                 item_code=line.item_code,
                                 description=line.description,
                                 quantity=line.quantity,
@@ -477,7 +497,30 @@ def _parser_build_sha256(parser_name: str) -> str:
     module = modules.get(parser_name)
     if module is None or module.__file__ is None:
         raise ParserRepositoryError(f"unknown parser implementation: {parser_name}")
-    return hashlib.sha256(Path(module.__file__).read_bytes(), usedforsecurity=True).hexdigest()
+    implementation = Path(module.__file__).read_bytes()
+    runtime_fingerprint: Any | None = None
+    for attribute in (
+        "PARSER_RUNTIME_FINGERPRINT",
+        "RUNTIME_FINGERPRINT",
+        "parser_runtime_fingerprint",
+    ):
+        if hasattr(module, attribute):
+            runtime_fingerprint = getattr(module, attribute)
+            break
+    if callable(runtime_fingerprint):
+        runtime_fingerprint = runtime_fingerprint()
+    if runtime_fingerprint is None:
+        # Preserve the historical identity for parsers without runtime assets.
+        return hashlib.sha256(implementation, usedforsecurity=True).hexdigest()
+    if isinstance(runtime_fingerprint, str):
+        encoded_fingerprint = runtime_fingerprint.encode("utf-8")
+    elif isinstance(runtime_fingerprint, bytes):
+        encoded_fingerprint = runtime_fingerprint
+    else:
+        raise ParserRepositoryError("parser runtime fingerprint must be str or bytes")
+    identity = b"retailprintguard-parser-build-v2\x00" + implementation
+    identity += b"\x00runtime-fingerprint\x00" + encoded_fingerprint
+    return hashlib.sha256(identity, usedforsecurity=True).hexdigest()
 
 
 __all__ = [

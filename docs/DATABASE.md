@@ -84,8 +84,8 @@ erDiagram
 | `parser_versions` | nome, versione e build del parser |
 | `active_parser_versions` | puntatore esplicito alla build attiva per nome parser, con motivo/data |
 | `documents` | identità stabile del documento sorgente |
-| `document_versions` | interpretazioni versionate, importi, testo, warning, hash |
-| `document_lines` | articoli, quantità, prezzi, sconti, IVA e span raw |
+| `document_versions` | interpretazioni append-only, inclusi tipo, riferimenti, tavolo, operatore, timestamp, importi, parser e hash |
+| `document_lines` | articoli, portata, quantità, prezzi, sconti, IVA e span raw |
 | `payments` | pagamenti associati a ordine o versione documento |
 
 La coppia `document_id`/`version_sequence` è univoca. Anche

@@ -87,9 +87,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
     ca-certificates curl gzip iproute2 logrotate mariadb-client mariadb-server \
-    nginx openssl python3 python3-pip python3-venv rsync tar util-linux
+    nginx openssl python3 python3-pip python3-venv rsync tar tesseract-ocr \
+    tesseract-ocr-eng tesseract-ocr-ita util-linux
 
-for command in flock install mariadb openssl python3 rsync runuser sha256sum systemctl; do
+for command in flock install mariadb openssl python3 rsync runuser sha256sum systemctl tesseract; do
     rpg_require_command "${command}"
 done
 

@@ -22,9 +22,11 @@ from retailprintguard.common.domain import (
     PaymentRecord,
 )
 
-ALGORITHM_VERSION = "rpg-correlation-1.1.0"
+ALGORITHM_VERSION = "rpg-correlation-1.2.0"
 ZERO = Decimal("0.0000")
 HUNDRED = Decimal("100")
+_CROSS_DEPARTMENT_WINDOW_SECONDS = 30
+_SAME_TABLE_CHANGE_WINDOW_SECONDS = 300
 
 _SOURCE_TYPES = {
     DocumentType.ORDER,
@@ -247,6 +249,69 @@ def compare_document_lines(
     return tuple(result)
 
 
+def apply_order_change_lines(
+    before: Iterable[DocumentLine], deltas: Iterable[DocumentLine]
+) -> tuple[DocumentLine, ...]:
+    """Apply observed ORDER_CHANGE quantities without mutating source evidence.
+
+    POS change tickets carry signed quantity deltas, rather than a replacement
+    snapshot.  Keeping this operation in the correlation layer lets the raw
+    ``-1x`` evidence remain untouched while derived order events expose the
+    effective residual quantity.  A line is removed only when its resulting
+    quantity reaches zero (or the change explicitly marks it removed).
+    """
+
+    state: dict[str, DocumentLine] = {}
+    order: list[str] = []
+    for ordinal, line in enumerate(before):
+        key = _line_key(line, ordinal)
+        if key not in state:
+            order.append(key)
+            state[key] = line
+            continue
+        current = state[key]
+        state[key] = current.model_copy(
+            update={
+                "quantity": (current.quantity or Decimal("1")) + (line.quantity or Decimal("1")),
+            }
+        )
+
+    for ordinal, delta in enumerate(deltas):
+        key = _line_key(delta, ordinal)
+        current = state.get(key)
+        delta_quantity = delta.quantity or ZERO
+        explicitly_removed = delta.removed or delta.cancelled
+        if current is None:
+            if explicitly_removed or delta_quantity <= ZERO:
+                # An unmatched negative delta is retained only in the original
+                # document.  Inventing a prior quantity would corrupt state.
+                continue
+            order.append(key)
+            state[key] = delta
+            continue
+
+        residual = (current.quantity or Decimal("1")) + delta_quantity
+        if explicitly_removed or residual <= ZERO:
+            state.pop(key)
+            order.remove(key)
+            continue
+
+        line_total = current.line_total
+        effective_price = _effective_unit_price(current)
+        if effective_price is not None:
+            line_total = effective_price * residual
+        state[key] = current.model_copy(
+            update={
+                "quantity": residual,
+                "line_total": line_total,
+                "state": "CHANGED",
+                "raw_text": delta.raw_text or current.raw_text,
+                "source": delta.source or current.source,
+            }
+        )
+    return tuple(state[key] for key in order if key in state)
+
+
 def _line_similarity(left: NormalizedDocument, right: NormalizedDocument) -> Decimal | None:
     left_keys = set(_aggregate_lines(left.lines))
     right_keys = set(_aggregate_lines(right.lines))
@@ -451,6 +516,114 @@ class CorrelationEngine:
             criteria=tuple(criteria),
         )
 
+    def _cross_department_dispatch_pair(
+        self, left: NormalizedDocument, right: NormalizedDocument
+    ) -> _PairScore | None:
+        """Link simultaneous department copies of one POS table dispatch.
+
+        A table number is intentionally not sufficient on its own: both
+        documents must be kitchen tickets from different devices and arrive
+        within the narrow dispatch window observed for a single send action.
+        """
+
+        if (
+            left.type is not DocumentType.KITCHEN_ORDER
+            or right.type is not DocumentType.KITCHEN_ORDER
+        ):
+            return None
+        if left.source_device_id == right.source_device_id:
+            return None
+        left_table, right_table = _normalise(left.table_code), _normalise(right.table_code)
+        if left_table is None or left_table != right_table:
+            return None
+        delta_seconds = abs((_document_time(right) - _document_time(left)).total_seconds())
+        if delta_seconds > _CROSS_DEPARTMENT_WINDOW_SECONDS:
+            return None
+        criteria = (
+            _Criterion(
+                name="CROSS_DEPARTMENT_DISPATCH",
+                weight=75,
+                matched=True,
+                detail=(f"stesso tavolo {left_table}, ticket cucina su dispositivi differenti"),
+            ),
+            _Criterion(
+                name="time_proximity",
+                weight=10,
+                matched=True,
+                detail=(
+                    f"distanza {int(delta_seconds)} secondi; limite dispatch "
+                    f"{_CROSS_DEPARTMENT_WINDOW_SECONDS}"
+                ),
+            ),
+        )
+        return _PairScore(
+            left_id=left.id,
+            right_id=right.id,
+            score=85,
+            criteria=criteria,
+        )
+
+    def _same_table_change_pair(
+        self, left: NormalizedDocument, right: NormalizedDocument
+    ) -> _PairScore | None:
+        """Link a signed POS change only to its recent local kitchen ticket."""
+
+        kitchen = left if left.type is DocumentType.KITCHEN_ORDER else right
+        change = left if left.type is DocumentType.ORDER_CHANGE else right
+        if {left.type, right.type} != {
+            DocumentType.KITCHEN_ORDER,
+            DocumentType.ORDER_CHANGE,
+        }:
+            return None
+        if kitchen.source_device_id != change.source_device_id:
+            return None
+        kitchen_table, change_table = (
+            _normalise(kitchen.table_code),
+            _normalise(change.table_code),
+        )
+        if kitchen_table is None or kitchen_table != change_table:
+            return None
+        shared_items = set(_aggregate_lines(kitchen.lines)) & set(_aggregate_lines(change.lines))
+        if not shared_items:
+            return None
+        delta_seconds = (_document_time(change) - _document_time(kitchen)).total_seconds()
+        if not 0 <= delta_seconds <= _SAME_TABLE_CHANGE_WINDOW_SECONDS:
+            return None
+        criteria = (
+            _Criterion(
+                name="SAME_TABLE_CHANGE_SEQUENCE",
+                weight=80,
+                matched=True,
+                detail=(
+                    f"ticket cucina seguito da variazione sullo stesso dispositivo e tavolo "
+                    f"{kitchen_table}"
+                ),
+            ),
+            _Criterion(
+                name="line_identity_overlap",
+                weight=10,
+                matched=True,
+                detail=(
+                    f"{len(shared_items)} articolo/i comuni per codice o descrizione normalizzata"
+                ),
+            ),
+            _Criterion(
+                name="time_proximity",
+                weight=10,
+                matched=True,
+                detail=(
+                    f"variazione dopo {int(delta_seconds)} secondi; limite sequenza "
+                    f"{_SAME_TABLE_CHANGE_WINDOW_SECONDS}"
+                ),
+            ),
+        )
+        return _PairScore(
+            left_id=left.id,
+            right_id=right.id,
+            score=100,
+            criteria=criteria,
+        )
+
     def _fiscal_siblings(
         self, left: NormalizedDocument, right: NormalizedDocument
     ) -> _PairScore | None:
@@ -549,6 +722,8 @@ class CorrelationEngine:
         return (
             self._device_response_pair(left, right)
             or self._fiscal_siblings(left, right)
+            or self._same_table_change_pair(left, right)
+            or self._cross_department_dispatch_pair(left, right)
             or self.score_pair(left, right)
         )
 
@@ -674,6 +849,14 @@ class CorrelationEngine:
                 }
                 - set(matched)
             )
+            evidence_details = sorted(
+                {
+                    criterion.detail
+                    for edge in relevant
+                    for criterion in edge.criteria
+                    if criterion.matched
+                }
+            )
             correlation = CorrelationResult(
                 transaction_id=transaction_id,
                 document_ids=tuple(document.id for document in documents),
@@ -683,7 +866,8 @@ class CorrelationEngine:
                 unmatched_criteria=tuple(unmatched),
                 explanation=(
                     f"{len(documents)} documenti collegati con punteggio minimo {score}; "
-                    f"criteri: {', '.join(matched)}"
+                    f"criteri: {', '.join(matched)}; "
+                    f"evidenze: {'; '.join(evidence_details)}"
                 ),
             )
 
@@ -721,8 +905,7 @@ class CorrelationEngine:
             else sum((_total(document) or ZERO) for document in economic_closures)
         )
         payment_total = sum(
-            payment.amount
-            for payment in _authoritative_payments(documents, valid_fiscal_documents)
+            payment.amount for payment in _authoritative_payments(documents, valid_fiscal_documents)
         )
         difference = None if prebill_total is None else prebill_total - comparison_total
         difference_percent = (
@@ -778,6 +961,7 @@ __all__ = [
     "LineChange",
     "LineChangeType",
     "TimelineEntry",
+    "apply_order_change_lines",
     "compare_document_lines",
     "numeric_suffix",
 ]

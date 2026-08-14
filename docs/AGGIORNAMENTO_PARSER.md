@@ -49,18 +49,28 @@ feed, cut, drawer e status realtime. Un decoder deve:
 - mantenere offset raw;
 - distinguere testo da dati binari;
 - limitare dimensioni raster e loop;
-- non invocare OCR come requisito di correttezza;
+- invocare l'OCR, quando necessario, soltanto nel worker parser con timeout,
+  output e pixel bounded; assenza o errore OCR deve produrre warning, non
+  perdita del RAW o errore del relay;
 - non trasformare preview reverse printproxy in risposta completa;
 - marcare `UNKNOWN` quando la semantica business non è sufficiente.
 
+Il parser ESC/POS `1.2.0` ricostruisce esclusivamente gruppi coerenti di bande
+`ESC *` osservate e usa Tesseract con lingua configurata dall'ambiente protetto
+del servizio. Accetta il tavolo soltanto con pattern stretto e confidenza almeno
+80. Testo OCR, confidenza, bounding box, dimensioni, offset e hash del bitmap
+derivato restano nei metadati; il payload originale non viene modificato.
+L'OCR non è importato né eseguito dai proxy POS/RCH.
+
 ## Parser nativi correnti
 
-Sono presenti due parser puri versione `1.0.0`:
+Sono presenti due parser nativi versionati:
 
-- `retailprintguard-escpos`: input massimo 16 MiB, massimo 1.024 documenti,
+- `retailprintguard-escpos` `1.2.0`: input massimo 16 MiB, massimo 1.024 documenti,
   split su comandi cut osservati, codepage allowlist, controlli resi come marker
-  leggibili e classificazione tramite indicatori letterali;
-- `retailprintguard-rch-observed`: framing incrementale sul flusso ricostruito,
+  leggibili, quantità firmate, portate, ricomposizione conservativa delle righe
+  mandate a capo e OCR raster bounded;
+- `retailprintguard-rch-observed` `1.1.0`: framing incrementale sul flusso ricostruito,
   BCC, ACK e issue bounded; ricostruisce aperture/chiusure gestionali e
   commerciali osservate e produce anche `DEVICE_RESPONSE` per frame reverse
   validi.
@@ -105,11 +115,19 @@ esponenziale da 5 secondi fino a un'ora; all'ottavo errore il job passa a
 copertura del dialetto fisico: fixture/PCAP autorizzati e collaudo hardware
 restano necessari.
 
-La repository registra in `parser_versions.build_sha256` lo SHA-256 del file
-Python che implementa il parser. Una modifica del file, anche senza cambio
-della versione semantica, crea quindi una build distinta. La release deve
-comunque essere content-addressed: l'hash del singolo modulo non sostituisce la
-provenienza del pacchetto completo.
+La repository registra in `parser_versions.build_sha256` un digest del modulo
+che implementa il parser. Per ESC/POS il digest include inoltre l'identità del
+runtime Tesseract e la lingua configurata; una modifica del codice o del runtime
+OCR crea quindi una build distinta anche senza cambio della versione semantica.
+La release deve comunque essere content-addressed: il digest del parser non
+sostituisce la provenienza del pacchetto completo.
+
+Tipo, sottotipo, riferimenti, tavolo, operatore, terminale e timestamp sono
+salvati in ogni `document_version`; la portata appartiene alla relativa riga.
+Il reparse aggiorna soltanto la proiezione corrente e aggiunge una versione
+immutabile. Per record creati prima della migrazione il backfill può copiare
+soltanto l'ultima proiezione legacy disponibile, perché le vecchie differenze
+non erano state memorizzate; RAW, hash e catene esistenti restano invariati.
 
 Rielaborazione append-only, esclusivamente one-shot:
 
@@ -163,7 +181,7 @@ riavvolga per default il watermark di correlazione:
 
 ```bash
 RPG_PARSER_NAME='retailprintguard-escpos'
-RPG_PARSER_VERSION='1.1.0'
+RPG_PARSER_VERSION='1.2.0'
 RPG_PARSER_BUILD_SHA256='incollare-qui-i-64-caratteri-esadecimali-verificati'
 RPG_PARSER_CHANGE_REASON='inserire change-id e motivazione approvata'
 [[ "${RPG_PARSER_BUILD_SHA256}" =~ ^[0-9a-f]{64}$ ]] || exit 1

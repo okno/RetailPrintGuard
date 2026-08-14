@@ -20,7 +20,7 @@ flowchart LR
 
 ## Correlazione spiegabile
 
-La versione correttiva corrente è `rpg-correlation-1.1.0`. Il punteggio usa criteri
+La versione correttiva corrente è `rpg-correlation-1.2.0`. Il punteggio usa criteri
 disponibili senza penalizzare automaticamente un campo assente. Tra i pesi
 massimi:
 
@@ -43,6 +43,16 @@ massimi:
 Il totale è limitato a 100. I documenti incompatibili o fuori finestra non
 vengono uniti. Ogni correlazione conserva criteri soddisfatti/non soddisfatti,
 spiegazione, versione algoritmo e membri originali.
+
+Per le comande POS sono disponibili due criteri compositi e prudenti:
+
+- `CROSS_DEPARTMENT_DISPATCH`: stesso tavolo, device POS differenti e massimo
+  30 secondi, per riunire le viste BAR/CUCINA/PIZZERIA dello stesso invio;
+- `SAME_TABLE_CHANGE_SEQUENCE`: stesso device e tavolo, variazione successiva
+  entro 300 secondi e almeno un articolo comune per codice o descrizione.
+
+I ticket dei reparti sono viste parziali simultanee, non snapshot successivi:
+confrontarli tra loro non genera quindi falsi articoli aggiunti o rimossi.
 
 Il motore calcola `ADDED`, `REMOVED`, `QUANTITY_CHANGED`, `PRICE_CHANGED`,
 `DISCOUNT_CHANGED` e `UNCHANGED`. Per i conti separati, il totale fiscale è la

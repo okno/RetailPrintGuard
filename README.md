@@ -25,7 +25,8 @@ in una dipendenza sincrona della stampa.
 - `retailprintguard-import`: import storico one-shot degli stessi formati;
 - `retailprintguard-parser`: worker DB indipendente che applica parser nativi
   puri e bounded a ESC/POS e ai frame RCH realmente osservati, senza dipendenze
-  dal relay;
+  dal relay; per i banner POS può usare OCR raster bounded nel solo control
+  plane, conservando sempre RAW, offset e confidenza;
 - `retailprintguard-correlate`: worker DB per correlazione deterministica, diff
   delle righe, ordini/eventi/snapshot e aggregazione dei documenti fiscali;
 - `retailprintguard-fraud`: worker DB per regole spiegabili e versionate, evidenze,

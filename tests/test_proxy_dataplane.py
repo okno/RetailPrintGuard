@@ -601,15 +601,16 @@ async def test_physical_target_lock_rejects_a_concurrent_client(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_active_reverse_tail_timeout_resets_on_each_chunk(tmp_path: Path) -> None:
-    chunks = tuple(bytes([value]) for value in range(12))
+    chunks = tuple(bytes([value]) for value in range(40))
     device = StreamingResponseDevice(chunks, delay=0.02)
     await device.start()
     settings = _settings(
         tmp_path,
         [_route("rch_streaming_tail", device.port, device_type="rch")],
-        # Keep the idle window shorter than the complete 240 ms response but
-        # large enough for coarse Windows CI scheduling under parallel load.
-        response_tail_timeout_seconds=0.12,
+        # Keep the idle window shorter than the complete 800 ms response while
+        # leaving enough scheduling margin for loaded Windows CI hosts.  The
+        # test still fails if the implementation uses one absolute deadline.
+        response_tail_timeout_seconds=0.5,
     )
     service = RelayService(settings)
     await service.start()

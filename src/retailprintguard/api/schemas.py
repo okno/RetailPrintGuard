@@ -139,6 +139,7 @@ class DiagnosticsView(BaseModel):
 
 class DocumentLineView(BaseModel):
     sequence: int
+    course_code: str | None = None
     item_code: str | None = None
     description: str | None = None
     quantity: Decimal | None = None

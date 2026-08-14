@@ -7,6 +7,7 @@ from retailprintguard.correlation.engine import (
     LineChange,
     LineChangeType,
     TimelineEntry,
+    apply_order_change_lines,
     compare_document_lines,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "LineChange",
     "LineChangeType",
     "TimelineEntry",
+    "apply_order_change_lines",
     "compare_document_lines",
 ]
