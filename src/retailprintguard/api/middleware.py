@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from time import monotonic
 from uuid import uuid4
 
 from fastapi import Request
@@ -17,12 +18,22 @@ CORRELATION_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 
 class CorrelationAndSecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        started = monotonic()
         supplied = request.headers.get("X-Correlation-ID", "")
         correlation_id = supplied if CORRELATION_RE.fullmatch(supplied) else str(uuid4())
         request.state.correlation_id = correlation_id
         try:
             response = await call_next(request)
         except RepositoryUnavailable:
+            logging.getLogger("retailprintguard.api").warning(
+                "control plane repository unavailable",
+                extra={
+                    "event": "api_request_failed",
+                    "correlation_id": correlation_id,
+                    "status": 503,
+                    "details": {"method": request.method, "path": request.url.path},
+                },
+            )
             response = JSONResponse(
                 status_code=503,
                 content={
@@ -53,4 +64,17 @@ class CorrelationAndSecurityMiddleware(BaseHTTPMiddleware):
             "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
         )
         response.headers["Cache-Control"] = "no-store"
+        logging.getLogger("retailprintguard.api").info(
+            "API request completed",
+            extra={
+                "event": "api_request_completed",
+                "correlation_id": correlation_id,
+                "status": response.status_code,
+                "details": {
+                    "method": request.method,
+                    "path": request.url.path,
+                    "duration_ms": round((monotonic() - started) * 1000, 3),
+                },
+            },
+        )
         return response

@@ -413,7 +413,7 @@ def _publish_ready(job_path: Path, job_id: str, manifest_sha256: str) -> Path:
 @dataclass(slots=True)
 class _OpenCommand:
     descriptor: SessionDescriptor
-    future: Future[None]
+    future: Future[None] | None
 
 
 @dataclass(slots=True)
@@ -598,6 +598,35 @@ class CaptureManager:
             raise
         return session
 
+    def open_session_nowait(
+        self,
+        descriptor: SessionDescriptor,
+        policy: StorageFailurePolicy,
+    ) -> CaptureSession:
+        """Queue session initialization without putting disk I/O on the relay path.
+
+        FIFO ordering guarantees that the writer opens the files before it sees
+        capture events.  Capacity is bounded: if even the open command cannot
+        be queued, the caller receives an explicit failure immediately and can
+        apply the configured storage policy without waiting on the filesystem.
+        """
+
+        if not self._running:
+            raise CaptureError("capture manager is not running")
+        if descriptor.session_id in self._sessions:
+            raise CaptureError(f"duplicate session id: {descriptor.session_id}")
+        session = CaptureSession(self, descriptor, policy)
+        self._sessions[descriptor.session_id] = session
+        try:
+            self._queue.put_nowait(_OpenCommand(descriptor, None))
+        except queue.Full as exc:
+            self._sessions.pop(descriptor.session_id, None)
+            session._mark_failure("bounded capture queue is full before session open")
+            raise CaptureQueueFull(
+                "bounded capture queue is full before session open"
+            ) from exc
+        return session
+
     def disabled_session(
         self,
         descriptor: SessionDescriptor,
@@ -672,9 +701,15 @@ class CaptureManager:
                             fsync_each_event=self.fsync_each_event,
                         )
                     except BaseException as exc:
-                        _future_exception(command.future, exc)
+                        self._threadsafe_failure(
+                            command.descriptor.session_id,
+                            f"capture open failed: {type(exc).__name__}: {exc}",
+                        )
+                        if command.future is not None:
+                            _future_exception(command.future, exc)
                     else:
-                        _future_result(command.future, None)
+                        if command.future is not None:
+                            _future_result(command.future, None)
                 elif isinstance(command, _EventCommand):
                     writer = writers.get(command.session_id)
                     if writer is None:
@@ -778,11 +813,22 @@ def recover_incomplete_spool(
                 files[name] = _file_facts(path)
             for preserved in sorted(candidate.glob("manifest.untrusted*.json")):
                 files[preserved.name] = _file_facts(preserved)
-            timeline = _inspect_timeline(candidate / "timeline.jsonl")
             captured_bytes = {
                 Direction.CLIENT_TO_DEVICE.value: files["client.raw"]["size"],
                 Direction.DEVICE_TO_CLIENT.value: files["device.raw"]["size"],
             }
+            timeline = _inspect_timeline(candidate / "timeline.jsonl")
+            timeline_covers_raw = (
+                timeline["integrity_ok"]
+                and timeline["covered_bytes"] == captured_bytes
+            )
+            recovery_errors = [
+                "unclean shutdown; completeness beyond captured prefixes is unknown"
+            ]
+            if not timeline_covers_raw:
+                recovery_errors.append(
+                    "timeline does not cover directional RAW; trailing bytes have no chunk index"
+                )
             manifest = {
                 "schema_version": SCHEMA_VERSION,
                 "capture_format": "retailprintguard-bidirectional-v1",
@@ -792,17 +838,18 @@ def recover_incomplete_spool(
                 "close_reason": "recovered_after_unclean_shutdown",
                 "status": "PARTIAL",
                 "transport_complete": False,
-                "storage_complete": timeline["integrity_ok"],
+                "storage_complete": timeline_covers_raw,
                 "observed_bytes": captured_bytes,
                 "observed_chunks": timeline["data_chunks"],
                 "captured_bytes": captured_bytes,
                 "captured_chunks": timeline["data_chunks"],
+                "timeline_covered_bytes": timeline["covered_bytes"],
                 "eof_events": timeline["eof_events"],
                 "timeline_events": timeline["events"],
                 "last_event_sha256": timeline["last_event_sha256"],
                 "dropped_chunks": 0,
                 "dropped_bytes": 0,
-                "errors": ["unclean shutdown; completeness beyond captured prefixes is unknown"],
+                "errors": recovery_errors,
                 "files": files,
             }
             manifest_bytes = _canonical_json_bytes(manifest) + b"\n"
@@ -853,6 +900,9 @@ def _inspect_timeline(path: Path) -> dict[str, Any]:
     events = 0
     data_chunks = {direction.value: 0 for direction in Direction}
     eof_events = {direction.value: 0 for direction in Direction}
+    covered_bytes = {direction.value: 0 for direction in Direction}
+    direction_sequences = {direction.value: 0 for direction in Direction}
+    observed_sequences: set[int] = set()
     previous_hash: str | None = None
     integrity_ok = True
     try:
@@ -863,16 +913,38 @@ def _inspect_timeline(path: Path) -> dict[str, Any]:
                     event_hash = entry.pop("event_sha256")
                     direction = str(entry["direction"])
                     kind = str(entry["kind"])
+                    sequence = int(entry["sequence"])
+                    observed_sequence = int(entry["observed_sequence"])
+                    direction_sequence = int(entry["direction_sequence"])
+                    offset = int(entry["offset"])
+                    length = int(entry["length"])
+                    if direction not in covered_bytes:
+                        raise ValueError
+                    if sequence != events or observed_sequence < 0:
+                        raise ValueError
+                    if observed_sequence in observed_sequences:
+                        raise ValueError
+                    if direction_sequence != direction_sequences[direction]:
+                        raise ValueError
+                    if offset != covered_bytes[direction] or length < 0:
+                        raise ValueError
                     if entry.get("previous_event_sha256") != previous_hash:
                         raise ValueError
                     if _sha256_bytes(_canonical_json_bytes(entry)) != event_hash:
                         raise ValueError
                     if kind == "data":
+                        if length < 1:
+                            raise ValueError
                         data_chunks[direction] += 1
+                        covered_bytes[direction] += length
                     elif kind == "eof":
+                        if length != 0:
+                            raise ValueError
                         eof_events[direction] += 1
                     else:
                         raise ValueError
+                    direction_sequences[direction] += 1
+                    observed_sequences.add(observed_sequence)
                     previous_hash = event_hash
                     events += 1
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -884,6 +956,7 @@ def _inspect_timeline(path: Path) -> dict[str, Any]:
         "events": events,
         "data_chunks": data_chunks,
         "eof_events": eof_events,
+        "covered_bytes": covered_bytes,
         "last_event_sha256": previous_hash,
         "integrity_ok": integrity_ok,
     }

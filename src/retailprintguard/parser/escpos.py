@@ -19,7 +19,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-escpos"
-PARSER_VERSION = "1.0.0"
+PARSER_VERSION = "1.1.0"
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_OUTPUT_CHARS = 4_000_000
 _MAX_DOCUMENTS = 1_024
@@ -62,8 +62,21 @@ def _segments(payload: bytes) -> tuple[_Segment, ...]:
     start = 0
     cursor = 0
     while cursor + 2 < len(payload) and len(result) < _MAX_DOCUMENTS - 1:
-        marker = payload.find(b"\x1d\x56", cursor)
-        if marker < 0 or marker + 2 >= len(payload):
+        gs_marker = payload.find(b"\x1d\x56", cursor)
+        esc_marker = payload.find(b"\x1b\x6d", cursor)
+        markers = [value for value in (gs_marker, esc_marker) if value >= 0]
+        if not markers:
+            break
+        marker = min(markers)
+        if payload[marker : marker + 2] == b"\x1b\x6d":
+            cut_end = marker + 2
+            next_init = payload.find(b"\x1b@", cut_end)
+            end = len(payload) if next_init < 0 else next_init
+            result.append(_Segment(payload[start:end], start, True))
+            start = end
+            cursor = end
+            continue
+        if marker + 2 >= len(payload):
             break
         mode = payload[marker + 2]
         if mode in {0, 1, 48, 49}:
@@ -73,9 +86,11 @@ def _segments(payload: bytes) -> tuple[_Segment, ...]:
         else:
             cursor = marker + 2
             continue
-        result.append(_Segment(payload[start:end], start, True))
-        start = end
-        cursor = end
+        next_init = payload.find(b"\x1b@", end)
+        segment_end = len(payload) if next_init < 0 else next_init
+        result.append(_Segment(payload[start:segment_end], start, True))
+        start = segment_end
+        cursor = segment_end
     if start < len(payload) or not result:
         result.append(_Segment(payload[start:], start, False))
     return tuple(result[:_MAX_DOCUMENTS])
@@ -168,6 +183,9 @@ def _extract_lines(
             elif command == 0x70 and cursor + 4 < len(payload):
                 control("<ESC/POS:CASH_DRAWER>", 5)
                 cursor += 5
+            elif command == 0x6D:
+                control("<ESC/POS:CUT>", 2)
+                cursor += 2
             elif command == 0x2A and cursor + 4 < len(payload):
                 width = payload[cursor + 3] + (payload[cursor + 4] << 8)
                 multiplier = 3 if payload[cursor + 2] in {32, 33} else 1
@@ -243,6 +261,12 @@ def _classify(text: str) -> tuple[DocumentType, str]:
         return DocumentType.KITCHEN_ORDER, "COMANDA_LITERAL"
     if "ORDINE" in upper:
         return DocumentType.ORDER, "ORDINE_LITERAL"
+    if re.search(r"-\s*\d+\s*[xX]\s+", text):
+        return DocumentType.ORDER_CHANGE, "VARIAZIONE_QUANTITA_POS_INFERRED"
+    if "PORTATA:" in upper or (
+        "COPERTI:" in upper and re.search(r"\b\d+\s*[xX]\s+", text)
+    ):
+        return DocumentType.KITCHEN_ORDER, "TICKET_POS_INFERRED"
     if "DOCUMENTO GESTIONALE" in upper:
         return DocumentType.MANAGEMENT_DOCUMENT, "GESTIONALE_LITERAL"
     return DocumentType.UNKNOWN, "NESSUN_MARCATORE_CONFERMATO"

@@ -17,16 +17,15 @@ from retailprintguard.proxy.spool import (
     SessionCloseSummary,
     SessionDescriptor,
     StorageFailurePolicy,
+    recover_incomplete_spool,
     utc_now_text,
 )
 
 TARGET = ("192.0.2.31", 9100)
 
 
-async def _write_capture(root: Path) -> Path:
-    manager = CaptureManager(root, queue_max_events=32, fsync_each_event=False)
-    await manager.start()
-    descriptor = SessionDescriptor(
+def _descriptor() -> SessionDescriptor:
+    return SessionDescriptor(
         session_id=str(uuid4()),
         job_id=str(uuid4()),
         device_id="pos_1",
@@ -39,6 +38,12 @@ async def _write_capture(root: Path) -> Path:
         connected_at_utc=utc_now_text(),
         connected_monotonic_ns=time.monotonic_ns(),
     )
+
+
+async def _write_capture(root: Path) -> Path:
+    manager = CaptureManager(root, queue_max_events=32, fsync_each_event=False)
+    await manager.start()
+    descriptor = _descriptor()
     capture = await manager.open_session(descriptor, StorageFailurePolicy.CONTINUE)
     client = b"ordine-sintetico\x1dV\x00"
     response = b"\x10\x00"
@@ -200,3 +205,122 @@ def test_discovery_observes_ready_published_after_directory_rename(tmp_path: Pat
     discovered = adapter.discover(maximum=10)
     assert len(discovered) == 1
     assert discovered[0].source_path == job
+
+
+@pytest.mark.asyncio
+async def test_native_spool_accepts_full_duplex_completion_order_under_backpressure(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "spool"
+    manager = CaptureManager(root, queue_max_events=16, fsync_each_event=False)
+    await manager.start()
+    descriptor = _descriptor()
+    capture = await manager.open_session(descriptor, StorageFailurePolicy.CONTINUE)
+    reverse = b"fast-reverse"
+    request = b"slow-request"
+    # observed_sequence records when read() completed.  The persisted sequence
+    # records when forwarding/drain completed, which may be the opposite order
+    # under independent full-duplex backpressure.
+    assert capture.record(
+        direction=Direction.DEVICE_TO_CLIENT,
+        direction_sequence=0,
+        kind="data",
+        captured_at_utc=utc_now_text(),
+        captured_monotonic_ns=time.monotonic_ns(),
+        offset=0,
+        payload=reverse,
+        forwarded=True,
+        forwarded_at_utc=utc_now_text(),
+        forward_error=None,
+        observed_sequence=1,
+    )
+    assert capture.record(
+        direction=Direction.CLIENT_TO_DEVICE,
+        direction_sequence=0,
+        kind="data",
+        captured_at_utc=utc_now_text(),
+        captured_monotonic_ns=time.monotonic_ns(),
+        offset=0,
+        payload=request,
+        forwarded=True,
+        forwarded_at_utc=utc_now_text(),
+        forward_error=None,
+        observed_sequence=0,
+    )
+    published = await capture.finalize(
+        SessionCloseSummary(
+            closed_at_utc=utc_now_text(),
+            closed_monotonic_ns=time.monotonic_ns(),
+            close_reason="clean_bidirectional_eof",
+            transport_complete=True,
+            observed_bytes={
+                "client_to_device": len(request),
+                "device_to_client": len(reverse),
+            },
+            observed_chunks={"client_to_device": 1, "device_to_client": 1},
+        )
+    )
+    await manager.stop()
+    assert published is not None
+
+    adapter = CanonicalCaptureV1Adapter(
+        root,
+        source_instance_id="rpg-backpressure",
+        devices_by_target={TARGET: "pos_1"},
+    )
+    envelope = adapter.load(adapter.discover(maximum=10)[0])
+    assert envelope.complete is True
+    assert [chunk.observed_sequence for chunk in envelope.chunks] == [1, 0]
+    assert [chunk.direction for chunk in envelope.chunks] == [
+        StreamDirection.DEVICE_TO_CLIENT,
+        StreamDirection.CLIENT_TO_DEVICE,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recovered_trailing_raw_is_imported_as_explicit_partial_evidence(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "spool"
+    manager = CaptureManager(root, queue_max_events=16, fsync_each_event=True)
+    await manager.start()
+    descriptor = _descriptor()
+    capture = await manager.open_session(descriptor, StorageFailurePolicy.CONTINUE)
+    indexed = b"indexed-prefix"
+    assert capture.record(
+        direction=Direction.CLIENT_TO_DEVICE,
+        direction_sequence=0,
+        kind="data",
+        captured_at_utc=utc_now_text(),
+        captured_monotonic_ns=time.monotonic_ns(),
+        offset=0,
+        payload=indexed,
+        forwarded=True,
+        forwarded_at_utc=utc_now_text(),
+        forward_error=None,
+        observed_sequence=0,
+    )
+    await manager.stop()
+    partial = next(root.rglob("*.partial"))
+    trailing = b"-unindexed-after-power-loss"
+    with (partial / "client.raw").open("ab") as handle:
+        handle.write(trailing)
+    recovered = recover_incomplete_spool(root)
+    assert len(recovered) == 1
+
+    adapter = CanonicalCaptureV1Adapter(
+        root,
+        source_instance_id="rpg-recovery",
+        devices_by_target={TARGET: "pos_1"},
+    )
+    envelope = adapter.load(adapter.discover(maximum=10)[0])
+    assert envelope.status == "PARTIAL"
+    assert envelope.complete is False
+    assert len(envelope.chunks) == 1
+    assert envelope.chunks[0].byte_count == len(indexed)
+    request = next(
+        artifact for artifact in envelope.artifacts if artifact.role is ArtifactRole.REQUEST_RAW
+    )
+    assert request.content == indexed + trailing
+    assert request.complete is False
+    assert any("timeline does not cover" in warning for warning in envelope.warnings)

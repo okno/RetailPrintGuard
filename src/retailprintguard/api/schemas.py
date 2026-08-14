@@ -52,6 +52,9 @@ class DeviceView(BaseModel):
     id: str
     name: str
     type: str
+    mac_address: str | None = None
+    department: str | None = None
+    role: str | None = None
     enabled: bool
     online: bool
     listen_endpoint: str
@@ -109,6 +112,29 @@ class JobView(BaseModel):
     imported_at: datetime | None = None
     parser_status: str | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+class SystemEventView(BaseModel):
+    id: UUID
+    service: str
+    severity: str
+    event_type: str
+    message: str
+    device_id: UUID | None = None
+    session_id: UUID | None = None
+    job_id: UUID | None = None
+    correlation_id: str | None = None
+    occurred_at: datetime
+    error: str | None = None
+
+
+class DiagnosticsView(BaseModel):
+    generated_at: datetime
+    database: str = "ok"
+    spool: str = "unknown"
+    parser_errors: int = 0
+    incomplete_jobs: int = 0
+    recent_events: list[SystemEventView] = Field(default_factory=list)
 
 
 class DocumentLineView(BaseModel):
@@ -216,6 +242,21 @@ class AlertUpdate(BaseModel):
     assigned_to_me: bool = False
     note: str | None = Field(default=None, max_length=4000)
     resolution_reason: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("status")
+    @classmethod
+    def valid_status(cls, value: str | None) -> str | None:
+        allowed = {
+            "OPEN",
+            "UNDER_REVIEW",
+            "CONFIRMED",
+            "FALSE_POSITIVE",
+            "JUSTIFIED",
+            "CLOSED",
+        }
+        if value is not None and value not in allowed:
+            raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
+        return value
 
 
 class RuleView(BaseModel):

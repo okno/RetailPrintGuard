@@ -122,6 +122,7 @@ def _parse_timeline(
     job_id: str,
     device_id: str,
     manifest: Mapping[str, Any],
+    allow_trailing_raw: bool = False,
 ) -> tuple[StreamChunk, ...]:
     if raw and not raw.endswith(b"\n"):
         raise SourceValidationError("canonical timeline has a truncated final record")
@@ -141,6 +142,7 @@ def _parse_timeline(
     data_counts = {name: 0 for name in streams}
     eof_counts = {name: 0 for name in streams}
     previous_hash: str | None = None
+    observed_sequences: set[int] = set()
     events: list[StreamChunk] = []
 
     for line_number, raw_line in enumerate(raw.splitlines(), 1):
@@ -173,9 +175,9 @@ def _parse_timeline(
         observed_sequence = require_int(
             event.get("observed_sequence"), "timeline.observed_sequence"
         )
-        previous_observed = events[-1].observed_sequence if events else None
-        if previous_observed is not None and observed_sequence <= previous_observed:
-            raise SourceValidationError("canonical observed sequence is not strictly increasing")
+        if observed_sequence in observed_sequences:
+            raise SourceValidationError("canonical observed sequence is duplicated")
+        observed_sequences.add(observed_sequence)
 
         direction_name = require_string(event.get("direction"), "timeline.direction", maximum=32)
         if direction_name not in streams:
@@ -253,16 +255,33 @@ def _parse_timeline(
         raise SourceValidationError("canonical timeline event count differs from manifest")
     if manifest.get("last_event_sha256") != previous_hash:
         raise SourceValidationError("canonical timeline head differs from manifest")
-    if offsets != _string_int_map(manifest.get("captured_bytes"), "manifest.captured_bytes"):
-        raise SourceValidationError("captured byte totals differ from canonical timeline")
+    captured_bytes = _string_int_map(manifest.get("captured_bytes"), "manifest.captured_bytes")
+    raw_bytes = {
+        "client_to_device": len(client_raw),
+        "device_to_client": len(device_raw),
+    }
+    if captured_bytes != raw_bytes:
+        raise SourceValidationError("captured byte totals differ from directional RAW files")
+    if offsets != captured_bytes:
+        if not allow_trailing_raw:
+            raise SourceValidationError("captured byte totals differ from canonical timeline")
+        covered_bytes = _string_int_map(
+            manifest.get("timeline_covered_bytes"), "manifest.timeline_covered_bytes"
+        )
+        if offsets != covered_bytes or any(
+            offsets[direction] > captured_bytes[direction] for direction in offsets
+        ):
+            raise SourceValidationError(
+                "partial recovery timeline coverage differs from its manifest"
+            )
     if data_counts != _string_int_map(manifest.get("captured_chunks"), "manifest.captured_chunks"):
         raise SourceValidationError("captured chunk totals differ from canonical timeline")
     if eof_counts != _string_int_map(manifest.get("eof_events"), "manifest.eof_events"):
         raise SourceValidationError("EOF totals differ from canonical timeline")
-    if offsets["client_to_device"] != len(client_raw) or offsets["device_to_client"] != len(
-        device_raw
-    ):
-        raise SourceValidationError("canonical timeline does not cover directional RAW files")
+    if manifest.get("status") == "COMPLETE" and observed_sequences != set(range(len(events))):
+        raise SourceValidationError(
+            "complete canonical timeline observed sequence is not contiguous from zero"
+        )
     return tuple(events)
 
 
@@ -513,15 +532,6 @@ class CanonicalCaptureV1Adapter:
             "session": session,
         }:
             raise SourceValidationError("canonical session descriptor differs from manifest")
-        chunks = _parse_timeline(
-            timeline_raw,
-            client_raw=client_raw,
-            device_raw=device_raw,
-            session_id=session_id,
-            job_id=job_id,
-            device_id=device_id,
-            manifest=manifest,
-        )
         status = require_string(manifest.get("status"), "manifest.status", maximum=16)
         if status not in {"COMPLETE", "PARTIAL"}:
             raise SourceValidationError(f"unsupported canonical capture status: {status!r}")
@@ -546,6 +556,24 @@ class CanonicalCaptureV1Adapter:
         captured_bytes = _string_int_map(manifest.get("captured_bytes"), "manifest.captured_bytes")
         captured_chunks = _string_int_map(
             manifest.get("captured_chunks"), "manifest.captured_chunks"
+        )
+        close_reason = require_string(
+            manifest.get("close_reason"), "manifest.close_reason", maximum=128
+        )
+        allow_trailing_raw = (
+            status == "PARTIAL"
+            and not storage_complete
+            and close_reason == "recovered_after_unclean_shutdown"
+        )
+        chunks = _parse_timeline(
+            timeline_raw,
+            client_raw=client_raw,
+            device_raw=device_raw,
+            session_id=session_id,
+            job_id=job_id,
+            device_id=device_id,
+            manifest=manifest,
+            allow_trailing_raw=allow_trailing_raw,
         )
         complete = status == "COMPLETE" and transport_complete and storage_complete
         if complete and (

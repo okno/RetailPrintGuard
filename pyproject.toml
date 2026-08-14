@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retailprintguard"
-version = "0.1.9"
+version = "0.2.0"
 description = "Resilient print evidence ingestion, correlation and fraud analysis platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,7 @@ dependencies = [
   "PyJWT>=2.10,<3",
   "PyMySQL>=1.1,<2",
   "PyYAML>=6.0,<7",
+  "reportlab>=4.2,<5",
   "sqlalchemy>=2.0,<3",
   "tzdata>=2025.2",
   "uvicorn>=0.34,<1",

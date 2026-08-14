@@ -20,7 +20,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.0.0"
+PARSER_VERSION = "1.1.0"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -38,7 +38,22 @@ _MANAGEMENT_TEXT_RE = re.compile(r'^="/\((?P<text>.*)\)(?:/\*(?P<style>\d+))?$')
 _COUNTER_RE = re.compile(r"^s\d{6}RE(?P<counter>\d{4})$")
 _ORDER_RE = re.compile(r"^\s*(?:ORDINE|ORDER)\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
 _TABLE_RE = re.compile(r"^\s*TAVOLO\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
+_DOCUMENT_CODE_RE = re.compile(
+    r"\b(?:DOC(?:UMENTO)?\.?\s*(?:GESTIONALE)?\s*N\.?|N\.?)\s*"
+    r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
+    re.IGNORECASE,
+)
 _PRINTED_MONEY_RE = re.compile(r"(?<!\d)(?P<value>[+-]?\d{1,9}(?:\.\d{3})*,\d{2})(?!\d)")
+_PRINTED_TOTAL_RE = re.compile(
+    r"^\s*(?:TOT|TOTALE(?:\s+COMPLESSIVO)?)\b(?P<tail>.*)$",
+    re.IGNORECASE,
+)
+_PAYMENT_RE = re.compile(
+    r"^\s*(?P<method>CONTANTI|CARTA|BANCOMAT|ASSEGNO|PAGAMENTO)\b(?P<tail>.*)$",
+    re.IGNORECASE,
+)
+_ERROR_RESPONSE_RE = re.compile(r"^ES(?P<code>\d{8})$")
+_SUCCESS_RESPONSE_RE = re.compile(r"^(?:ON\d{8}|s\d{6}RE\d{4}|\d{4})$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +90,10 @@ class _Draft:
     item_code: str | None = None
     order_code: str | None = None
     table_code: str | None = None
+    external_document_code: str | None = None
     total: Decimal | None = None
+    tax_total: Decimal | None = None
+    payments: list[PaymentRecord] = field(default_factory=list)
     total_code: str | None = None
     frame_ids: list[int] = field(default_factory=list)
     end_offset: int = 0
@@ -217,6 +235,41 @@ def _append_management_line(draft: _Draft, frame: Frame, text: str) -> None:
         )
     )
 
+    if match := _ORDER_RE.fullmatch(text):
+        draft.order_code = match.group("value") or None
+    if match := _TABLE_RE.fullmatch(text):
+        draft.table_code = match.group("value") or None
+    if match := _DOCUMENT_CODE_RE.search(text):
+        draft.external_document_code = match.group("value")
+
+    if match := _PRINTED_TOTAL_RE.match(text):
+        total_values = [
+            _printed_money(amount.group("value"))
+            for amount in _PRINTED_MONEY_RE.finditer(match.group("tail"))
+        ]
+        total_values = [amount for amount in total_values if amount is not None]
+        if total_values:
+            # The first amount following the printed TOTAL label is the
+            # document total.  A later amount can be the VAT component.
+            if draft.total is None:
+                draft.total = total_values[0]
+            if len(total_values) > 1:
+                draft.tax_total = total_values[-1]
+
+    if match := _PAYMENT_RE.match(text):
+        values = [
+            _printed_money(amount.group("value"))
+            for amount in _PRINTED_MONEY_RE.finditer(match.group("tail"))
+        ]
+        if values and values[-1] is not None:
+            draft.payments.append(
+                PaymentRecord(
+                    method=match.group("method").upper(),
+                    amount=values[-1],
+                    evidence=EvidenceLevel.INFERRED,
+                )
+            )
+
 
 def _append_commercial_item(draft: _Draft, frame: Frame, match: re.Match[str]) -> None:
     if len(draft.lines) >= _MAX_LINES:
@@ -224,8 +277,12 @@ def _append_commercial_item(draft: _Draft, frame: Frame, match: re.Match[str]) -
             draft.warnings.append("line_limit_exceeded")
         return
     quantity = Decimal(match.group("quantity") or "1")
-    total = _cents(match.group("amount"))
-    unit = (total / quantity).quantize(Decimal("0.0001")) if quantity else None
+    # Captures and printed output confirm that ``/$amount/*quantity`` carries
+    # a unit amount followed by quantity.  The previous implementation
+    # treated amount as a line total and divided it again, under-reporting
+    # multi-quantity lines.
+    unit = _cents(match.group("amount"))
+    total = (unit * quantity).quantize(Decimal("0.01"))
     draft.lines.append(
         DocumentLine(
             sequence=len(draft.lines) + 1,
@@ -282,15 +339,21 @@ def _draft_document(
             document_type = DocumentType.KITCHEN_ORDER
             subtype = "COMANDA_LITERAL"
             confidence = 90
+        elif "CORRISPETTIVO NON RISCOSSO" in upper:
+            document_type = DocumentType.MANAGEMENT_DOCUMENT
+            subtype = "CORRISPETTIVO_NON_RISCOSSO_LITERAL"
+            confidence = 90
         else:
             document_type = DocumentType.MANAGEMENT_DOCUMENT
             subtype = "RCH_GESTIONALE_INFERRED"
             confidence = 70
-        values = [
-            _printed_money(match.group("value")) for match in _PRINTED_MONEY_RE.finditer(text)
-        ]
-        draft.total = next((value for value in reversed(values) if value is not None), None)
-        payments = ()
+        if draft.total is None:
+            values = [
+                _printed_money(match.group("value"))
+                for match in _PRINTED_MONEY_RE.finditer(text)
+            ]
+            draft.total = next((value for value in reversed(values) if value is not None), None)
+        payments = tuple(draft.payments)
     identifier = uuid5(
         NAMESPACE_URL,
         f"retailprintguard:rch:{job_id}:{draft.kind}:{draft.start_offset}:{source_hash}",
@@ -303,12 +366,13 @@ def _draft_document(
         source_job_id=job_id,
         type=document_type,
         subtype=subtype,
-        external_document_code=None,
+        external_document_code=draft.external_document_code,
         order_code=draft.order_code,
         table_code=draft.table_code,
         captured_at=captured_at,
         gross_total=draft.total,
         net_total=draft.total,
+        tax_total=draft.tax_total,
         status="COMPLETE" if draft.complete else "PARTIAL",
         normalized_text=text,
         encoding="latin-1-lossless-byte-view",
@@ -330,6 +394,60 @@ def _draft_document(
             "total_command_code": draft.total_code,
             "response_counter_suffix": response_counter,
             "semantic_evidence": "INFERRED_FROM_CAPTURE",
+            "economic_close": (
+                draft.kind == "management"
+                and "CORRISPETTIVO NON RISCOSSO" in text.upper()
+            ),
+            "settlement_kind": (
+                "ROOM_CHARGE"
+                if draft.kind == "management"
+                and "CORRISPETTIVO NON RISCOSSO" in text.upper()
+                and "CONTO: CAMERA" in text.upper()
+                else None
+            ),
+        },
+    )
+
+
+def _cancellation_command_document(
+    frame: Frame,
+    *,
+    device_id: str,
+    session_id: str | None,
+    job_id: str,
+    captured_at: datetime,
+    manifest_sha256: str,
+    source_hash: str,
+    source_path: str,
+) -> NormalizedDocument:
+    return NormalizedDocument(
+        id=uuid5(
+            NAMESPACE_URL,
+            f"retailprintguard:rch:{job_id}:cancel-command:{frame.offset}:{source_hash}",
+        ),
+        source_device_id=device_id,
+        source_session_id=session_id,
+        source_job_id=job_id,
+        type=DocumentType.CANCELLATION,
+        subtype="RCH_DOCUMENT_CANCEL_COMMAND_OBSERVED",
+        captured_at=captured_at,
+        status="COMPLETE",
+        normalized_text="RCH cancellation command observed",
+        encoding="latin-1-lossless-byte-view",
+        parser_name=PARSER_NAME,
+        parser_version=PARSER_VERSION,
+        parse_confidence=80,
+        evidence=EvidenceLevel.INFERRED,
+        source_manifest_sha256=manifest_sha256,
+        source_payload_sha256=source_hash,
+        source_path=source_path,
+        complete=True,
+        raw_metadata={
+            "source_start_offset": frame.offset,
+            "source_end_offset": frame.offset + len(frame.raw),
+            "source_frame_ids": [frame.frame_id],
+            "observed_command": "=k",
+            "semantic_evidence": "INFERRED_FROM_CAPTURE_AND_PRINTED_OUTPUT",
         },
     )
 
@@ -353,6 +471,21 @@ def _response_document(
         if frame.address == "01" and frame.frame_class == "N" and frame.bcc_valid
     ]
     text = "\n".join(frame.text for frame in valid)
+    errors = [
+        match.group("code")
+        for frame in valid
+        if (match := _ERROR_RESPONSE_RE.fullmatch(frame.text)) is not None
+    ]
+    unknown = [
+        frame.text
+        for frame in valid
+        if _ERROR_RESPONSE_RE.fullmatch(frame.text) is None
+        and _SUCCESS_RESPONSE_RE.fullmatch(frame.text) is None
+    ]
+    semantic_warnings = tuple(
+        [*(f"device_error_status:{code}" for code in errors)]
+        + (["unclassified_response"] if unknown else [])
+    )
     digest = hashlib.sha256(response_raw, usedforsecurity=True).hexdigest()
     return NormalizedDocument(
         id=uuid5(NAMESPACE_URL, f"retailprintguard:rch:{job_id}:response:{digest}"),
@@ -362,7 +495,13 @@ def _response_document(
         type=DocumentType.DEVICE_RESPONSE,
         subtype="RCH_RESPONSE_STREAM_CONFIRMED",
         captured_at=captured_at,
-        status="COMPLETE" if not response.issues and not response.truncated else "PARTIAL",
+        status=(
+            "ERROR"
+            if errors
+            else "COMPLETE"
+            if not response.issues and not response.truncated and not unknown
+            else "PARTIAL"
+        ),
         normalized_text=text,
         encoding="latin-1-lossless-byte-view",
         parser_name=PARSER_NAME,
@@ -373,7 +512,7 @@ def _response_document(
         source_payload_sha256=digest,
         source_path=source_path,
         complete=not response.issues and not response.truncated,
-        warnings=response.issues,
+        warnings=tuple((*response.issues, *semantic_warnings)),
         lines=tuple(
             DocumentLine(
                 sequence=index,
@@ -392,6 +531,8 @@ def _response_document(
             "ack_count": response.ack_count,
             "valid_response_frames": len(valid),
             "framing_issues": list(response.issues),
+            "device_error_codes": errors,
+            "unclassified_response_frames": unknown,
         },
     )
 
@@ -454,6 +595,26 @@ def parse_rch(
             commercial_start = None
             total_seen = False
     documents: list[NormalizedDocument] = []
+    for frame in request.frames:
+        if (
+            frame.address == "00"
+            and frame.frame_class == "z"
+            and frame.bcc_valid
+            and frame.text == "=k"
+            and len(documents) < _MAX_DOCUMENTS
+        ):
+            documents.append(
+                _cancellation_command_document(
+                    frame,
+                    device_id=device_id,
+                    session_id=session_id,
+                    job_id=job_id,
+                    captured_at=captured_at,
+                    manifest_sha256=manifest_sha256,
+                    source_hash=source_hash,
+                    source_path=str(source_path),
+                )
+            )
     active: _Draft | None = None
 
     def finish(*, complete: bool, warning: str | None = None) -> None:

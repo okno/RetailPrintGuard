@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from retailprintguard.correlation.worker import (
     CorrelationWorker,
@@ -320,6 +320,129 @@ def test_database_workers_persist_scenario_a_idempotently() -> None:
     engine.dispose()
 
 
+def test_order_without_fiscal_close_remains_idempotent_across_worker_polls() -> None:
+    engine, factory = _database()
+    _seed_scenario(factory, split=False)
+    with factory.begin() as session:
+        # Leave only the source/pre-bill side of the transaction and make it old
+        # enough for ORDER_WITHOUT_FISCAL_CLOSE.  Re-evaluation time must not be
+        # part of the stable finding identity.
+        session.execute(
+            update(Document)
+            .where(Document.document_type == "COMMERCIAL_DOCUMENT")
+            .values(document_type="UNKNOWN")
+        )
+        session.execute(
+            update(Document).values(
+                captured_at=datetime(2000, 1, 1, tzinfo=UTC),
+                document_timestamp=datetime(2000, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    correlation = CorrelationWorker(factory)
+    correlation.run_once()
+    worker = FraudWorker(factory, order_without_fiscal_close_minutes=1)
+    first = worker.run_once()
+    second = worker.run_once()
+
+    assert first.alerts_inserted >= 1
+    assert second.alerts_inserted == 0
+    with factory() as session:
+        matching = session.scalars(
+            select(FraudAlert)
+            .join(FraudRuleVersion, FraudRuleVersion.id == FraudAlert.fraud_rule_version_id)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "ORDER_WITHOUT_FISCAL_CLOSE")
+        ).all()
+        assert len(matching) == 1
+    engine.dispose()
+
+
+def test_post_prebill_economic_close_persists_the_observed_35_to_5_delta() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        pos_id = _device(session, "pos_synthetic", "pos", 9100)
+        rch_id = _device(session, "rch_synthetic", "rch", 23)
+        parser = ParserVersion(
+            name="test",
+            version="1.0.0",
+            build_sha256=_sha("synthetic-parser"),
+            protocol="test",
+        )
+        session.add(parser)
+        session.flush()
+        _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="synthetic-prebill-35",
+            document_type="PRE_BILL",
+            total="35.00",
+            when=NOW,
+            lines=(
+                ("Cover", "4.00"),
+                ("Drink A", "8.00"),
+                ("Food A", "8.00"),
+                ("Food B", "7.00"),
+                ("Food C", "8.00"),
+            ),
+        )
+        close_id = _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="synthetic-room-close-5",
+            document_type="MANAGEMENT_DOCUMENT",
+            total="5.00",
+            when=NOW + timedelta(minutes=20),
+            lines=(
+                ("Cover", "4.00"),
+                ("Drink A", "1.00"),
+                ("Food A", "0.00"),
+                ("Food B", "0.00"),
+                ("Food C", "0.00"),
+            ),
+        )
+        close_version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == close_id)
+        )
+        assert close_version is not None
+        close_version.raw_metadata = {
+            "economic_close": True,
+            "settlement_kind": "ROOM_CHARGE",
+        }
+
+    correlation = CorrelationWorker(factory)
+    assert correlation.run_once().correlations_inserted == 1
+    fraud = FraudWorker(factory)
+    first = fraud.run_once()
+    second = fraud.run_once()
+    assert first.alerts_inserted >= 1
+    assert second.alerts_inserted == 0
+
+    with factory() as session:
+        alert = session.scalar(
+            select(FraudAlert)
+            .join(FraudRuleVersion, FraudRuleVersion.id == FraudAlert.fraud_rule_version_id)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "MODIFICA_POST_PRECONTO")
+        )
+        assert alert is not None
+        assert alert.original_amount == Decimal("35.0000")
+        assert alert.final_amount == Decimal("5.0000")
+        assert alert.difference_amount == Decimal("30.0000")
+        assert alert.difference_percent == Decimal("85.7143")
+        evidence = session.scalar(
+            select(FraudAlertEvidence).where(
+                FraudAlertEvidence.fraud_alert_id == alert.id,
+                FraudAlertEvidence.evidence_type == "post_prebill_economic_outcome",
+            )
+        )
+        assert evidence is not None
+        assert Decimal(evidence.evidence["observed_final_total"]) == Decimal("5.00")
+    engine.dispose()
+
+
 def test_database_workers_aggregate_legitimate_split_without_amount_drop() -> None:
     engine, factory = _database()
     _seed_scenario(factory, split=True)
@@ -461,6 +584,20 @@ def test_yaml_threshold_changes_append_rule_versions_and_allow_a_b_a() -> None:
         assert versions[0].effective_until is not None
         assert versions[1].effective_until is not None
         assert versions[2].effective_until is None
+        post_prebill_rule = session.scalar(
+            select(FraudRule).where(FraudRule.code == "MODIFICA_POST_PRECONTO")
+        )
+        assert post_prebill_rule is not None
+        post_prebill_versions = session.scalars(
+            select(FraudRuleVersion)
+            .where(FraudRuleVersion.fraud_rule_id == post_prebill_rule.id)
+            .order_by(FraudRuleVersion.version)
+        ).all()
+        assert [row.configuration["minimum_percent"] for row in post_prebill_versions] == [
+            "20",
+            "60",
+            "20",
+        ]
     engine.dispose()
 
 

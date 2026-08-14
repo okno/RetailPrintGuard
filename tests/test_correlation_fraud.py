@@ -121,6 +121,7 @@ def test_scenario_a_100_to_50_creates_diff_and_explainable_high_alerts() -> None
     assert transaction.correlation.score >= 60
     assert transaction.prebill_total == Decimal("100.00")
     assert transaction.fiscal_total == Decimal("50.00")
+    assert transaction.observed_final_total == Decimal("50.00")
     assert transaction.difference_amount == Decimal("50.00")
     assert transaction.difference_percent == Decimal("50.0000")
     assert {change.change_type for change in transaction.line_changes} >= {
@@ -215,6 +216,7 @@ def test_scenario_b_split_100_into_two_50_has_no_amount_drop_false_positive() ->
     assert len(transaction.documents) == 3
     assert transaction.split_payment is True
     assert transaction.fiscal_total == Decimal("100.00")
+    assert transaction.observed_final_total == Decimal("100.00")
     assert transaction.payment_total == Decimal("100.00")
     assert transaction.difference_amount == Decimal("0.00")
     assert all(
@@ -233,9 +235,91 @@ def test_scenario_b_split_100_into_two_50_has_no_amount_drop_false_positive() ->
     assert "ITEM_REMOVED_AFTER_PREBILL" not in codes
 
 
+def test_synthetic_post_prebill_change_35_to_non_fiscal_close_5_is_quantified() -> None:
+    prebill = _document(
+        "post-prebill-prebill",
+        DocumentType.PRE_BILL,
+        "35.00",
+        (
+            _line(1, "COVER", "4.00"),
+            _line(2, "DRINK-A", "8.00"),
+            _line(3, "FOOD-A", "8.00"),
+            _line(4, "FOOD-B", "7.00"),
+            _line(5, "FOOD-C", "8.00"),
+        ),
+        minute=0,
+        device="pos_synthetic",
+        external_code="PB-LAB-1",
+    )
+    non_fiscal_close = _document(
+        "post-prebill-room-close",
+        DocumentType.MANAGEMENT_DOCUMENT,
+        "5.00",
+        (
+            _line(1, "COVER", "4.00"),
+            _line(2, "DRINK-A", "1.00"),
+            _line(3, "FOOD-A", "0.00"),
+            _line(4, "FOOD-B", "0.00"),
+            _line(5, "FOOD-C", "0.00"),
+        ),
+        minute=20,
+        device="rch_synthetic",
+        external_code="MG-LAB-2",
+    ).model_copy(
+        update={
+            "subtype": "CORRISPETTIVO_NON_RISCOSSO",
+            "normalized_text": "Conto: Camera LAB\nCORRISPETTIVO NON RISCOSSO\nTOT 5,00",
+            "raw_metadata": {
+                "order_reference": "REFERENCE-80",
+                "economic_close": True,
+                "settlement_kind": "ROOM_CHARGE",
+            },
+        }
+    )
+    cancellation = _document(
+        "post-prebill-cancelled-attempt",
+        DocumentType.CANCELLATION,
+        "5.00",
+        (),
+        minute=18,
+        device="rch_synthetic",
+        external_code="CN-LAB-1",
+    )
+    incomplete_fiscal_attempt = _document(
+        "post-prebill-incomplete-fiscal-attempt",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "5.00",
+        (_line(1, "COVER", "4.00"), _line(2, "DRINK-A", "1.00")),
+        minute=17,
+        device="rch_synthetic",
+        external_code="TRY-LAB-1",
+    ).model_copy(update={"complete": False, "status": "PARTIAL"})
+
+    transaction = CorrelationEngine().correlate(
+        (cancellation, incomplete_fiscal_attempt, non_fiscal_close, prebill)
+    )[0]
+    assert transaction.correlation is not None
+    assert transaction.prebill_total == Decimal("35.00")
+    assert transaction.fiscal_total == Decimal("0")
+    assert transaction.observed_final_total == Decimal("5.00")
+    assert transaction.difference_amount == Decimal("30.00")
+    assert transaction.difference_percent == Decimal("85.7143")
+    assert {change.change_type for change in transaction.line_changes} >= {
+        LineChangeType.PRICE_CHANGED,
+    }
+    codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+        )
+    }
+    assert "MODIFICA_POST_PRECONTO" in codes
+
+
 def test_all_sixteen_required_rules_are_versioned_and_registered() -> None:
     expected = {
         "PREBILL_FISCAL_AMOUNT_DROP",
+        "MODIFICA_POST_PRECONTO",
         "ITEM_REMOVED_AFTER_PREBILL",
         "PRICE_REDUCED_AFTER_PREBILL",
         "EXTREME_PRICE_CHANGE",
