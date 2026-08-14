@@ -35,6 +35,7 @@ from retailprintguard.db.models import (
     ProxySession,
     RawPayload,
     Role,
+    SystemEvent,
     User,
     UserRole,
 )
@@ -71,7 +72,9 @@ def _factory():
 def _seed_api(factory):
     ids = {name: uuid4() for name in ("device", "session", "job", "raw", "document")}
     ids.update({name: uuid4() for name in ("parser", "user", "rule", "rule_version")})
-    ids.update({name: uuid4() for name in ("correlation", "transaction", "alert")})
+    ids.update(
+        {name: uuid4() for name in ("correlation", "transaction", "alert", "duplicate_alert")}
+    )
     with factory.begin() as session:
         session.add(
             Device(
@@ -80,6 +83,9 @@ def _seed_api(factory):
                 name="POS uno",
                 device_type="pos",
                 parser_kind="escpos",
+                mac_address="02:00:00:00:01:01",
+                department="Bar",
+                role="comande_bar",
                 listen_ip="192.0.2.10",
                 listen_port=9100,
                 target_ip="192.0.2.20",
@@ -274,6 +280,28 @@ def _seed_api(factory):
         )
         session.flush()
         session.add(
+            FraudAlert(
+                id=ids["duplicate_alert"],
+                fraud_rule_version_id=ids["rule_version"],
+                correlation_id=ids["correlation"],
+                transaction_id=ids["transaction"],
+                finding_key="8" * 64,
+                severity="HIGH",
+                score=90,
+                status="OPEN",
+                is_canonical=False,
+                duplicate_of_alert_id=ids["alert"],
+                deduplicated_at=NOW + timedelta(seconds=1),
+                deduplication_reason="duplicate regression fixture",
+                description="Calo sospetto duplicato storico",
+                explanation="100 -> 50",
+                difference_amount=Decimal("50.00"),
+                confidence=95,
+                opened_at=NOW + timedelta(seconds=1),
+            )
+        )
+        session.flush()
+        session.add(
             FraudAlertEvidence(
                 fraud_alert_id=ids["alert"],
                 sequence=1,
@@ -282,6 +310,19 @@ def _seed_api(factory):
                 evidence_type="AMOUNT_DIFF",
                 summary="Differenza 50 euro",
                 evidence={"difference": "50.00"},
+            )
+        )
+        session.add(
+            SystemEvent(
+                service="parser",
+                severity="WARNING",
+                event_type="SYNTHETIC_DIAGNOSTIC",
+                message="Evento diagnostico sintetico",
+                device_id=ids["device"],
+                session_id=ids["session"],
+                job_id=ids["job"],
+                correlation_id="diagnostic-request-1",
+                occurred_at=NOW,
             )
         )
     return ids
@@ -297,8 +338,16 @@ def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> Non
     assert repository.authenticate("auditor", "bad-password") is None
     rule_view = repository.set_rule_enabled("PREBILL_FISCAL_AMOUNT_DROP", False, principal)
     assert rule_view is not None and rule_view.enabled is False and rule_view.version == 2
-    assert repository.dashboard().economic_difference == Decimal("50.0000")
-    assert repository.list_devices()[0].id == "pos_1"
+    dashboard = repository.dashboard()
+    assert dashboard.open_alerts == 1
+    assert dashboard.economic_difference == Decimal("50.0000")
+    device = repository.list_devices()[0]
+    assert (device.id, device.mac_address, device.department, device.role) == (
+        "pos_1",
+        "02:00:00:00:01:01",
+        "Bar",
+        "comande_bar",
+    )
     documents, total = repository.list_documents(
         limit=20, offset=0, filters={"order_code": "ORD-80"}
     )
@@ -306,6 +355,13 @@ def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> Non
     assert repository.get_document_raw(ids["document"]).content == b"PRECONTO 100,00"
     hits, hit_count = repository.search(query="melone", limit=10, offset=0)
     assert hit_count == 1 and hits[0].entity_id == ids["document"]
+    alerts, alert_count = repository.list_alerts(limit=20, offset=0, filters={})
+    assert alert_count == 1 and [alert.id for alert in alerts] == [ids["alert"]]
+    assert repository.get_alert(ids["duplicate_alert"]) is not None
+    diagnostics = repository.diagnostics()
+    assert diagnostics.database == "ok"
+    assert diagnostics.parser_errors == 0 and diagnostics.incomplete_jobs == 0
+    assert diagnostics.recent_events[0].correlation_id == "diagnostic-request-1"
 
     updated = repository.update_alert(
         ids["alert"],
@@ -569,5 +625,68 @@ def test_ingestion_scan_batch_aggregates_import_and_duplicate_report(tmp_path: P
         assert batch.status == "COMPLETED"
         assert (batch.scanned_count, batch.imported_count, batch.skipped_count) == (2, 1, 1)
         assert batch.report["source_kinds"] == ["commercialrchproxy.pharsed.v1"]
+        assert session.scalar(select(func.count()).select_from(ImportItem)) == 1
+    engine.dispose()
+
+
+def test_duplicate_only_scans_do_not_grow_import_batch_history(tmp_path: Path) -> None:
+    engine, factory = _factory()
+    with factory.begin() as session:
+        session.add(
+            Device(
+                external_id="rch_1",
+                name="RCH",
+                device_type="rch",
+                parser_kind="rch_observed",
+                listen_ip="192.0.2.10",
+                listen_port=23,
+                target_ip="192.0.2.20",
+                target_port=23,
+            )
+        )
+    repository = SqlAlchemyIngestionRepository(factory, spool_root=tmp_path)
+    envelope = _envelope(source_key="rch:batch:stable", manifest_sha256="c" * 64)
+
+    imported_batch = repository.begin_import_batch(
+        source_system="RCHCaptureV1Adapter",
+        source_instance="rch-primary",
+        source_root=tmp_path,
+    )
+    assert repository.store_import(envelope).disposition is ImportDisposition.IMPORTED
+    repository.complete_import_batch(
+        imported_batch,
+        {
+            "discovered": 1,
+            "imported": 1,
+            "duplicates": 0,
+            "quarantined": 0,
+            "retry_exhausted": 0,
+            "errors": [],
+        },
+    )
+
+    for _ in range(3):
+        duplicate_batch = repository.begin_import_batch(
+            source_system="RCHCaptureV1Adapter",
+            source_instance="rch-primary",
+            source_root=tmp_path,
+        )
+        assert repository.store_import(envelope).disposition is ImportDisposition.DUPLICATE
+        repository.complete_import_batch(
+            duplicate_batch,
+            {
+                "discovered": 1,
+                "imported": 0,
+                "duplicates": 1,
+                "quarantined": 0,
+                "retry_exhausted": 0,
+                "errors": [],
+            },
+        )
+
+    with factory() as session:
+        batches = session.scalars(select(ImportBatch)).all()
+        assert len(batches) == 1
+        assert batches[0].imported_count == 1
         assert session.scalar(select(func.count()).select_from(ImportItem)) == 1
     engine.dispose()

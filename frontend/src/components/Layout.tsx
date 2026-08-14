@@ -6,7 +6,9 @@ import {
   FactCheckOutlined,
   FileUploadOutlined,
   LogoutOutlined,
+  LanOutlined,
   MenuOutlined,
+  MonitorHeartOutlined,
   SearchOutlined,
   SettingsSuggestOutlined,
   ShieldOutlined,
@@ -30,10 +32,11 @@ import {
 } from '@mui/material'
 import { useState, type ReactNode } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import type { User } from '../types'
+import type { Role, User } from '../types'
 
 const drawerWidth = 252
-const navigation = [
+const reviewerRoles: Role[] = ['ADMIN', 'AUDITOR', 'OPERATOR']
+const navigation: Array<{ label: string; path: string; icon: ReactNode; roles?: Role[] }> = [
   { label: 'Dashboard', path: '/', icon: <DashboardOutlined /> },
   { label: 'Transazioni', path: '/transazioni', icon: <AccountTreeOutlined /> },
   { label: 'Documenti', path: '/documenti', icon: <DescriptionOutlined /> },
@@ -41,7 +44,9 @@ const navigation = [
   { label: 'Regole', path: '/regole', icon: <SettingsSuggestOutlined /> },
   { label: 'Ricerca', path: '/ricerca', icon: <SearchOutlined /> },
   { label: 'Dispositivi', path: '/dispositivi', icon: <DevicesOutlined /> },
-  { label: 'Importazioni', path: '/importazioni', icon: <FileUploadOutlined /> },
+  { label: 'Sessioni TCP', path: '/sessioni', icon: <LanOutlined /> },
+  { label: 'Diagnostica', path: '/diagnostica', icon: <MonitorHeartOutlined /> },
+  { label: 'Importazioni', path: '/importazioni', icon: <FileUploadOutlined />, roles: reviewerRoles },
 ]
 
 export function Layout({ children, user, onLogout }: { children: ReactNode; user: User; onLogout: () => void }) {
@@ -60,7 +65,7 @@ export function Layout({ children, user, onLogout }: { children: ReactNode; user
       </Toolbar>
       <Divider sx={{ borderColor: 'rgba(255,255,255,.08)' }} />
       <List sx={{ px: 1.5, py: 2 }}>
-        {navigation.map((item) => (
+        {navigation.filter((item) => !item.roles || item.roles.some((role) => user.roles.includes(role))).map((item) => (
           <ListItemButton
             key={item.path}
             component={NavLink}

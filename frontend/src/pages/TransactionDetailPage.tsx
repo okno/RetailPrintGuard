@@ -2,7 +2,7 @@ import { AddCircleOutline, ArrowBack, DeleteOutline, EuroOutlined, ReceiptLongOu
 import { Box, Button, Card, CardContent, Divider, Grid, List, ListItem, ListItemIcon, ListItemText, Paper, Typography } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useParams } from 'react-router-dom'
-import { api } from '../api/client'
+import { api, scopedQueryKey } from '../api/client'
 import { ErrorState, LoadingState } from '../components/State'
 import { PageHeader } from '../components/PageHeader'
 import type { Transaction } from '../types'
@@ -12,7 +12,7 @@ const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR
 export function TransactionDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const query = useQuery({ queryKey: ['transaction', id], queryFn: () => api<Transaction>(`/transactions/${id}`), enabled: Boolean(id) })
+  const query = useQuery({ queryKey: scopedQueryKey('transaction', id), queryFn: () => api<Transaction>(`/transactions/${id}`), enabled: Boolean(id) })
   if (query.isLoading) return <LoadingState />
   if (query.error || !query.data) return <ErrorState error={query.error} />
   const item = query.data

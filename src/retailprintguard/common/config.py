@@ -14,6 +14,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 DEVICE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
+MAC_ADDRESS_PATTERNS = (
+    re.compile(r"^[0-9A-Fa-f]{12}$"),
+    re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"),
+    re.compile(r"^(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$"),
+)
 
 
 class DeviceType(StrEnum):
@@ -31,6 +36,9 @@ class DeviceConfig(BaseModel):
 
     id: str
     name: Annotated[str, Field(min_length=1, max_length=120)]
+    mac_address: Annotated[str | None, Field(min_length=17, max_length=17)] = None
+    department: Annotated[str | None, Field(min_length=1, max_length=128)] = None
+    role: Annotated[str | None, Field(min_length=1, max_length=64)] = None
     type: DeviceType
     listen_ip: IPv4Address
     listen_port: Annotated[int, Field(ge=1, le=65535)]
@@ -48,6 +56,27 @@ class DeviceConfig(BaseModel):
         if not DEVICE_ID_RE.fullmatch(value):
             raise ValueError("device id must match [a-z][a-z0-9_-]{1,63}")
         return value
+
+    @field_validator("mac_address", mode="before")
+    @classmethod
+    def canonical_mac_address(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("device MAC address must be a string")
+        candidate = value.strip()
+        if not any(pattern.fullmatch(candidate) for pattern in MAC_ADDRESS_PATTERNS):
+            raise ValueError(
+                "device MAC address must contain 12 hexadecimal digits, optionally "
+                "separated consistently by ':' or '-'"
+            )
+        compact = candidate.replace(":", "").replace("-", "").upper()
+        return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
+
+    @field_validator("department", "role", mode="before")
+    @classmethod
+    def strip_optional_device_label(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def coherent_type_and_parser(self) -> DeviceConfig:

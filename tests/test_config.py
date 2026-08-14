@@ -63,6 +63,52 @@ def test_loads_strict_multi_device_configuration(tmp_path: Path) -> None:
     assert settings.timezone == "Europe/Rome"
 
 
+@pytest.mark.parametrize(
+    ("configured", "canonical"),
+    [
+        ("02:ab:cd:00:01:02", "02:AB:CD:00:01:02"),
+        ("02-AB-CD-00-01-02", "02:AB:CD:00:01:02"),
+        ("02abcd000102", "02:AB:CD:00:01:02"),
+    ],
+)
+def test_device_metadata_normalizes_mac_and_labels(
+    tmp_path: Path, configured: str, canonical: str
+) -> None:
+    data = _base(tmp_path)
+    data["devices"][0].update(  # type: ignore[index, union-attr]
+        {
+            "mac_address": configured,
+            "department": "  Reparto sintetico  ",
+            "role": "  stampa_comande  ",
+        }
+    )
+
+    device = load_settings(_write(tmp_path, data)).devices[0]
+
+    assert device.mac_address == canonical
+    assert device.department == "Reparto sintetico"
+    assert device.role == "stampa_comande"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "02:AB-CD:00:01:02",
+        "02:AB:CD:00:01",
+        "not-a-mac-address",
+        123,
+    ],
+)
+def test_device_metadata_rejects_noncanonicalizable_mac(
+    tmp_path: Path, invalid: object
+) -> None:
+    data = _base(tmp_path)
+    data["devices"][0]["mac_address"] = invalid  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match="MAC address"):
+        load_settings(_write(tmp_path, data))
+
+
 def test_device_directory_listing_uses_shell_safe_tab_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

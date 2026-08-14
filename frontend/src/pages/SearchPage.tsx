@@ -3,14 +3,18 @@ import { Box, Button, Card, InputAdornment, List, ListItemButton, ListItemText, 
 import { useQuery } from '@tanstack/react-query'
 import { FormEvent, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api } from '../api/client'
+import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import type { Page, SearchHit } from '../types'
+import { formatDateTime } from '../format'
 
 function routeFor(hit: SearchHit) {
-  if (hit.entity_type === 'document') return `/documenti/${hit.entity_id}`
-  if (hit.entity_type === 'transaction') return `/transazioni/${hit.entity_id}`
+  const entityType = hit.entity_type.toUpperCase()
+  if (entityType === 'DOCUMENT') return `/documenti/${hit.entity_id}`
+  if (entityType === 'TRANSACTION') return `/transazioni/${hit.entity_id}`
+  if (entityType === 'ORDER') return `/transazioni?order_code=${encodeURIComponent(hit.title)}`
+  if (entityType === 'DEVICE') return '/dispositivi'
   return undefined
 }
 
@@ -20,7 +24,7 @@ export function SearchPage() {
   const navigate = useNavigate()
   const queryText = params.get('q') ?? ''
   const query = useQuery({
-    queryKey: ['search', queryText],
+    queryKey: scopedQueryKey('search', queryText),
     queryFn: () => api<Page<SearchHit>>(`/search?q=${encodeURIComponent(queryText)}&limit=100`),
     enabled: queryText.length >= 2,
   })
@@ -42,7 +46,7 @@ export function SearchPage() {
           <List disablePadding>{query.data.items.map((hit) => {
             const target = routeFor(hit)
             return <ListItemButton key={`${hit.entity_type}-${hit.entity_id}`} divider disabled={!target} onClick={() => target && navigate(target)} sx={{ py: 1.5 }}>
-              <ListItemText primary={<Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}><Typography fontWeight={700}>{hit.title}</Typography><Typography variant="caption" color="text.secondary">{new Date(hit.occurred_at).toLocaleString('it-IT')}</Typography></Box>} secondary={<>{hit.subtitle}<br />{hit.highlights.join(' · ')}</>} />
+              <ListItemText primary={<Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}><Typography fontWeight={700}>{hit.title}</Typography><Typography variant="caption" color="text.secondary">{formatDateTime(hit.occurred_at)}</Typography></Box>} secondary={<>{hit.subtitle}<br />{hit.highlights.join(' · ')}</>} />
             </ListItemButton>
           })}</List>
         )}

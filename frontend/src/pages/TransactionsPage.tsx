@@ -1,14 +1,14 @@
 import { Box, Card, FormControl, InputLabel, MenuItem, Select, Table, TableBody, TableCell, TableHead, TablePagination, TableRow, TextField } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api } from '../api/client'
+import { api, scopedQueryKey } from '../api/client'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import { PageHeader } from '../components/PageHeader'
 import { StatusChip } from '../components/StatusChip'
 import type { Page, Transaction } from '../types'
+import { shortDateTime as date } from '../format'
 
 const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
-const date = new Intl.DateTimeFormat('it-IT', { dateStyle: 'short', timeStyle: 'short' })
 
 export function TransactionsPage() {
   const [params, setParams] = useSearchParams()
@@ -16,14 +16,15 @@ export function TransactionsPage() {
   const limit = Number(params.get('limit') ?? 25)
   const offset = Number(params.get('offset') ?? 0)
   const query = useQuery({
-    queryKey: ['transactions', params.toString()],
+    queryKey: scopedQueryKey('transactions', params.toString()),
     queryFn: () => api<Page<Transaction>>(`/transactions?${params.toString() || `limit=${limit}&offset=${offset}`}`),
   })
   function update(name: string, value: string) { const next = new URLSearchParams(params); value ? next.set(name, value) : next.delete(name); next.set('offset', '0'); next.set('limit', String(limit)); setParams(next) }
   return <>
     <PageHeader title="Transazioni" subtitle="Correlazione unificata di comande, modifiche, preconti, documenti fiscali e pagamenti." />
-    <Card sx={{ p: 2, mb: 2 }}><Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' }, gap: 2 }}>
+    <Card sx={{ p: 2, mb: 2 }}><Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(4, 1fr)' }, gap: 2 }}>
       <TextField label="Tavolo" size="small" value={params.get('table_code') ?? ''} onChange={(e) => update('table_code', e.target.value)} />
+      <TextField label="Codice ordine" size="small" value={params.get('order_code') ?? ''} onChange={(e) => update('order_code', e.target.value)} />
       <TextField label="Operatore" size="small" value={params.get('operator_code') ?? ''} onChange={(e) => update('operator_code', e.target.value)} />
       <FormControl size="small"><InputLabel>Differenza</InputLabel><Select label="Differenza" value={params.get('minimum_difference') ?? ''} onChange={(e) => update('minimum_difference', String(e.target.value))}><MenuItem value="">Tutte</MenuItem><MenuItem value="0.01">Con differenza</MenuItem><MenuItem value="20">Almeno 20 €</MenuItem><MenuItem value="50">Almeno 50 €</MenuItem></Select></FormControl>
     </Box></Card>

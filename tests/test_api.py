@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -27,9 +29,11 @@ class FakeRepository(EmptyRepository):
         self.user_id = uuid4()
         self.document_id = uuid4()
         self.job_id = uuid4()
+        self.session_id = uuid4()
         self.alert_id = uuid4()
         self.audits: list[AuditEntry] = []
         self.rule_enabled = True
+        self.last_alert_filters: dict[str, object] = {}
 
     def authenticate(self, username: str, password: str) -> UserPrincipal | None:
         if username == "auditor" and password == "correct-password":
@@ -43,6 +47,12 @@ class FakeRepository(EmptyRepository):
                 id=self.user_id,
                 username=username,
                 roles=(RoleName.ADMIN,),
+            )
+        if username == "reader" and password == "correct-password":
+            return UserPrincipal(
+                id=self.user_id,
+                username=username,
+                roles=(RoleName.READ_ONLY,),
             )
         return None
 
@@ -88,15 +98,37 @@ class FakeRepository(EmptyRepository):
             complete=True,
         )
 
-    def get_document_raw(self, document_id: UUID) -> RawArtifact | None:
+    def get_document_raw(
+        self, document_id: UUID, *, direction: str = "request"
+    ) -> RawArtifact | None:
         if document_id != self.document_id:
             return None
-        return RawArtifact(b"\x1bSYNTHETIC", "synthetic.raw", "b" * 64)
+        payload = b"\x1bSYNTHETIC" if direction == "request" else b"ACK"
+        return RawArtifact(
+            payload,
+            f"synthetic-{direction}.raw",
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+    def get_job_raw(self, job_id: UUID, *, direction: str) -> RawArtifact | None:
+        return (
+            self.get_document_raw(self.document_id, direction=direction)
+            if job_id == self.job_id
+            else None
+        )
+
+    def get_session_raw(self, session_id: UUID, *, direction: str) -> RawArtifact | None:
+        return (
+            self.get_document_raw(self.document_id, direction=direction)
+            if session_id == self.session_id
+            else None
+        )
 
     def list_alerts(
         self, *, limit: int, offset: int, filters: dict[str, object]
     ) -> tuple[list[AlertView], int]:
-        del limit, offset, filters
+        del limit, offset
+        self.last_alert_filters = filters
         return [self._alert()], 1
 
     def get_alert(self, alert_id: UUID) -> AlertView | None:
@@ -116,7 +148,7 @@ class FakeRepository(EmptyRepository):
             score=90,
             status=status,
             opened_at=datetime.now(UTC),
-            description="Riduzione sintetica",
+            description="=RIDUZIONE_SINTETICA()",
             explanation="100.00 -> 50.00",
             confidence=100,
         )
@@ -190,6 +222,11 @@ def test_login_dashboard_and_bad_password() -> None:
     assert response.json()["economic_difference"] == "50.00"
     assert any(entry.action == "AUTH_LOGIN" for entry in repository.audits)
 
+    diagnostics = client.get("/api/v1/system/diagnostics", headers=headers)
+    assert diagnostics.status_code == 200
+    assert diagnostics.json()["database"] == "ok"
+    assert diagnostics.json()["recent_events"] == []
+
 
 def test_protected_routes_reject_missing_token() -> None:
     client, _ = _client()
@@ -205,8 +242,51 @@ def test_raw_download_requires_auditor_and_is_audited() -> None:
 
     assert response.status_code == 200
     assert response.content == b"\x1bSYNTHETIC"
-    assert response.headers["Digest"] == f"sha-256={'b' * 64}"
+    encoded = base64.b64encode(hashlib.sha256(response.content).digest()).decode("ascii")
+    assert response.headers["Content-Digest"] == f"sha-256=:{encoded}:"
+    assert response.headers["X-Checksum-SHA256"] == hashlib.sha256(response.content).hexdigest()
     assert repository.audits[-1].action == "RAW_DOWNLOAD"
+
+    reader = _login(client, "reader")
+    assert (
+        client.get(f"/api/v1/documents/{repository.document_id}/raw", headers=reader).status_code
+        == 403
+    )
+
+
+def test_document_derivatives_and_bidirectional_evidence_downloads() -> None:
+    client, repository = _client()
+    headers = _login(client)
+    assert (
+        client.get(f"/api/v1/documents/{repository.document_id}/txt", headers=headers).text
+        == "PRECONTO SINTETICO"
+    )
+    json_response = client.get(
+        f"/api/v1/documents/{repository.document_id}/json", headers=headers
+    )
+    assert json_response.status_code == 200
+    assert json_response.json()["id"] == str(repository.document_id)
+    pdf_response = client.get(
+        f"/api/v1/documents/{repository.document_id}/pdf", headers=headers
+    )
+    assert pdf_response.status_code == 200
+    assert pdf_response.headers["content-type"] == "application/pdf"
+    assert pdf_response.content.startswith(b"%PDF-")
+    assert pdf_response.content.endswith(b"%%EOF\n")
+    assert pdf_response.headers["X-RetailPrintGuard-Renderer"]
+    assert repository.audits[-1].action == "PDF_DOWNLOAD"
+    assert (
+        client.get(
+            f"/api/v1/jobs/{repository.job_id}/raw?direction=response", headers=headers
+        ).content
+        == b"ACK"
+    )
+    assert (
+        client.get(
+            f"/api/v1/sessions/{repository.session_id}/raw?direction=request", headers=headers
+        ).content
+        == b"\x1bSYNTHETIC"
+    )
 
 
 def test_alert_workflow_and_csv_export() -> None:
@@ -220,9 +300,32 @@ def test_alert_workflow_and_csv_export() -> None:
     assert updated.status_code == 200
     assert updated.json()["status"] == "UNDER_REVIEW"
 
-    exported = client.get("/api/v1/alerts/export.csv", headers=headers)
+    exported = client.get(
+        "/api/v1/alerts/export.csv?severity=HIGH&rule=DROP&status=OPEN"
+        "&device_id=pos_1&operator_code=op_1",
+        headers=headers,
+    )
     assert exported.status_code == 200
     assert "PREBILL_FISCAL_AMOUNT_DROP" in exported.content.decode("utf-8-sig")
+    assert "'=RIDUZIONE_SINTETICA()" in exported.content.decode("utf-8-sig")
+    assert repository.last_alert_filters == {
+        "severity": "HIGH",
+        "rule": "DROP",
+        "status": "OPEN",
+        "device_id": "pos_1",
+        "operator_code": "op_1",
+    }
+
+
+def test_invalid_alert_transition_is_a_validation_error() -> None:
+    client, repository = _client()
+    response = client.patch(
+        f"/api/v1/alerts/{repository.alert_id}",
+        headers=_login(client),
+        json={"status": "NOT_A_STATE"},
+    )
+    assert response.status_code == 422
+    assert response.headers["X-Correlation-ID"]
 
 
 def test_only_admin_can_toggle_rule() -> None:

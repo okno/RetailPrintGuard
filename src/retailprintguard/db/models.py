@@ -49,6 +49,9 @@ class Device(Base):
     id: Mapped[UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid4)
     external_id: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    mac_address: Mapped[str | None] = mapped_column(String(17))
+    department: Mapped[str | None] = mapped_column(String(128))
+    role: Mapped[str | None] = mapped_column(String(64))
     device_type: Mapped[str] = mapped_column(String(16), nullable=False)
     parser_kind: Mapped[str] = mapped_column(String(64), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -598,6 +601,20 @@ class FraudAlert(Base):
         UniqueConstraint("fraud_rule_version_id", "transaction_id", "finding_key"),
         Index("ix_fraud_alerts_status_opened", "status", "opened_at"),
         Index("ix_fraud_alerts_severity_opened", "severity", "opened_at"),
+        Index(
+            "ix_fraud_alerts_operational_status_opened",
+            "is_canonical",
+            "status",
+            "opened_at",
+        ),
+        Index("ix_fraud_alerts_duplicate_of", "duplicate_of_alert_id"),
+        CheckConstraint(
+            "(is_canonical = 1 AND duplicate_of_alert_id IS NULL "
+            "AND deduplicated_at IS NULL AND deduplication_reason IS NULL) OR "
+            "(is_canonical = 0 AND duplicate_of_alert_id IS NOT NULL "
+            "AND deduplicated_at IS NOT NULL AND deduplication_reason IS NOT NULL)",
+            name="canonical_duplicate_consistency",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid4)
@@ -612,6 +629,14 @@ class FraudAlert(Base):
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
     score: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="OPEN")
+    is_canonical: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1"
+    )
+    duplicate_of_alert_id: Mapped[UUID | None] = mapped_column(
+        UUIDBinary(), ForeignKey("fraud_alerts.id", ondelete="RESTRICT")
+    )
+    deduplicated_at: Mapped[Any | None] = mapped_column(UTCDateTime())
+    deduplication_reason: Mapped[str | None] = mapped_column(String(191))
     description: Mapped[str] = mapped_column(Text, nullable=False)
     explanation: Mapped[str] = mapped_column(Text, nullable=False)
     original_amount: Mapped[Decimal | None] = mapped_column(MONEY)

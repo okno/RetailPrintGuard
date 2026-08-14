@@ -12,6 +12,7 @@ from retailprintguard.api.schemas import (
     AuditEntry,
     DashboardView,
     DeviceView,
+    DiagnosticsView,
     DocumentView,
     ImportBatchView,
     JobView,
@@ -25,16 +26,26 @@ from retailprintguard.api.schemas import (
 
 
 class RawArtifact:
-    def __init__(self, content: bytes, filename: str, sha256: str) -> None:
+    def __init__(
+        self,
+        content: bytes,
+        filename: str,
+        sha256: str,
+        *,
+        media_type: str = "application/octet-stream",
+    ) -> None:
         self.content = content
         self.filename = filename
         self.sha256 = sha256
+        self.media_type = media_type
 
 
 class ApiRepository(Protocol):
     def authenticate(self, username: str, password: str) -> UserPrincipal | None: ...
 
     def dashboard(self) -> DashboardView: ...
+
+    def diagnostics(self) -> DiagnosticsView: ...
 
     def list_devices(self) -> Sequence[DeviceView]: ...
 
@@ -52,7 +63,13 @@ class ApiRepository(Protocol):
 
     def get_document(self, document_id: UUID) -> DocumentView | None: ...
 
-    def get_document_raw(self, document_id: UUID) -> RawArtifact | None: ...
+    def get_document_raw(
+        self, document_id: UUID, *, direction: str = "request"
+    ) -> RawArtifact | None: ...
+
+    def get_job_raw(self, job_id: UUID, *, direction: str) -> RawArtifact | None: ...
+
+    def get_session_raw(self, session_id: UUID, *, direction: str) -> RawArtifact | None: ...
 
     def list_orders(
         self, *, limit: int, offset: int, filters: dict[str, Any]
@@ -103,6 +120,11 @@ class EmptyRepository:
     def dashboard(self) -> DashboardView:
         return DashboardView()
 
+    def diagnostics(self) -> DiagnosticsView:
+        from datetime import UTC, datetime
+
+        return DiagnosticsView(generated_at=datetime.now(UTC), database="unconfigured")
+
     def list_devices(self) -> Sequence[DeviceView]:
         return ()
 
@@ -123,8 +145,18 @@ class EmptyRepository:
         del document_id
         return None
 
-    def get_document_raw(self, document_id: UUID) -> RawArtifact | None:
-        del document_id
+    def get_document_raw(
+        self, document_id: UUID, *, direction: str = "request"
+    ) -> RawArtifact | None:
+        del document_id, direction
+        return None
+
+    def get_job_raw(self, job_id: UUID, *, direction: str) -> RawArtifact | None:
+        del job_id, direction
+        return None
+
+    def get_session_raw(self, session_id: UUID, *, direction: str) -> RawArtifact | None:
+        del session_id, direction
         return None
 
     def get_transaction(self, transaction_id: UUID) -> TransactionView | None:

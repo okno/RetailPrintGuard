@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from retailprintguard.common.domain import DocumentType
 from retailprintguard.parser.escpos import parse_escpos
@@ -147,3 +148,108 @@ def test_rch_management_toggle_multiple_docs_and_malformed_raw_is_never_executed
     )
     assert unknown[0].type is DocumentType.UNKNOWN
     assert unknown[0].warnings
+
+
+def test_rch_observed_quantity_management_totals_and_error_status_regression() -> None:
+    requests = b"".join(
+        (
+            _rch_frame("=k", sequence="0"),
+            _rch_frame("=K", sequence="1"),
+            _rch_frame("=R3/$200/*2/(Coperto)", sequence="2"),
+            _rch_frame("=R2/$100/*1/(Bevanda sintetica)", sequence="3"),
+            _rch_frame("=R4/$000/*1/(Voce ridotta)", sequence="4"),
+        )
+    )
+    responses = b"".join(
+        (
+            b"\x06" + _rch_frame("ON00000000", address="01", frame_class="N", sequence="8"),
+            b"\x06" + _rch_frame("ON00000000", address="01", frame_class="N", sequence="9"),
+            b"\x06" + _rch_frame("ON00000000", address="01", frame_class="N", sequence="0"),
+            b"\x06" + _rch_frame("ON00000000", address="01", frame_class="N", sequence="1"),
+            b"\x06" + _rch_frame("ES00010000", address="01", frame_class="N", sequence="2"),
+        )
+    )
+    documents = parse_rch(
+        requests,
+        responses,
+        device_id="rch_synthetic",
+        session_id="session-quantity",
+        job_id="job-quantity",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )
+
+    cancellation, commercial, response = documents
+    assert cancellation.type is DocumentType.CANCELLATION
+    assert cancellation.raw_metadata["observed_command"] == "=k"
+    assert commercial.lines[0].quantity == 2
+    assert commercial.lines[0].unit_price == 2
+    assert commercial.lines[0].line_total == 4
+    assert response.status == "ERROR"
+    assert response.complete is True
+    assert response.raw_metadata["device_error_codes"] == ["00010000"]
+    assert "device_error_status:00010000" in response.warnings
+
+    management = b"".join(
+        (
+            _rch_frame("=o", sequence="0"),
+            _rch_frame('="/(PRECONTO SINTETICO)', sequence="1"),
+            _rch_frame('="/(TOT                                      2,00)/*2', sequence="2"),
+            _rch_frame('="/(Contanti                                 2,00)', sequence="3"),
+            _rch_frame('="/(A 10% 10%                  1,82            0,18)', sequence="4"),
+            _rch_frame('="/(TOT                        1,82            0,18)', sequence="5"),
+            _rch_frame('="/(Tavolo: LAB-9)/*2', sequence="6"),
+            _rch_frame('="/(Ordine: ORD-LAB)/*2', sequence="7"),
+            _rch_frame('="/(01\\01\\42    12:34                  N. 9999-0042)', sequence="8"),
+            _rch_frame("=o", sequence="0"),
+        )
+    )
+    management_document = parse_rch(
+        management,
+        b"",
+        device_id="rch_synthetic",
+        session_id="session-management-total",
+        job_id="job-management-total",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+    assert management_document.gross_total == 2
+    assert management_document.tax_total == Decimal("0.18")
+    assert management_document.table_code == "LAB-9"
+    assert management_document.order_code == "ORD-LAB"
+    assert management_document.external_document_code == "9999-0042"
+    assert management_document.payments[0].method == "CONTANTI"
+    assert management_document.payments[0].amount == 2
+
+
+def test_escpos_legacy_cut_marks_document_complete_and_visible() -> None:
+    documents = parse_escpos(
+        b"\x1b@COMANDA SINTETICA\nVoce 7,50\nTOTALE 7,50\n\x1bm",
+        device_id="pos_synthetic",
+        session_id="session-legacy-cut",
+        job_id="job-legacy-cut",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )
+
+    assert len(documents) == 1
+    assert documents[0].type is DocumentType.KITCHEN_ORDER
+    assert documents[0].complete is True
+    assert documents[0].status == "COMPLETE"
+    assert "<ESC/POS:CUT>" in documents[0].normalized_text
+
+    change = parse_escpos(
+        b"\x1b@-1x Voce sintetica\nCoperti: 2\n\x1bm\x1bp\x00\x07\x79\x10\x04\x01",
+        device_id="pos_synthetic",
+        session_id="session-order-change",
+        job_id="job-order-change",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )
+    assert len(change) == 1
+    assert change[0].type is DocumentType.ORDER_CHANGE
+    assert change[0].complete is True

@@ -1,6 +1,6 @@
 import { Card, Switch, Table, TableBody, TableCell, TableHead, TableRow, Typography } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, session } from '../api/client'
+import { api, scopedQueryKey, session } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
 import { ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
@@ -8,7 +8,7 @@ import type { FraudRule } from '../types'
 
 export function RulesPage() {
   const queryClient = useQueryClient()
-  const query = useQuery({ queryKey: ['rules'], queryFn: () => api<FraudRule[]>('/rules') })
+  const query = useQuery({ queryKey: scopedQueryKey('rules'), queryFn: () => api<FraudRule[]>('/rules') })
   const update = useMutation({ mutationFn: ({ code, enabled }: { code: string; enabled: boolean }) => api<FraudRule>(`/rules/${encodeURIComponent(code)}?enabled=${enabled}`, { method: 'PATCH' }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ['rules'] }) })
   const isAdmin = session().user?.roles.includes('ADMIN') ?? false
   return <>

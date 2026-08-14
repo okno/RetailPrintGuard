@@ -10,7 +10,7 @@ le direzioni e non importa parser, API o database. La cattura usa una coda
 limitata e uno spool locale; un guasto del control plane non deve trasformarsi
 in una dipendenza sincrona della stampa.
 
-> Stato: release iniziale `0.1.9`. I test software sintetici coprono relay,
+> Stato: release `0.2.0`. I test software sintetici coprono relay,
 > spool, configurazione, import, correlazione, regole, modelli e API. Il collaudo
 > su hardware reale, il confronto PCAP direct-vs-proxy e l'installazione sul
 > target Debian 12 non sono ancora attestati da questo repository. Consultare
@@ -28,7 +28,7 @@ in una dipendenza sincrona della stampa.
   dal relay;
 - `retailprintguard-correlate`: worker DB per correlazione deterministica, diff
   delle righe, ordini/eventi/snapshot e aggregazione dei documenti fiscali;
-- `retailprintguard-fraud`: worker DB per sedici regole spiegabili, evidenze,
+- `retailprintguard-fraud`: worker DB per regole spiegabili e versionate, evidenze,
   storia alert e whitelist documentate;
 - `retailprintguard-api`: API FastAPI versionate, autenticazione e RBAC;
 - `retailprintguard-admin`: bootstrap interattivo e auditato del solo primo
@@ -100,13 +100,23 @@ RetailPrintGuard/
 ## Documentazione
 
 - [Analisi iniziale](docs/ANALISI_INIZIALE.md)
+- [Inventario del sistema](docs/SYSTEM_INVENTORY.md)
+- [Valutazione dell'incidente](docs/INCIDENT_ASSESSMENT.md)
+- [Matrice delle evidenze](docs/EVIDENCE_MATRIX.md)
+- [Analisi della causa](docs/ROOT_CAUSE_ANALYSIS.md)
 - [Architettura](docs/ARCHITETTURA.md)
+- [Flusso dati rilevato](docs/DATA_FLOW_AS_IS.md)
+- [Flusso dati corretto](docs/DATA_FLOW_TO_BE.md)
+- [Decisione sul trasporto](docs/ARCHITECTURE_DECISION_TRANSPORT.md)
 - [Configurazione dispositivi](docs/CONFIGURAZIONE.md)
 - [Formato spool](docs/FORMATO_SPOOL.md)
 - [Database ed ER](docs/DATABASE.md)
+- [Modello database e integrità](docs/DATABASE_MODEL.md)
+- [Progettazione dei parser](docs/PARSER_DESIGN.md)
 - [API e RBAC](docs/API.md)
 - [Web application](docs/WEB_APPLICATION.md)
 - [Correlazione, alert e regole](docs/ALERT_E_REGOLE.md)
+- [Modello antifrode](docs/FRAUD_DETECTION_MODEL.md)
 - [Importazione storica](docs/IMPORT_STORICO.md)
 - [Migrazione dai proxy standalone](docs/MIGRAZIONE_DA_LEGACY.md)
 - [Guida operativa](docs/OPERATIONS.md)
@@ -115,9 +125,15 @@ RetailPrintGuard/
 - [Backup, restore e disaster recovery](docs/BACKUP_RESTORE_DR.md)
 - [Aggiornamento parser](docs/AGGIORNAMENTO_PARSER.md)
 - [Sicurezza](docs/SECURITY.md)
+- [Security review](docs/SECURITY_REVIEW.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Decisioni architetturali](docs/ADR.md)
 - [Rapporto test](docs/TEST_REPORT.md)
+- [Piano test](docs/TEST_PLAN.md)
+- [Piano deployment](docs/DEPLOYMENT_PLAN.md)
+- [Piano rollback](docs/ROLLBACK_PLAN.md)
+- [Questioni aperte](docs/OPEN_ISSUES.md)
+- [Validazione finale](docs/FINAL_VALIDATION_REPORT.md)
 - [Limiti noti](docs/LIMITI_NOTI.md)
 - [Registro modifiche](CHANGELOG.md)
 

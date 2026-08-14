@@ -22,7 +22,7 @@ from retailprintguard.common.domain import (
     PaymentRecord,
 )
 
-ALGORITHM_VERSION = "rpg-correlation-1.0.0"
+ALGORITHM_VERSION = "rpg-correlation-1.1.0"
 ZERO = Decimal("0.0000")
 HUNDRED = Decimal("100")
 
@@ -36,6 +36,10 @@ _SOURCE_TYPES = {
 _FISCAL_TYPES = {
     DocumentType.COMMERCIAL_DOCUMENT,
     DocumentType.REFUND,
+}
+_ECONOMIC_CLOSE_TYPES = {
+    *_FISCAL_TYPES,
+    DocumentType.MANAGEMENT_DOCUMENT,
 }
 _FOLLOWUP_TYPES = {
     *_FISCAL_TYPES,
@@ -100,6 +104,7 @@ class CorrelatedTransaction(BaseModel):
     documents: tuple[NormalizedDocument, ...]
     prebill_total: Decimal | None
     fiscal_total: Decimal
+    observed_final_total: Decimal
     payment_total: Decimal
     difference_amount: Decimal | None
     difference_percent: Decimal | None
@@ -686,24 +691,46 @@ class CorrelationEngine:
         prebill = prebills[-1] if prebills else None
         prebill_total = None if prebill is None else _total(prebill)
         fiscal_documents = [document for document in documents if document.type in _FISCAL_TYPES]
+        valid_fiscal_documents = [
+            document
+            for document in fiscal_documents
+            if document.complete and _total(document) is not None
+        ]
         fiscal_total = sum(
             (
                 -(_total(document) or ZERO)
                 if document.type is DocumentType.REFUND
                 else (_total(document) or ZERO)
             )
-            for document in fiscal_documents
+            for document in valid_fiscal_documents
+        )
+        economic_closures = [
+            document
+            for document in documents
+            if document.type in _ECONOMIC_CLOSE_TYPES
+            and document is not prebill
+            and _total(document) is not None
+            and (
+                document in valid_fiscal_documents
+                or bool(document.raw_metadata.get("economic_close"))
+            )
+        ]
+        comparison_total = (
+            fiscal_total
+            if valid_fiscal_documents
+            else sum((_total(document) or ZERO) for document in economic_closures)
         )
         payment_total = sum(
-            payment.amount for payment in _authoritative_payments(documents, fiscal_documents)
+            payment.amount
+            for payment in _authoritative_payments(documents, valid_fiscal_documents)
         )
-        difference = None if prebill_total is None else prebill_total - fiscal_total
+        difference = None if prebill_total is None else prebill_total - comparison_total
         difference_percent = (
             None
             if prebill_total is None or prebill_total == ZERO
             else (difference / prebill_total * HUNDRED).quantize(Decimal("0.0001"))
         )
-        final_lines = tuple(line for document in fiscal_documents for line in document.lines)
+        final_lines = tuple(line for document in economic_closures for line in document.lines)
         line_changes = (
             compare_document_lines(prebill.lines, final_lines)
             if prebill is not None and prebill.lines and final_lines
@@ -726,10 +753,11 @@ class CorrelationEngine:
             documents=tuple(documents),
             prebill_total=prebill_total,
             fiscal_total=fiscal_total,
+            observed_final_total=comparison_total,
             payment_total=payment_total,
             difference_amount=difference,
             difference_percent=difference_percent,
-            split_payment=len(fiscal_documents) > 1 and fiscal_total > ZERO,
+            split_payment=len(valid_fiscal_documents) > 1 and fiscal_total > ZERO,
             line_changes=line_changes,
             timeline=timeline,
         )

@@ -1,5 +1,8 @@
 # Considerazioni di sicurezza
 
+La review post-incidente, il threat model e i gate correnti sono in
+[SECURITY_REVIEW.md](SECURITY_REVIEW.md).
+
 ## Modello di minaccia
 
 Asset principali:

@@ -1,5 +1,9 @@
 # Limiti noti e rischi residui
 
+Per lo stato del worktree correttivo e i criteri di chiusura usare anche
+[OPEN_ISSUES.md](OPEN_ISSUES.md). Le voci sottostanti descrivono la baseline
+storica dichiarata e non vanno considerate chiuse senza un nuovo gate.
+
 Stato verificato sul worktree del 13 agosto 2026.
 
 ## Bloccanti per accettazione completa
@@ -35,8 +39,8 @@ Stato verificato sul worktree del 13 agosto 2026.
 
 - La UI mostra un diff JSON, non una comparazione affiancata semanticamente
   completa.
-- Non esiste ancora export fascicolo evidenze PDF/ZIP; l'API offre CSV alert e
-  download RAW singolo.
+- Il documento singolo è esportabile in RAW/TXT/JSON/PDF e gli alert in CSV;
+  non esiste ancora un fascicolo ZIP multi-documento firmato.
 - Mancano ordinamento generico server-side, filtri temporali completi e
   persistenza avanzata filtri.
 - Nessun SSE/WebSocket: lo stato device viene aggiornato a polling.

@@ -33,6 +33,7 @@ from retailprintguard.proxy.spool import (
 )
 
 LOGGER = logging.getLogger("retailprintguard.proxy")
+_PUBLISHED_JOB_HISTORY_LIMIT = 256
 
 
 class RelayError(RuntimeError):
@@ -101,10 +102,14 @@ class _ActivityClock:
 
     async def wait_until_idle(self, timeout: float) -> None:
         while True:
+            # Clear first, then sample the clock.  If touch() happens before
+            # clear, its new timestamp is observed below; if it happens after,
+            # the event remains set.  Reversing these operations loses a wakeup
+            # and can fire an idle timeout while traffic is active.
+            self.changed.clear()
             remaining = timeout - (time.monotonic() - self.last_activity)
             if remaining <= 0:
                 return
-            self.changed.clear()
             try:
                 await asyncio.wait_for(self.changed.wait(), timeout=remaining)
             except TimeoutError:
@@ -316,7 +321,12 @@ class RelayService:
         )
         policy = StorageFailurePolicy(self.settings.proxy.storage_failure_policy)
         try:
-            capture = await self.capture_manager.open_session(descriptor, policy)
+            # Opening the on-disk spool is deliberately queued, not awaited.
+            # The writer thread processes the open command before subsequent
+            # events, while the socket pumps can start immediately.  A full
+            # queue fails explicitly according to policy instead of making a
+            # physical-device connection wait on disk I/O.
+            capture = self.capture_manager.open_session_nowait(descriptor, policy)
         except (CaptureError, OSError) as exc:
             message = f"capture initialization failed: {type(exc).__name__}: {exc}"
             self._log(logging.CRITICAL, "capture_open_failed", device, error=message)
@@ -388,6 +398,9 @@ class RelayService:
         else:
             if published is not None:
                 self.published_jobs.append(published)
+                overflow = len(self.published_jobs) - _PUBLISHED_JOB_HISTORY_LIMIT
+                if overflow > 0:
+                    del self.published_jobs[:overflow]
 
     async def _run_full_duplex(
         self,
@@ -428,11 +441,15 @@ class RelayService:
             name="session-idle-timeout",
         )
         failure_watcher: asyncio.Task[str] | None = None
-        if capture.policy is StorageFailurePolicy.ABORT:
+        tail_idle_watcher: asyncio.Task[None] | None = None
+        if capture.manager is not None:
             failure_watcher = asyncio.create_task(capture.wait_failed(), name="capture-failure")
+            failure_watcher.add_done_callback(
+                lambda task: _log_capture_failure(task, capture)
+            )
 
         watched: set[asyncio.Task[Any]] = {*pumps, idle_watcher}
-        if failure_watcher is not None:
+        if failure_watcher is not None and capture.policy is StorageFailurePolicy.ABORT:
             watched.add(failure_watcher)
         try:
             done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
@@ -443,7 +460,11 @@ class RelayService:
                     "session_idle_timeout",
                     ("no traffic in either direction before the configured timeout",),
                 )
-            if failure_watcher is not None and failure_watcher in done:
+            if (
+                failure_watcher is not None
+                and capture.policy is StorageFailurePolicy.ABORT
+                and failure_watcher in done
+            ):
                 error = failure_watcher.result()
                 await _cancel_tasks(pumps)
                 return _SessionOutcome(False, "storage_failure", (error,))
@@ -455,34 +476,43 @@ class RelayService:
 
             remaining = {pump for pump in pumps if not pump.done()}
             if remaining:
+                # Once one side half-closes, use the shorter response-tail
+                # limit as an *idle* timeout.  A device that is still sending
+                # bytes keeps extending the tail; an absolute deadline would
+                # truncate a valid long RCH response.
+                await _cancel_tasks({idle_watcher})
+                tail_idle_watcher = asyncio.create_task(
+                    activity.wait_until_idle(
+                        self.settings.proxy.response_tail_timeout_seconds
+                    ),
+                    name="response-tail-idle-timeout",
+                )
                 tail_watch: set[asyncio.Task[Any]] = set(remaining)
-                tail_watch.add(idle_watcher)
-                if failure_watcher is not None:
+                tail_watch.add(tail_idle_watcher)
+                if failure_watcher is not None and capture.policy is StorageFailurePolicy.ABORT:
                     tail_watch.add(failure_watcher)
-                done_tail, pending_tail = await asyncio.wait(
+                done_tail, _ = await asyncio.wait(
                     tail_watch,
-                    timeout=self.settings.proxy.response_tail_timeout_seconds,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if idle_watcher in done_tail:
+                if tail_idle_watcher in done_tail:
                     await _cancel_tasks(remaining)
                     return _SessionOutcome(
                         False,
-                        "session_idle_timeout",
-                        ("no traffic in either direction before the configured timeout",),
+                        "half_close_tail_idle_timeout",
+                        (
+                            "opposite direction was idle after half-close for the "
+                            "configured response-tail timeout",
+                        ),
                     )
-                if failure_watcher is not None and failure_watcher in done_tail:
+                if (
+                    failure_watcher is not None
+                    and capture.policy is StorageFailurePolicy.ABORT
+                    and failure_watcher in done_tail
+                ):
                     error = failure_watcher.result()
                     await _cancel_tasks(remaining)
                     return _SessionOutcome(False, "storage_failure", (error,))
-                unfinished_pumps = {task for task in pending_tail if task in pumps}
-                if unfinished_pumps:
-                    await _cancel_tasks(unfinished_pumps)
-                    return _SessionOutcome(
-                        False,
-                        "half_close_tail_timeout",
-                        ("opposite direction did not reach EOF before the configured timeout",),
-                    )
                 error = _first_task_error({task for task in done_tail if task in pumps})
                 if error is not None:
                     return _SessionOutcome(False, "transport_error", (error,))
@@ -491,6 +521,8 @@ class RelayService:
         finally:
             await _cancel_tasks({task for task in pumps if not task.done()})
             await _cancel_tasks({idle_watcher})
+            if tail_idle_watcher is not None:
+                await _cancel_tasks({tail_idle_watcher})
             if failure_watcher is not None:
                 await _cancel_tasks({failure_watcher})
 
@@ -517,6 +549,7 @@ class RelayService:
                 except (TimeoutError, OSError, RuntimeError) as exc:
                     forwarded = False
                     forward_error = f"{type(exc).__name__}: {exc}"
+                    self._abort_writer(destination)
                 accepted = capture.record(
                     direction=direction,
                     direction_sequence=direction_sequence,
@@ -548,6 +581,12 @@ class RelayService:
             except (TimeoutError, OSError, RuntimeError) as exc:
                 forwarded = False
                 forward_error = f"{type(exc).__name__}: {exc}"
+                # write() may already have queued a prefix in the kernel.  A
+                # graceful close could keep flushing that stale payload after
+                # the per-target lock is released and a client retries.  Abort
+                # the transport immediately so no buffered tail survives the
+                # failed forwarding attempt.
+                self._abort_writer(destination)
             accepted = capture.record(
                 direction=direction,
                 direction_sequence=direction_sequence,
@@ -570,7 +609,8 @@ class RelayService:
     def _abort_writer(writer: asyncio.StreamWriter) -> None:
         transport = writer.transport
         if transport is not None:
-            transport.abort()
+            with contextlib.suppress(OSError, RuntimeError):
+                transport.abort()
 
     @staticmethod
     def _log(level: int, event: str, device: DeviceConfig, **values: Any) -> None:
@@ -640,6 +680,25 @@ def _first_task_error(tasks: set[asyncio.Task[Any]]) -> str | None:
         if exception is not None:
             return f"{type(exception).__name__}: {exception}"
     return None
+
+
+def _log_capture_failure(task: asyncio.Task[str], capture: CaptureSession) -> None:
+    if task.cancelled():
+        return
+    try:
+        error = task.result()
+    except Exception as exc:  # pragma: no cover - defensive task callback boundary
+        error = f"{type(exc).__name__}: {exc}"
+    LOGGER.critical(
+        "capture_failed",
+        extra={
+            "event": "capture_failed",
+            "device": capture.descriptor.device_id,
+            "session_id": capture.descriptor.session_id,
+            "job_id": capture.descriptor.job_id,
+            "error": error,
+        },
+    )
 
 
 __all__ = ["RelayError", "RelayService"]

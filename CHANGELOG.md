@@ -3,7 +3,49 @@
 Tutte le modifiche rilevanti sono documentate in questo file. Il progetto segue
 la struttura di Keep a Changelog.
 
-## [Unreleased]
+## [0.2.0] — 2026-08-14
+
+### Added
+
+- renderer PDF receipt-style deterministico, versionato e bounded, endpoint
+  autenticato con checksum e download integrato nella web application;
+- metadati dispositivo validati (`mac_address`, reparto e ruolo) con migrazione
+  MariaDB e valori di esempio esclusivamente sintetici;
+- regola composita `MODIFICA_POST_PRECONTO` con chiusure economiche distinte da
+  chiusure fiscali e diff spiegabile;
+- pacchetto documentale di incident assessment, matrice delle evidenze, analisi
+  della causa, data flow as-is/to-be, ADR del trasporto e piani verificabili di
+  test, deployment e rollback;
+- strumenti operativi sicuri per test, validazione offline delle catture,
+  reprocessing controllato, verifica segreti ed export auditato dei documenti;
+- `AGENTS.md` con vincoli espliciti per data plane, apparati, privacy ed
+  evidenze.
+
+### Documentation
+
+- registrata la distinzione tra osservazioni fotografiche, RAW/timeline,
+  database e log, senza pubblicare IP, MAC, PII, UUID o hash operativi;
+- documentata la mitigazione dell'incidente: arresto del solo worker antifrode,
+  con proxy POS/RCH lasciati attivi e senza probe o restart degli apparati.
+
+### Fixed
+
+- reverse tail ora basata su inattività, abort sincrono del trasporto prima del
+  rilascio lock, ordine timeline completion-safe, capture non bloccante e
+  recovery `PARTIAL` coerente;
+- parser ESC/POS/RCH corretti per cut legacy, quantità/prezzo, totale copia/IVA,
+  status d'errore, annulli e documenti camera/non riscossi;
+- fingerprint antifrode reso stabile tra polling e batch ingestion
+  solo-duplicati non più persistiti;
+- duplicati alert storici preservati ma marcati con relazione canonica tramite
+  migrazione non distruttiva;
+- API e frontend corretti per paginazione, query N+1, mapping, logout/cache,
+  ricerca, export sicuro, error state e download evidenze.
+
+### Security
+
+- download RAW/TXT/JSON/PDF verificati con SHA-256 e auditati;
+- nginx corredato da esempio TLS e security gate per segreti/artefatti privati.
 
 ## [0.1.9] — 2026-08-13
 

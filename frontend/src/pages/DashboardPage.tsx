@@ -1,7 +1,7 @@
 import { DescriptionOutlined, DevicesOutlined, EuroOutlined, ReceiptLongOutlined, ShieldOutlined, WarningAmberOutlined } from '@mui/icons-material'
 import { Box, Card, CardContent, Grid, LinearProgress, List, ListItem, ListItemText, Typography } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
-import { api } from '../api/client'
+import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
 import { StatCard } from '../components/StatCard'
 import { ErrorState, LoadingState } from '../components/State'
@@ -12,8 +12,8 @@ const euros = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR
 const bytes = new Intl.NumberFormat('it-IT', { notation: 'compact', style: 'unit', unit: 'byte' })
 
 export function DashboardPage() {
-  const dashboard = useQuery({ queryKey: ['dashboard'], queryFn: () => api<Dashboard>('/dashboard') })
-  const devices = useQuery({ queryKey: ['devices'], queryFn: () => api<Device[]>('/devices') })
+  const dashboard = useQuery({ queryKey: scopedQueryKey('dashboard'), queryFn: () => api<Dashboard>('/dashboard') })
+  const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices') })
   if (dashboard.isLoading) return <LoadingState />
   if (dashboard.error || !dashboard.data) return <ErrorState error={dashboard.error} />
   const data = dashboard.data

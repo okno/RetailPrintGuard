@@ -1,25 +1,30 @@
 """Versioned API routes with role checks and server-side pagination."""
 
+import base64
 import csv
+import hashlib
 import io
+import re
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from decimal import Decimal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from retailprintguard import __version__
 from retailprintguard.api.auth import LoginThrottle, TokenService, constant_time_dummy_verify
-from retailprintguard.api.repository import ApiRepository
+from retailprintguard.api.repository import ApiRepository, RawArtifact
 from retailprintguard.api.schemas import (
     AlertUpdate,
     AlertView,
     AuditEntry,
     DashboardView,
     DeviceView,
+    DiagnosticsView,
     DocumentView,
     HealthView,
     ImportBatchView,
@@ -35,8 +40,37 @@ from retailprintguard.api.schemas import (
     TransactionView,
     UserPrincipal,
 )
+from retailprintguard.render.pdf import (
+    PDF_RENDERER_VERSION,
+    DocumentRenderError,
+    render_document_pdf,
+)
 
 bearer = HTTPBearer(auto_error=False)
+_DOWNLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def _safe_download_name(value: str) -> str:
+    result = _DOWNLOAD_NAME_RE.sub("_", value).strip("._")
+    return result[:191] or "evidence.bin"
+
+
+def _csv_safe(value: object) -> object:
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _content_digest(payload: bytes) -> str:
+    digest = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
+    return f"sha-256=:{digest}:"
+
+
+def _stream_bytes(payload: bytes, *, chunk_size: int = 64 * 1024) -> Any:
+    view = memoryview(payload)
+    for offset in range(0, len(view), chunk_size):
+        yield bytes(view[offset : offset + chunk_size])
 
 
 class ApiContext:
@@ -110,6 +144,54 @@ def create_router(context: ApiContext) -> APIRouter:
             )
         )
 
+    def artifact_response(
+        request: Request,
+        repo: ApiRepository,
+        user: UserPrincipal,
+        artifact: RawArtifact,
+        *,
+        action: str,
+        entity_type: str,
+        entity_id: UUID,
+        preview_bytes: int | None = None,
+    ) -> StreamingResponse:
+        computed_sha256 = hashlib.sha256(artifact.content).hexdigest()
+        if computed_sha256 != artifact.sha256:
+            audit(
+                request,
+                repo,
+                user,
+                "EVIDENCE_INTEGRITY_FAILURE",
+                entity_type,
+                str(entity_id),
+                stored_sha256=artifact.sha256,
+                computed_sha256=computed_sha256,
+            )
+            raise HTTPException(status_code=409, detail="Integrità dell'evidenza non verificata")
+        content = artifact.content if preview_bytes is None else artifact.content[:preview_bytes]
+        audit(
+            request,
+            repo,
+            user,
+            action,
+            entity_type,
+            str(entity_id),
+            sha256=computed_sha256,
+            bytes=len(content),
+            preview=preview_bytes is not None,
+        )
+        filename = _safe_download_name(artifact.filename)
+        return StreamingResponse(
+            _stream_bytes(content),
+            media_type=artifact.media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Digest": _content_digest(content),
+                "X-Checksum-SHA256": hashlib.sha256(content).hexdigest(),
+                "Content-Length": str(len(content)),
+            },
+        )
+
     @router.post("/auth/login", response_model=TokenResponse, tags=["auth"])
     def login(
         request: Request, body: LoginRequest, repo: Annotated[ApiRepository, Depends(repository)]
@@ -149,6 +231,19 @@ def create_router(context: ApiContext) -> APIRouter:
     ) -> list[DeviceView]:
         return list(repo.list_devices())
 
+    @router.get(
+        "/system/diagnostics",
+        response_model=DiagnosticsView,
+        tags=["system"],
+    )
+    def diagnostics(
+        _: AnyUser, repo: Annotated[ApiRepository, Depends(repository)]
+    ) -> DiagnosticsView:
+        result = repo.diagnostics()
+        return result.model_copy(
+            update={"database": repo.database_health(), "spool": context.spool_health}
+        )
+
     @router.get("/sessions", response_model=Page[SessionView], tags=["sessions"])
     def sessions(
         _: AnyUser,
@@ -177,6 +272,54 @@ def create_router(context: ApiContext) -> APIRouter:
             filters={"device_id": device_id, "status": job_status},
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
+
+    @router.get("/sessions/{session_id}/raw", tags=["sessions"])
+    def session_raw(
+        session_id: UUID,
+        request: Request,
+        user: Auditor,
+        repo: Annotated[ApiRepository, Depends(repository)],
+        direction: Literal["request", "response"] = "request",
+    ) -> StreamingResponse:
+        artifact = repo.get_session_raw(session_id, direction=direction)
+        if artifact is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Flusso RAW {direction} della sessione non disponibile",
+            )
+        return artifact_response(
+            request,
+            repo,
+            user,
+            artifact,
+            action="SESSION_RAW_DOWNLOAD",
+            entity_type="proxy_session",
+            entity_id=session_id,
+        )
+
+    @router.get("/jobs/{job_id}/raw", tags=["jobs"])
+    def job_raw(
+        job_id: UUID,
+        request: Request,
+        user: Auditor,
+        repo: Annotated[ApiRepository, Depends(repository)],
+        direction: Literal["request", "response"] = "request",
+    ) -> StreamingResponse:
+        artifact = repo.get_job_raw(job_id, direction=direction)
+        if artifact is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Payload RAW {direction} del job non disponibile",
+            )
+        return artifact_response(
+            request,
+            repo,
+            user,
+            artifact,
+            action="JOB_RAW_DOWNLOAD",
+            entity_type="print_job",
+            entity_id=job_id,
+        )
 
     @router.get("/documents", response_model=Page[DocumentView], tags=["documents"])
     def documents(
@@ -210,27 +353,113 @@ def create_router(context: ApiContext) -> APIRouter:
         request: Request,
         user: Auditor,
         repo: Annotated[ApiRepository, Depends(repository)],
-    ) -> Response:
-        artifact = repo.get_document_raw(document_id)
+        direction: Literal["request", "response"] = "request",
+        preview_bytes: Annotated[int | None, Query(ge=1, le=65_536)] = None,
+    ) -> StreamingResponse:
+        artifact = repo.get_document_raw(document_id, direction=direction)
         if artifact is None:
-            raise HTTPException(status_code=404, detail="Payload originale non trovato")
-        audit(
+            raise HTTPException(
+                status_code=404,
+                detail=f"Payload originale {direction} non trovato",
+            )
+        return artifact_response(
             request,
             repo,
             user,
-            "RAW_DOWNLOAD",
-            "document",
-            str(document_id),
-            sha256=artifact.sha256,
+            artifact,
+            action="RAW_DOWNLOAD",
+            entity_type="document",
+            entity_id=document_id,
+            preview_bytes=preview_bytes,
         )
-        return Response(
-            content=artifact.content,
-            media_type="application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{artifact.filename}"',
-                "Digest": f"sha-256={artifact.sha256}",
-            },
+
+    @router.get("/documents/{document_id}/txt", tags=["documents"])
+    def document_txt(
+        document_id: UUID,
+        request: Request,
+        user: Auditor,
+        repo: Annotated[ApiRepository, Depends(repository)],
+    ) -> StreamingResponse:
+        result = repo.get_document(document_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Documento non trovato")
+        if not result.normalized_text:
+            raise HTTPException(status_code=404, detail="Derivato TXT non disponibile")
+        payload = result.normalized_text.encode("utf-8")
+        artifact = RawArtifact(
+            payload,
+            f"{document_id}.txt",
+            hashlib.sha256(payload).hexdigest(),
+            media_type="text/plain; charset=utf-8",
         )
+        return artifact_response(
+            request,
+            repo,
+            user,
+            artifact,
+            action="TXT_DOWNLOAD",
+            entity_type="document",
+            entity_id=document_id,
+        )
+
+    @router.get("/documents/{document_id}/json", tags=["documents"])
+    def document_json(
+        document_id: UUID,
+        request: Request,
+        user: Auditor,
+        repo: Annotated[ApiRepository, Depends(repository)],
+    ) -> StreamingResponse:
+        result = repo.get_document(document_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Documento non trovato")
+        payload = (result.model_dump_json(indent=2) + "\n").encode("utf-8")
+        artifact = RawArtifact(
+            payload,
+            f"{document_id}.json",
+            hashlib.sha256(payload).hexdigest(),
+            media_type="application/json; charset=utf-8",
+        )
+        return artifact_response(
+            request,
+            repo,
+            user,
+            artifact,
+            action="JSON_DOWNLOAD",
+            entity_type="document",
+            entity_id=document_id,
+        )
+
+    @router.get("/documents/{document_id}/pdf", tags=["documents"])
+    def document_pdf(
+        document_id: UUID,
+        request: Request,
+        user: Auditor,
+        repo: Annotated[ApiRepository, Depends(repository)],
+    ) -> StreamingResponse:
+        result = repo.get_document(document_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Documento non trovato")
+        try:
+            payload = render_document_pdf(result)
+        except DocumentRenderError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        artifact = RawArtifact(
+            payload,
+            f"{document_id}.pdf",
+            hashlib.sha256(payload).hexdigest(),
+            media_type="application/pdf",
+        )
+        response = artifact_response(
+            request,
+            repo,
+            user,
+            artifact,
+            action="PDF_DOWNLOAD",
+            entity_type="document",
+            entity_id=document_id,
+        )
+        response.headers["X-RetailPrintGuard-Renderer"] = PDF_RENDERER_VERSION
+        return response
 
     @router.get("/orders", response_model=Page[OrderView], tags=["orders"])
     def orders(
@@ -253,14 +482,16 @@ def create_router(context: ApiContext) -> APIRouter:
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
         table_code: str | None = None,
+        order_code: str | None = None,
         operator_code: str | None = None,
-        minimum_difference: float | None = None,
+        minimum_difference: Decimal | None = None,
     ) -> Page[TransactionView]:
         items, total = repo.list_transactions(
             limit=limit,
             offset=offset,
             filters={
                 "table_code": table_code,
+                "order_code": order_code,
                 "operator_code": operator_code,
                 "minimum_difference": minimum_difference,
             },
@@ -284,10 +515,21 @@ def create_router(context: ApiContext) -> APIRouter:
         user: Auditor,
         repo: Annotated[ApiRepository, Depends(repository)],
         severity: str | None = None,
+        rule: str | None = None,
         alert_status: str | None = Query(default=None, alias="status"),
+        device_id: str | None = None,
+        operator_code: str | None = None,
     ) -> StreamingResponse:
         items, _ = repo.list_alerts(
-            limit=10_000, offset=0, filters={"severity": severity, "status": alert_status}
+            limit=10_000,
+            offset=0,
+            filters={
+                "severity": severity,
+                "rule": rule,
+                "status": alert_status,
+                "device_id": device_id,
+                "operator_code": operator_code,
+            },
         )
         buffer = io.StringIO(newline="")
         writer = csv.writer(buffer)
@@ -296,7 +538,7 @@ def create_router(context: ApiContext) -> APIRouter:
         )
         for item in items:
             writer.writerow(
-                [
+                [_csv_safe(value) for value in [
                     item.id,
                     item.rule_code,
                     item.severity,
@@ -304,7 +546,7 @@ def create_router(context: ApiContext) -> APIRouter:
                     item.status,
                     item.opened_at.isoformat(),
                     item.description,
-                ]
+                ]]
             )
         audit(request, repo, user, "ALERT_EXPORT", "fraud_alert", count=len(items))
         return StreamingResponse(

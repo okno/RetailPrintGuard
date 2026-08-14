@@ -147,6 +147,12 @@ def _rule(
 
 DEFAULT_RULES: tuple[RuleDefinition, ...] = (
     _rule(
+        "MODIFICA_POST_PRECONTO",
+        AlertSeverity.HIGH,
+        minimum_percent=Decimal("20"),
+        minimum_amount=Decimal("1.00"),
+    ),
+    _rule(
         "PREBILL_FISCAL_AMOUNT_DROP",
         AlertSeverity.HIGH,
         minimum_percent=Decimal("20"),
@@ -270,6 +276,7 @@ class FraudEngine:
             raise ValueError("fraud rule codes must be unique")
         self.rules = rules
         self._handlers: dict[str, Callable[[FraudContext, RuleDefinition], _FindingData | None]] = {
+            "MODIFICA_POST_PRECONTO": self._post_prebill_change,
             "PREBILL_FISCAL_AMOUNT_DROP": self._prebill_amount_drop,
             "ITEM_REMOVED_AFTER_PREBILL": self._item_removed,
             "PRICE_REDUCED_AFTER_PREBILL": self._price_reduced,
@@ -350,6 +357,94 @@ class FraudEngine:
                 )
             )
         return tuple(findings)
+
+    def _post_prebill_change(
+        self, context: FraudContext, rule: RuleDefinition
+    ) -> _FindingData | None:
+        """Flag a material post-prebill reduction even without a valid fiscal close.
+
+        A cancelled/partial fiscal attempt or an explicitly marked non-fiscal
+        settlement is still economically relevant evidence.  It must not be
+        misrepresented as a successful fiscal total, hence this rule uses the
+        correlation engine's separately provenance-checked
+        ``observed_final_total``.
+        """
+
+        tx = context.transaction
+        if tx.prebill_total is None or tx.prebill_total <= ZERO:
+            return None
+        closures = [
+            document
+            for document in tx.documents
+            if (
+                document.type in FISCAL_TYPES
+                or bool(document.raw_metadata.get("economic_close"))
+                or document.type is DocumentType.CANCELLATION
+            )
+        ]
+        if not closures:
+            return None
+        difference = tx.difference_amount or ZERO
+        percent = tx.difference_percent or ZERO
+        if difference < _decimal(rule.parameters.get("minimum_amount"), "1") or percent < _decimal(
+            rule.parameters.get("minimum_percent"), "20"
+        ):
+            return None
+        line_evidence = tuple(
+            {
+                "kind": "post_prebill_line_change",
+                "change_type": change.change_type.value,
+                "item_key": change.item_key,
+                "description": change.description,
+                "quantity_before": (
+                    None if change.before_quantity is None else str(change.before_quantity)
+                ),
+                "quantity_after": (
+                    None if change.after_quantity is None else str(change.after_quantity)
+                ),
+                "unit_price_before": (
+                    None if change.before_unit_price is None else str(change.before_unit_price)
+                ),
+                "unit_price_after": (
+                    None if change.after_unit_price is None else str(change.after_unit_price)
+                ),
+            }
+            for change in tx.line_changes
+            if change.change_type is not LineChangeType.UNCHANGED
+        )
+        status_evidence = {
+            "kind": "post_prebill_economic_outcome",
+            "prebill_total": str(tx.prebill_total),
+            "observed_final_total": str(tx.observed_final_total),
+            "fiscal_aggregate": str(tx.fiscal_total),
+            "difference_amount": str(difference),
+            "difference_percent": str(percent),
+            "fiscal_conclusive": any(
+                document.type in FISCAL_TYPES and document.complete for document in closures
+            ),
+            "cancelled_or_partial": any(
+                document.type is DocumentType.CANCELLATION or not document.complete
+                for document in closures
+            ),
+            "room_settlement": any(
+                document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+                for document in closures
+            ),
+        }
+        score = min(100, 70 + int(percent * Decimal("0.3")))
+        return _FindingData(
+            description="Modifica economica rilevante dopo il preconto",
+            explanation=(
+                f"Il preconto era {tx.prebill_total} EUR; l'esito economico osservato "
+                f"e' {tx.observed_final_total} EUR, con differenza {difference} EUR "
+                f"({percent}%). L'esito fiscale puo' essere annullato, parziale o non "
+                "conclusivo e richiede revisione umana."
+            ),
+            evidence=(status_evidence, *line_evidence),
+            score=score,
+            confidence=95 if tx.correlation else 70,
+            document_ids=tuple(document.id for document in tx.documents),
+        )
 
     def _prebill_amount_drop(
         self, context: FraudContext, rule: RuleDefinition
@@ -546,7 +641,13 @@ class FraudEngine:
                 {
                     "kind": "missing_fiscal_close",
                     "last_source_at": latest.isoformat(),
-                    "evaluated_at": context.evaluated_at.isoformat(),
+                    # ``evaluated_at`` is deliberately not evidence identity.  The
+                    # finding stays the same while the order remains unclosed;
+                    # including the worker clock here changed the fingerprint on
+                    # every poll and generated an unbounded stream of duplicate
+                    # alerts.  ``FraudAlert.opened_at`` records when the condition
+                    # was first observed.
+                    "threshold_minutes": int(limit.total_seconds() / 60),
                 },
             ),
             score=70,

@@ -31,6 +31,7 @@ from retailprintguard.api.schemas import (
     AuditEntry,
     DashboardView,
     DeviceView,
+    DiagnosticsView,
     DocumentLineView,
     DocumentView,
     ImportBatchView,
@@ -40,6 +41,7 @@ from retailprintguard.api.schemas import (
     RuleView,
     SearchHit,
     SessionView,
+    SystemEventView,
     TransactionView,
     UserPrincipal,
 )
@@ -93,6 +95,7 @@ from retailprintguard.ingestion.repository import (
 )
 
 MONEY_ZERO = Decimal("0.0000")
+DEVICE_ACTIVITY_STALE_AFTER = timedelta(minutes=10)
 FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT.value, DocumentType.REFUND.value}
 SOURCE_TYPES = {
     DocumentType.ORDER.value,
@@ -298,7 +301,10 @@ class SqlAlchemyApiRepository:
                 session.scalar(
                     select(func.count())
                     .select_from(FraudAlert)
-                    .where(FraudAlert.status.in_(open_states))
+                    .where(
+                        FraudAlert.is_canonical.is_(True),
+                        FraudAlert.status.in_(open_states),
+                    )
                 )
                 or 0
             )
@@ -307,6 +313,7 @@ class SqlAlchemyApiRepository:
                     select(func.count())
                     .select_from(FraudAlert)
                     .where(
+                        FraudAlert.is_canonical.is_(True),
                         FraudAlert.status.in_(open_states),
                         FraudAlert.severity == "CRITICAL",
                     )
@@ -316,6 +323,7 @@ class SqlAlchemyApiRepository:
             economic = (
                 session.scalar(
                     select(func.coalesce(func.sum(FraudAlert.difference_amount), 0)).where(
+                        FraudAlert.is_canonical.is_(True),
                         FraudAlert.status.in_(open_states)
                     )
                 )
@@ -323,16 +331,30 @@ class SqlAlchemyApiRepository:
             )
             device_count = session.scalar(select(func.count()).select_from(Device)) or 0
             latest_status = self._latest_device_statuses(session)
-            online = sum(status.status.upper() == "ONLINE" for status in latest_status.values())
+            now = datetime.now(UTC)
+            online = sum(
+                self._is_device_online(status, now=now) for status in latest_status.values()
+            )
             spool_bytes = sum(status.spool_bytes for status in latest_status.values())
-            # Keep the recovery/test dialect free from MariaDB JSON functions.
-            parse_errors = sum(
-                bool(errors) for errors in session.scalars(select(DocumentVersion.errors)).all()
+            dialect_name = session.get_bind().dialect.name
+            json_length = (
+                func.json_length(DocumentVersion.errors)
+                if dialect_name in {"mysql", "mariadb"}
+                else func.json_array_length(DocumentVersion.errors)
+            )
+            parse_errors = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(DocumentVersion)
+                    .where(func.coalesce(json_length, 0) > 0)
+                )
+                or 0
             )
             trend = [
                 {"date": str(day), "count": count}
                 for day, count in session.execute(
                     select(func.date(FraudAlert.opened_at), func.count())
+                    .where(FraudAlert.is_canonical.is_(True))
                     .group_by(func.date(FraudAlert.opened_at))
                     .order_by(func.date(FraudAlert.opened_at).desc())
                     .limit(30)
@@ -352,6 +374,64 @@ class SqlAlchemyApiRepository:
                 spool_bytes=spool_bytes,
                 parse_errors=parse_errors,
                 alert_trend=trend,
+            )
+
+    def diagnostics(self) -> DiagnosticsView:
+        with self._read() as session:
+            dialect_name = session.get_bind().dialect.name
+            json_length = (
+                func.json_length(DocumentVersion.errors)
+                if dialect_name in {"mysql", "mariadb"}
+                else func.json_array_length(DocumentVersion.errors)
+            )
+            parser_errors = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(DocumentVersion)
+                    .where(func.coalesce(json_length, 0) > 0)
+                )
+                or 0
+            )
+            incomplete_jobs = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(PrintJob)
+                    .where(
+                        or_(
+                            PrintJob.capture_complete.is_(False),
+                            PrintJob.timeline_complete.is_(False),
+                            PrintJob.status.in_(("FAILED", "INCOMPLETE", "MALFORMED")),
+                            PrintJob.import_status.in_(("FAILED", "QUARANTINED")),
+                        )
+                    )
+                )
+                or 0
+            )
+            events = session.scalars(
+                select(SystemEvent)
+                .order_by(SystemEvent.occurred_at.desc(), SystemEvent.id.desc())
+                .limit(100)
+            ).all()
+            return DiagnosticsView(
+                generated_at=datetime.now(UTC),
+                parser_errors=parser_errors,
+                incomplete_jobs=incomplete_jobs,
+                recent_events=[
+                    SystemEventView(
+                        id=event.id,
+                        service=event.service,
+                        severity=event.severity,
+                        event_type=event.event_type,
+                        message=event.message,
+                        device_id=event.device_id,
+                        session_id=event.session_id,
+                        job_id=event.job_id,
+                        correlation_id=event.correlation_id,
+                        occurred_at=event.occurred_at,
+                        error=event.error,
+                    )
+                    for event in events
+                ],
             )
 
     @staticmethod
@@ -375,18 +455,31 @@ class SqlAlchemyApiRepository:
         ).all()
         return {row.device_id: row for row in rows}
 
+    @staticmethod
+    def _is_device_online(status: DeviceStatus, *, now: datetime) -> bool:
+        return bool(
+            status.status.upper() == "ONLINE"
+            and status.last_connection_at is not None
+            and status.last_connection_at >= now - DEVICE_ACTIVITY_STALE_AFTER
+        )
+
     def list_devices(self) -> Sequence[DeviceView]:
         with self._read() as session:
             statuses = self._latest_device_statuses(session)
             devices = session.scalars(select(Device).order_by(Device.external_id)).all()
+            now = datetime.now(UTC)
             return tuple(
                 DeviceView(
                     id=device.external_id,
                     name=device.name,
                     type=device.device_type,
+                    mac_address=device.mac_address,
+                    department=device.department,
+                    role=device.role,
                     enabled=device.enabled,
                     online=(
-                        device.id in statuses and statuses[device.id].status.upper() == "ONLINE"
+                        device.id in statuses
+                        and self._is_device_online(statuses[device.id], now=now)
                     ),
                     listen_endpoint=f"{device.listen_ip}:{device.listen_port}",
                     target_endpoint=f"{device.target_ip}:{device.target_port}",
@@ -467,15 +560,22 @@ class SqlAlchemyApiRepository:
             rows = session.execute(
                 statement.order_by(PrintJob.captured_at.desc()).limit(limit).offset(offset)
             ).all()
+            job_ids = [job.id for job, _ in rows]
+            sizes: dict[UUID, dict[str, int]] = {job_id: {} for job_id in job_ids}
+            if job_ids:
+                for job_id, direction, byte_count in session.execute(
+                    select(
+                        RawPayload.job_id,
+                        RawPayload.direction,
+                        func.sum(RawPayload.byte_count),
+                    )
+                    .where(RawPayload.job_id.in_(job_ids))
+                    .group_by(RawPayload.job_id, RawPayload.direction)
+                ):
+                    sizes[job_id][direction] = int(byte_count or 0)
             result: list[JobView] = []
             for job, device in rows:
-                direction_sizes = dict(
-                    session.execute(
-                        select(RawPayload.direction, func.sum(RawPayload.byte_count))
-                        .where(RawPayload.job_id == job.id)
-                        .group_by(RawPayload.direction)
-                    ).all()
-                )
+                direction_sizes = sizes[job.id]
                 result.append(
                     JobView(
                         id=job.id,
@@ -495,103 +595,162 @@ class SqlAlchemyApiRepository:
                 )
             return result, count
 
-    def _document_view(self, session: Session, document: Document) -> DocumentView | None:
-        version = session.scalar(
-            select(DocumentVersion)
-            .where(DocumentVersion.document_id == document.id)
-            .order_by(DocumentVersion.version_sequence.desc(), DocumentVersion.id.desc())
-            .limit(1)
+    def _document_views(
+        self, session: Session, documents: Sequence[Document]
+    ) -> list[DocumentView]:
+        if not documents:
+            return []
+        document_ids = [document.id for document in documents]
+        latest = (
+            select(
+                DocumentVersion.document_id,
+                func.max(DocumentVersion.version_sequence).label("version_sequence"),
+            )
+            .where(DocumentVersion.document_id.in_(document_ids))
+            .group_by(DocumentVersion.document_id)
+            .subquery()
         )
-        if version is None:
-            return None
-        device = session.get(Device, document.device_id)
-        parser = session.get(ParserVersion, version.parser_version_id)
-        lines = session.scalars(
+        versions = session.scalars(
+            select(DocumentVersion).join(
+                latest,
+                and_(
+                    latest.c.document_id == DocumentVersion.document_id,
+                    latest.c.version_sequence == DocumentVersion.version_sequence,
+                ),
+            )
+        ).all()
+        version_by_document = {version.document_id: version for version in versions}
+        devices = {
+            device.id: device
+            for device in session.scalars(
+                select(Device).where(Device.id.in_({document.device_id for document in documents}))
+            )
+        }
+        parsers = {
+            parser.id: parser
+            for parser in session.scalars(
+                select(ParserVersion).where(
+                    ParserVersion.id.in_({version.parser_version_id for version in versions})
+                )
+            )
+        }
+        version_ids = [version.id for version in versions]
+        lines_by_version: dict[UUID, list[DocumentLine]] = {}
+        payments_by_version: dict[UUID, list[Payment]] = {}
+        for line in session.scalars(
             select(DocumentLine)
-            .where(DocumentLine.document_version_id == version.id)
-            .order_by(DocumentLine.sequence)
-        ).all()
-        payments = session.scalars(
+            .where(DocumentLine.document_version_id.in_(version_ids))
+            .order_by(DocumentLine.document_version_id, DocumentLine.sequence)
+        ):
+            lines_by_version.setdefault(line.document_version_id, []).append(line)
+        for payment in session.scalars(
             select(Payment)
-            .where(Payment.document_version_id == version.id)
-            .order_by(Payment.created_at, Payment.id)
-        ).all()
-        correlations = session.execute(
+            .where(Payment.document_version_id.in_(version_ids))
+            .order_by(Payment.document_version_id, Payment.created_at, Payment.id)
+        ):
+            payments_by_version.setdefault(payment.document_version_id, []).append(payment)
+        correlations_by_document: dict[
+            UUID, list[tuple[DocumentCorrelationMember, DocumentCorrelation]]
+        ] = {}
+        for member, correlation in session.execute(
             select(DocumentCorrelationMember, DocumentCorrelation)
             .join(
                 DocumentCorrelation,
                 DocumentCorrelation.id == DocumentCorrelationMember.correlation_id,
             )
-            .where(DocumentCorrelationMember.document_id == document.id)
-            .order_by(DocumentCorrelation.created_at.desc())
-        ).all()
-        return DocumentView(
-            id=document.id,
-            device_id=device.external_id if device else str(document.device_id),
-            job_id=document.job_id,
-            type=document.document_type,
-            subtype=document.subtype,
-            external_code=document.external_document_code,
-            order_code=document.order_code,
-            table_code=document.table_code,
-            operator_code=document.operator_code,
-            terminal_code=document.terminal_code,
-            document_timestamp=document.document_timestamp,
-            captured_at=document.captured_at,
-            gross_total=version.gross_total,
-            net_total=version.net_total,
-            discount_total=version.discount_total,
-            tax_total=version.tax_total,
-            status=version.status,
-            normalized_text=version.normalized_text,
-            parser_name=parser.name if parser else "unknown",
-            parser_version=parser.version if parser else "unknown",
-            confidence=version.parse_confidence,
-            sha256=version.source_payload_sha256,
-            complete=version.complete,
-            warnings=[str(value) for value in (version.warnings or [])],
-            lines=[
-                DocumentLineView(
-                    sequence=line.sequence,
-                    item_code=line.item_code,
-                    description=line.description,
-                    quantity=line.quantity,
-                    unit_price=line.unit_price,
-                    original_unit_price=line.original_unit_price,
-                    modified_unit_price=line.modified_unit_price,
-                    discount=line.discount,
-                    tax_rate=line.tax_rate,
-                    line_total=line.line_total,
-                    state=line.line_state,
-                    removed=line.removed,
-                    cancelled=line.cancelled,
-                    raw_text=line.raw_text,
+            .where(DocumentCorrelationMember.document_id.in_(document_ids))
+            .order_by(
+                DocumentCorrelationMember.document_id,
+                DocumentCorrelation.created_at.desc(),
+            )
+        ):
+            correlations_by_document.setdefault(member.document_id, []).append(
+                (member, correlation)
+            )
+        result: list[DocumentView] = []
+        for document in documents:
+            version = version_by_document.get(document.id)
+            if version is None:
+                continue
+            device = devices.get(document.device_id)
+            parser = parsers.get(version.parser_version_id)
+            lines = lines_by_version.get(version.id, [])
+            payments = payments_by_version.get(version.id, [])
+            correlations = correlations_by_document.get(document.id, [])
+            result.append(
+                DocumentView(
+                    id=document.id,
+                    device_id=device.external_id if device else str(document.device_id),
+                    job_id=document.job_id,
+                    type=document.document_type,
+                    subtype=document.subtype,
+                    external_code=document.external_document_code,
+                    order_code=document.order_code,
+                    table_code=document.table_code,
+                    operator_code=document.operator_code,
+                    terminal_code=document.terminal_code,
+                    document_timestamp=document.document_timestamp,
+                    captured_at=document.captured_at,
+                    gross_total=version.gross_total,
+                    net_total=version.net_total,
+                    discount_total=version.discount_total,
+                    tax_total=version.tax_total,
+                    status=version.status,
+                    normalized_text=version.normalized_text,
+                    parser_name=parser.name if parser else "unknown",
+                    parser_version=parser.version if parser else "unknown",
+                    confidence=version.parse_confidence,
+                    sha256=version.source_payload_sha256,
+                    complete=version.complete,
+                    warnings=[str(value) for value in (version.warnings or [])],
+                    lines=[
+                        DocumentLineView(
+                            sequence=line.sequence,
+                            item_code=line.item_code,
+                            description=line.description,
+                            quantity=line.quantity,
+                            unit_price=line.unit_price,
+                            original_unit_price=line.original_unit_price,
+                            modified_unit_price=line.modified_unit_price,
+                            discount=line.discount,
+                            tax_rate=line.tax_rate,
+                            line_total=line.line_total,
+                            state=line.line_state,
+                            removed=line.removed,
+                            cancelled=line.cancelled,
+                            raw_text=line.raw_text,
+                        )
+                        for line in lines
+                    ],
+                    payments=[
+                        {
+                            "id": str(payment.id),
+                            "method": payment.method,
+                            "amount": str(payment.amount),
+                            "currency": payment.currency,
+                            "status": payment.status,
+                            "evidence": payment.evidence_level,
+                        }
+                        for payment in payments
+                    ],
+                    correlations=[
+                        {
+                            "id": str(correlation.id),
+                            "transaction_id": str(correlation.transaction_id),
+                            "score": correlation.score,
+                            "role": member.role,
+                            "algorithm_version": correlation.algorithm_version,
+                            "explanation": correlation.explanation,
+                        }
+                        for member, correlation in correlations
+                    ],
                 )
-                for line in lines
-            ],
-            payments=[
-                {
-                    "id": str(payment.id),
-                    "method": payment.method,
-                    "amount": str(payment.amount),
-                    "currency": payment.currency,
-                    "status": payment.status,
-                    "evidence": payment.evidence_level,
-                }
-                for payment in payments
-            ],
-            correlations=[
-                {
-                    "id": str(correlation.id),
-                    "transaction_id": str(correlation.transaction_id),
-                    "score": correlation.score,
-                    "role": member.role,
-                    "algorithm_version": correlation.algorithm_version,
-                    "explanation": correlation.explanation,
-                }
-                for member, correlation in correlations
-            ],
-        )
+            )
+        return result
+
+    def _document_view(self, session: Session, document: Document) -> DocumentView | None:
+        views = self._document_views(session, [document])
+        return views[0] if views else None
 
     def list_documents(
         self, *, limit: int, offset: int, filters: dict[str, Any]
@@ -616,18 +775,35 @@ class SqlAlchemyApiRepository:
                 .limit(limit)
                 .offset(offset)
             ).all()
-            return [
-                view
-                for document in documents
-                if (view := self._document_view(session, document)) is not None
-            ], count
+            return self._document_views(session, documents), count
 
     def get_document(self, document_id: UUID) -> DocumentView | None:
         with self._read() as session:
             document = session.get(Document, document_id)
             return None if document is None else self._document_view(session, document)
 
-    def get_document_raw(self, document_id: UUID) -> RawArtifact | None:
+    @staticmethod
+    def _raw_direction(direction: str) -> str:
+        try:
+            return {
+                "request": "CLIENT_TO_DEVICE",
+                "response": "DEVICE_TO_CLIENT",
+            }[direction]
+        except KeyError as exc:
+            raise ValueError("direction must be request or response") from exc
+
+    @staticmethod
+    def _raw_artifact(raw: RawPayload, filename_prefix: str) -> RawArtifact:
+        return RawArtifact(
+            raw.payload,
+            f"{filename_prefix}_{raw.artifact_role.lower()}.raw",
+            raw.sha256,
+        )
+
+    def get_document_raw(
+        self, document_id: UUID, *, direction: str = "request"
+    ) -> RawArtifact | None:
+        stored_direction = self._raw_direction(direction)
         with self._read() as session:
             document = session.get(Document, document_id)
             if document is None:
@@ -639,20 +815,69 @@ class SqlAlchemyApiRepository:
                 .limit(1)
             )
             raw = session.get(RawPayload, version.raw_payload_id) if version else None
+            if raw is not None and raw.direction != stored_direction:
+                raw = None
             if raw is None:
                 raw = session.scalar(
                     select(RawPayload)
                     .where(
                         RawPayload.job_id == document.job_id,
-                        RawPayload.direction == "CLIENT_TO_DEVICE",
+                        RawPayload.direction == stored_direction,
                     )
                     .order_by(RawPayload.created_at, RawPayload.id)
                     .limit(1)
                 )
             if raw is None:
                 return None
-            filename = f"{document.id}_{raw.artifact_role.lower()}.raw"
-            return RawArtifact(raw.payload, filename, raw.sha256)
+            return self._raw_artifact(raw, str(document.id))
+
+    def get_job_raw(self, job_id: UUID, *, direction: str) -> RawArtifact | None:
+        stored_direction = self._raw_direction(direction)
+        with self._read() as session:
+            if session.get(PrintJob, job_id) is None:
+                return None
+            raw = session.scalar(
+                select(RawPayload)
+                .where(RawPayload.job_id == job_id, RawPayload.direction == stored_direction)
+                .order_by(RawPayload.created_at, RawPayload.id)
+                .limit(1)
+            )
+            return None if raw is None else self._raw_artifact(raw, str(job_id))
+
+    def get_session_raw(self, session_id: UUID, *, direction: str) -> RawArtifact | None:
+        stored_direction = self._raw_direction(direction)
+        with self._read() as session:
+            if session.get(ProxySession, session_id) is None:
+                return None
+            chunks = session.scalars(
+                select(StreamChunk)
+                .where(
+                    StreamChunk.session_id == session_id,
+                    StreamChunk.direction == stored_direction,
+                    StreamChunk.event_kind == "data",
+                )
+                .order_by(StreamChunk.direction_offset, StreamChunk.direction_sequence)
+            ).all()
+            if not chunks:
+                return None
+            expected_offset = 0
+            payload_parts: list[bytes] = []
+            for chunk in chunks:
+                if chunk.direction_offset != expected_offset:
+                    return None
+                if len(chunk.payload) != chunk.byte_count:
+                    return None
+                if hashlib.sha256(chunk.payload).hexdigest() != chunk.sha256:
+                    return None
+                payload_parts.append(chunk.payload)
+                expected_offset += chunk.byte_count
+            payload = b"".join(payload_parts)
+            digest = hashlib.sha256(payload).hexdigest()
+            return RawArtifact(
+                payload,
+                f"{session_id}_{direction}.raw",
+                digest,
+            )
 
     def list_orders(
         self, *, limit: int, offset: int, filters: dict[str, Any]
@@ -673,16 +898,16 @@ class SqlAlchemyApiRepository:
             rows = session.scalars(
                 statement.order_by(Order.opened_at.desc()).limit(limit).offset(offset)
             ).all()
+            versions = {
+                order_id: int(sequence or 0)
+                for order_id, sequence in session.execute(
+                    select(OrderSnapshot.order_id, func.max(OrderSnapshot.sequence))
+                    .where(OrderSnapshot.order_id.in_([order.id for order in rows]))
+                    .group_by(OrderSnapshot.order_id)
+                ).all()
+            }
             result: list[OrderView] = []
             for order in rows:
-                version = (
-                    session.scalar(
-                        select(func.max(OrderSnapshot.sequence)).where(
-                            OrderSnapshot.order_id == order.id
-                        )
-                    )
-                    or 0
-                )
                 result.append(
                     OrderView(
                         id=order.id,
@@ -693,7 +918,7 @@ class SqlAlchemyApiRepository:
                         closed_at=order.closed_at,
                         status=order.status,
                         current_total=order.gross_total,
-                        version=int(version),
+                        version=versions.get(order.id, 0),
                     )
                 )
             return result, count
@@ -752,7 +977,10 @@ class SqlAlchemyApiRepository:
             session.scalar(
                 select(func.count())
                 .select_from(FraudAlert)
-                .where(FraudAlert.transaction_id == correlation.transaction_id)
+                .where(
+                    FraudAlert.is_canonical.is_(True),
+                    FraudAlert.transaction_id == correlation.transaction_id,
+                )
             )
             or 0
         )
@@ -823,7 +1051,10 @@ class SqlAlchemyApiRepository:
                 )
         alerts = session.scalars(
             select(FraudAlert)
-            .where(FraudAlert.transaction_id == correlation.transaction_id)
+            .where(
+                FraudAlert.is_canonical.is_(True),
+                FraudAlert.transaction_id == correlation.transaction_id,
+            )
             .order_by(FraudAlert.opened_at, FraudAlert.id)
         ).all()
         for alert in alerts:
@@ -924,31 +1155,93 @@ class SqlAlchemyApiRepository:
     ) -> tuple[list[TransactionView], int]:
         limit, offset = _page(limit, offset)
         with self._read() as session:
-            # The current correlation version is unique per transaction/version. Keep
-            # the newest record per transaction and apply semantic filters to views.
-            correlations = session.scalars(
-                select(DocumentCorrelation)
+            ranked = (
+                select(
+                    DocumentCorrelation.id.label("correlation_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=DocumentCorrelation.transaction_id,
+                        order_by=(
+                            DocumentCorrelation.created_at.desc(),
+                            DocumentCorrelation.id.desc(),
+                        ),
+                    )
+                    .label("row_number"),
+                )
                 .where(DocumentCorrelation.status != "SUPERSEDED")
-                .order_by(DocumentCorrelation.created_at.desc())
-            ).all()
-            latest: dict[UUID, DocumentCorrelation] = {}
-            for correlation in correlations:
-                latest.setdefault(correlation.transaction_id, correlation)
-            views = [self._transaction_view(session, item) for item in latest.values()]
+                .subquery()
+            )
+            occurrence = (
+                select(
+                    DocumentCorrelationMember.correlation_id.label("correlation_id"),
+                    func.min(
+                        func.coalesce(Document.document_timestamp, Document.captured_at)
+                    ).label("occurred_at"),
+                )
+                .join(Document, Document.id == DocumentCorrelationMember.document_id)
+                .group_by(DocumentCorrelationMember.correlation_id)
+                .subquery()
+            )
+            statement: Select[Any] = (
+                select(DocumentCorrelation)
+                .join(
+                    ranked,
+                    and_(
+                        ranked.c.correlation_id == DocumentCorrelation.id,
+                        ranked.c.row_number == 1,
+                    ),
+                )
+                .outerjoin(
+                    occurrence,
+                    occurrence.c.correlation_id == DocumentCorrelation.id,
+                )
+            )
+            document_filters = []
             if filters.get("table_code"):
-                views = [item for item in views if item.table_code == str(filters["table_code"])]
+                document_filters.append(Document.table_code == str(filters["table_code"]))
+            if filters.get("order_code"):
+                document_filters.append(Document.order_code == str(filters["order_code"]))
             if filters.get("operator_code"):
-                views = [
-                    item for item in views if item.operator_code == str(filters["operator_code"])
-                ]
-            if filters.get("minimum_difference") is not None:
-                minimum = _as_decimal(filters["minimum_difference"]) or MONEY_ZERO
-                views = [
-                    item
-                    for item in views
-                    if item.difference is not None and abs(item.difference) >= minimum
-                ]
-            views.sort(key=lambda item: (item.occurred_at, str(item.id)), reverse=True)
+                document_filters.append(
+                    Document.operator_code == str(filters["operator_code"])
+                )
+            if document_filters:
+                statement = statement.where(
+                    DocumentCorrelation.id.in_(
+                        select(DocumentCorrelationMember.correlation_id)
+                        .join(Document, Document.id == DocumentCorrelationMember.document_id)
+                        .where(*document_filters)
+                    )
+                )
+            statement = statement.order_by(
+                occurrence.c.occurred_at.desc(), DocumentCorrelation.id.desc()
+            )
+            minimum_value = filters.get("minimum_difference")
+            if minimum_value is None:
+                count = (
+                    session.scalar(
+                        select(func.count()).select_from(statement.order_by(None).subquery())
+                    )
+                    or 0
+                )
+                correlations = session.scalars(
+                    statement.limit(limit).offset(offset)
+                ).all()
+                return [self._transaction_view(session, item) for item in correlations], count
+
+            # Difference depends on the latest versions and split fiscal documents.
+            # Keep its exact domain semantics, but only pay the full materialisation
+            # cost when that uncommon derived-value filter is explicitly requested.
+            correlations = session.scalars(
+                statement
+            ).all()
+            minimum = _as_decimal(minimum_value) or MONEY_ZERO
+            views = [
+                view
+                for correlation in correlations
+                if (view := self._transaction_view(session, correlation)).difference is not None
+                and abs(view.difference) >= minimum
+            ]
             return views[offset : offset + limit], len(views)
 
     def get_transaction(self, transaction_id: UUID) -> TransactionView | None:
@@ -961,92 +1254,139 @@ class SqlAlchemyApiRepository:
             )
             return None if correlation is None else self._transaction_view(session, correlation)
 
-    def _alert_view(self, session: Session, alert: FraudAlert) -> AlertView:
-        version = session.get(FraudRuleVersion, alert.fraud_rule_version_id)
-        rule = session.get(FraudRule, version.fraud_rule_id) if version else None
-        evidence_rows = session.scalars(
-            select(FraudAlertEvidence)
-            .where(FraudAlertEvidence.fraud_alert_id == alert.id)
-            .order_by(FraudAlertEvidence.sequence, FraudAlertEvidence.id)
-        ).all()
-        history_rows = session.scalars(
-            select(FraudAlertHistory)
-            .where(FraudAlertHistory.fraud_alert_id == alert.id)
-            .order_by(FraudAlertHistory.sequence)
-        ).all()
-        document_ids: list[UUID] = []
-        device_ids: list[str] = []
-        if alert.correlation_id is not None:
-            document_ids = list(
-                session.scalars(
-                    select(DocumentCorrelationMember.document_id).where(
-                        DocumentCorrelationMember.correlation_id == alert.correlation_id
-                    )
-                ).all()
+    def _alert_views(
+        self, session: Session, alerts: Sequence[FraudAlert], *, include_details: bool
+    ) -> list[AlertView]:
+        if not alerts:
+            return []
+        alert_ids = [alert.id for alert in alerts]
+        version_ids = {alert.fraud_rule_version_id for alert in alerts}
+        versions = {
+            version.id: version
+            for version in session.scalars(
+                select(FraudRuleVersion).where(FraudRuleVersion.id.in_(version_ids))
             )
-            if document_ids:
-                device_ids = list(
-                    session.scalars(
-                        select(Device.external_id)
-                        .join(Document, Document.device_id == Device.id)
-                        .where(Document.id.in_(document_ids))
-                        .distinct()
-                        .order_by(Device.external_id)
-                    ).all()
+        }
+        rules = {
+            rule.id: rule
+            for rule in session.scalars(
+                select(FraudRule).where(
+                    FraudRule.id.in_({version.fraud_rule_id for version in versions.values()})
                 )
-        return AlertView(
-            id=alert.id,
-            rule_code=rule.code if rule else "UNKNOWN",
-            severity=alert.severity,
-            score=alert.score,
-            status=alert.status,
-            opened_at=alert.opened_at,
-            transaction_id=alert.transaction_id,
-            device_ids=device_ids,
-            document_ids=document_ids,
-            description=alert.description,
-            explanation=alert.explanation,
-            economic_difference=alert.difference_amount,
-            confidence=alert.confidence,
-            assigned_to=alert.assigned_to_user_id,
-            acknowledged_at=alert.taken_at,
-            closed_at=alert.closed_at,
-            resolution_reason=alert.closure_reason,
-            evidence=[
-                {
-                    "id": str(row.id),
-                    "type": row.evidence_type,
-                    "summary": row.summary,
-                    "document_id": str(row.document_id) if row.document_id else None,
-                    "raw_payload_id": str(row.raw_payload_id) if row.raw_payload_id else None,
-                    "artifact_path": row.artifact_path,
-                    "artifact_sha256": row.artifact_sha256,
-                    "details": row.evidence,
-                }
-                for row in evidence_rows
-            ],
-            history=[
-                {
-                    "sequence": row.sequence,
-                    "event_type": row.event_type,
-                    "previous_status": row.previous_status,
-                    "new_status": row.new_status,
-                    "note": row.note,
-                    "reason": row.reason,
-                    "actor_user_id": str(row.actor_user_id) if row.actor_user_id else None,
-                    "occurred_at": row.occurred_at.isoformat(),
-                    "record_hash": row.record_hash,
-                }
-                for row in history_rows
-            ],
-        )
+            )
+        }
+        correlation_ids = {
+            alert.correlation_id for alert in alerts if alert.correlation_id is not None
+        }
+        documents_by_correlation: dict[UUID, list[UUID]] = {}
+        devices_by_correlation: dict[UUID, set[str]] = {}
+        if correlation_ids:
+            for correlation_id, document_id, device_external_id in session.execute(
+                select(
+                    DocumentCorrelationMember.correlation_id,
+                    Document.id,
+                    Device.external_id,
+                )
+                .join(Document, Document.id == DocumentCorrelationMember.document_id)
+                .join(Device, Device.id == Document.device_id)
+                .where(DocumentCorrelationMember.correlation_id.in_(correlation_ids))
+                .order_by(DocumentCorrelationMember.correlation_id, Document.id)
+            ):
+                documents_by_correlation.setdefault(correlation_id, []).append(document_id)
+                devices_by_correlation.setdefault(correlation_id, set()).add(device_external_id)
+        evidence_by_alert: dict[UUID, list[FraudAlertEvidence]] = {}
+        history_by_alert: dict[UUID, list[FraudAlertHistory]] = {}
+        if include_details:
+            for row in session.scalars(
+                select(FraudAlertEvidence)
+                .where(FraudAlertEvidence.fraud_alert_id.in_(alert_ids))
+                .order_by(
+                    FraudAlertEvidence.fraud_alert_id,
+                    FraudAlertEvidence.sequence,
+                    FraudAlertEvidence.id,
+                )
+            ):
+                evidence_by_alert.setdefault(row.fraud_alert_id, []).append(row)
+            for row in session.scalars(
+                select(FraudAlertHistory)
+                .where(FraudAlertHistory.fraud_alert_id.in_(alert_ids))
+                .order_by(FraudAlertHistory.fraud_alert_id, FraudAlertHistory.sequence)
+            ):
+                history_by_alert.setdefault(row.fraud_alert_id, []).append(row)
+        result: list[AlertView] = []
+        for alert in alerts:
+            version = versions.get(alert.fraud_rule_version_id)
+            rule = rules.get(version.fraud_rule_id) if version else None
+            evidence_rows = evidence_by_alert.get(alert.id, [])
+            history_rows = history_by_alert.get(alert.id, [])
+            result.append(
+                AlertView(
+                    id=alert.id,
+                    rule_code=rule.code if rule else "UNKNOWN",
+                    severity=alert.severity,
+                    score=alert.score,
+                    status=alert.status,
+                    opened_at=alert.opened_at,
+                    transaction_id=alert.transaction_id,
+                    device_ids=sorted(devices_by_correlation.get(alert.correlation_id, set())),
+                    document_ids=documents_by_correlation.get(alert.correlation_id, []),
+                    description=alert.description,
+                    explanation=alert.explanation,
+                    economic_difference=alert.difference_amount,
+                    confidence=alert.confidence,
+                    assigned_to=alert.assigned_to_user_id,
+                    acknowledged_at=alert.taken_at,
+                    closed_at=alert.closed_at,
+                    resolution_reason=alert.closure_reason,
+                    evidence=[
+                        {
+                            "id": str(row.id),
+                            "type": row.evidence_type,
+                            "summary": row.summary,
+                            "document_id": str(row.document_id) if row.document_id else None,
+                            "raw_payload_id": (
+                                str(row.raw_payload_id) if row.raw_payload_id else None
+                            ),
+                            "artifact_path": row.artifact_path,
+                            "artifact_sha256": row.artifact_sha256,
+                            "details": row.evidence,
+                        }
+                        for row in evidence_rows
+                    ],
+                    history=[
+                        {
+                            "sequence": row.sequence,
+                            "event_type": row.event_type,
+                            "previous_status": row.previous_status,
+                            "new_status": row.new_status,
+                            "note": row.note,
+                            "reason": row.reason,
+                            "actor_user_id": (
+                                str(row.actor_user_id) if row.actor_user_id else None
+                            ),
+                            "occurred_at": row.occurred_at.isoformat(),
+                            "record_hash": row.record_hash,
+                        }
+                        for row in history_rows
+                    ],
+                )
+            )
+        return result
+
+    def _alert_view(self, session: Session, alert: FraudAlert) -> AlertView:
+        return self._alert_views(session, [alert], include_details=True)[0]
 
     def list_alerts(
         self, *, limit: int, offset: int, filters: dict[str, Any]
     ) -> tuple[list[AlertView], int]:
         limit, offset = _page(limit, offset)
         with self._read() as session:
-            statement: Select[Any] = select(FraudAlert).join(FraudRuleVersion).join(FraudRule)
+            statement: Select[Any] = (
+                select(FraudAlert)
+                .join(FraudRuleVersion)
+                .join(FraudRule)
+                .where(FraudAlert.is_canonical.is_(True))
+            )
             if filters.get("severity"):
                 statement = statement.where(FraudAlert.severity == str(filters["severity"]))
             if filters.get("status"):
@@ -1087,7 +1427,7 @@ class SqlAlchemyApiRepository:
                 .unique()
                 .all()
             )
-            return [self._alert_view(session, alert) for alert in alerts], count
+            return self._alert_views(session, alerts, include_details=False), count
 
     def get_alert(self, alert_id: UUID) -> AlertView | None:
         with self._read() as session:
@@ -1238,9 +1578,24 @@ class SqlAlchemyApiRepository:
     def list_imports(self, *, limit: int, offset: int) -> tuple[list[ImportBatchView], int]:
         limit, offset = _page(limit, offset)
         with self._read() as session:
-            count = session.scalar(select(func.count()).select_from(ImportBatch)) or 0
+            # Older releases persisted one COMPLETED row for every duplicate-only
+            # polling cycle. Keep those rows available for forensic SQL, but omit the
+            # operational noise from the UI and its pagination count.
+            meaningful = or_(
+                ImportBatch.imported_count > 0,
+                ImportBatch.failed_count > 0,
+                ImportBatch.status != "COMPLETED",
+                ImportBatch.scanned_count != ImportBatch.skipped_count,
+            )
+            count = (
+                session.scalar(
+                    select(func.count(ImportBatch.id)).where(meaningful)
+                )
+                or 0
+            )
             rows = session.scalars(
                 select(ImportBatch)
+                .where(meaningful)
                 .order_by(ImportBatch.started_at.desc())
                 .limit(limit)
                 .offset(offset)
@@ -1269,46 +1624,75 @@ class SqlAlchemyApiRepository:
             return [], 0
         escaped_value = value.replace("%", r"\%").replace("_", r"\_")
         pattern = f"%{escaped_value}%"
+        amount = _as_decimal(value.replace(",", "."))
         with self._read() as session:
-            document_ids = session.scalars(
-                select(Document.id)
-                .outerjoin(DocumentVersion, DocumentVersion.id == _latest_version_id())
-                .where(
-                    or_(
-                        Document.external_document_code.ilike(pattern, escape="\\"),
-                        Document.order_code.ilike(pattern, escape="\\"),
-                        Document.table_code.ilike(pattern, escape="\\"),
-                        Document.operator_code.ilike(pattern, escape="\\"),
-                        DocumentVersion.normalized_text.ilike(pattern, escape="\\"),
-                        DocumentVersion.source_payload_sha256.ilike(pattern, escape="\\"),
-                        DocumentVersion.id.in_(
-                            select(DocumentLine.document_version_id).where(
-                                DocumentLine.description.ilike(pattern, escape="\\")
-                            )
-                        ),
+            document_predicates = [
+                Document.external_document_code.ilike(pattern, escape="\\"),
+                Document.order_code.ilike(pattern, escape="\\"),
+                Document.table_code.ilike(pattern, escape="\\"),
+                Document.operator_code.ilike(pattern, escape="\\"),
+                Device.external_id.ilike(pattern, escape="\\"),
+                Device.name.ilike(pattern, escape="\\"),
+                DocumentVersion.normalized_text.ilike(pattern, escape="\\"),
+                DocumentVersion.source_payload_sha256.ilike(pattern, escape="\\"),
+                DocumentVersion.id.in_(
+                    select(DocumentLine.document_version_id).where(
+                        DocumentLine.description.ilike(pattern, escape="\\")
                     )
-                )
+                ),
+            ]
+            if amount is not None:
+                document_predicates.append(DocumentVersion.gross_total == amount)
+            documents = session.scalars(
+                select(Document)
+                .join(Device, Device.id == Document.device_id)
+                .outerjoin(DocumentVersion, DocumentVersion.id == _latest_version_id())
+                .where(or_(*document_predicates))
                 .order_by(Document.captured_at.desc())
                 .limit(500)
             ).all()
-            hits: list[SearchHit] = []
-            for document_id in document_ids:
-                document = session.get(Document, document_id)
-                if document is not None:
-                    hits.append(
-                        SearchHit(
-                            entity_type="DOCUMENT",
-                            entity_id=document.id,
-                            occurred_at=document.document_timestamp or document.captured_at,
-                            title=(
-                                document.external_document_code
-                                or document.order_code
-                                or document.document_type
-                            ),
-                            subtitle=f"{document.document_type} · {document.table_code or '-'}",
-                            highlights=[value],
-                        )
+            hits: list[SearchHit] = [
+                SearchHit(
+                    entity_type="DOCUMENT",
+                    entity_id=document.id,
+                    occurred_at=document.document_timestamp or document.captured_at,
+                    title=(
+                        document.external_document_code
+                        or document.order_code
+                        or document.document_type
+                    ),
+                    subtitle=f"{document.document_type} · {document.table_code or '-'}",
+                    highlights=[value],
+                )
+                for document in documents
+            ]
+            for device in session.scalars(
+                select(Device)
+                .where(
+                    or_(
+                        Device.external_id.ilike(pattern, escape="\\"),
+                        Device.name.ilike(pattern, escape="\\"),
+                        Device.mac_address.ilike(pattern, escape="\\"),
+                        Device.department.ilike(pattern, escape="\\"),
+                        Device.role.ilike(pattern, escape="\\"),
                     )
+                )
+                .order_by(Device.external_id)
+                .limit(100)
+            ):
+                hits.append(
+                    SearchHit(
+                        entity_type="DEVICE",
+                        entity_id=device.id,
+                        occurred_at=device.created_at,
+                        title=device.name,
+                        subtitle=(
+                            f"{device.external_id} · "
+                            f"{device.department or device.device_type}"
+                        ),
+                        highlights=[value],
+                    )
+                )
             for order in session.scalars(
                 select(Order)
                 .where(
@@ -1442,13 +1826,24 @@ class SqlAlchemyIngestionRepository:
                     raise ValueError("import batch not found")
                 if batch.status != "RUNNING":
                     raise ValueError("import batch is already complete")
-                batch.scanned_count = int(report.get("discovered", 0))
-                batch.imported_count = int(report.get("imported", 0))
-                batch.skipped_count = int(report.get("duplicates", 0))
-                batch.failed_count = int(report.get("quarantined", 0)) + int(
+                discovered = int(report.get("discovered", 0))
+                imported = int(report.get("imported", 0))
+                duplicates = int(report.get("duplicates", 0))
+                failed = int(report.get("quarantined", 0)) + int(
                     report.get("retry_exhausted", 0)
                 )
                 errors = tuple(str(item)[:4096] for item in report.get("errors", ()))
+                if imported == 0 and failed == 0 and not errors and discovered == duplicates:
+                    # A periodic scan that observes no new evidence is operational noise,
+                    # not an immutable import event. Duplicate attempts do not create
+                    # ImportItem rows, so deleting this still-RUNNING shell is FK-safe and
+                    # prevents an idle worker from growing import_batches without bound.
+                    session.delete(batch)
+                    return
+                batch.scanned_count = discovered
+                batch.imported_count = imported
+                batch.skipped_count = duplicates
+                batch.failed_count = failed
                 batch.status = "COMPLETED_WITH_ERRORS" if errors else "COMPLETED"
                 batch.ended_at = datetime.now(UTC)
                 batch.report = {
@@ -2328,6 +2723,9 @@ def _sync_devices(factory: sessionmaker[Session], settings: Settings) -> None:
                 values = {
                     "name": configured.name,
                     "device_type": configured.type.value,
+                    "mac_address": configured.mac_address,
+                    "department": configured.department,
+                    "role": configured.role,
                     "parser_kind": configured.parser,
                     "enabled": configured.enabled,
                     "bidirectional": configured.bidirectional,

@@ -1,4 +1,5 @@
 import { Alert, Box, Button, CircularProgress } from '@mui/material'
+import { useQueryClient } from '@tanstack/react-query'
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { clearSession, session, subscribeSession } from './api/client'
@@ -14,6 +15,8 @@ const DocumentsPage = lazy(() => import('./pages/DocumentsPage').then((module) =
 const ImportsPage = lazy(() => import('./pages/ImportsPage').then((module) => ({ default: module.ImportsPage })))
 const RulesPage = lazy(() => import('./pages/RulesPage').then((module) => ({ default: module.RulesPage })))
 const SearchPage = lazy(() => import('./pages/SearchPage').then((module) => ({ default: module.SearchPage })))
+const SessionsPage = lazy(() => import('./pages/SessionsPage').then((module) => ({ default: module.SessionsPage })))
+const DiagnosticsPage = lazy(() => import('./pages/DiagnosticsPage').then((module) => ({ default: module.DiagnosticsPage })))
 const TransactionDetailPage = lazy(() => import('./pages/TransactionDetailPage').then((module) => ({ default: module.TransactionDetailPage })))
 const TransactionsPage = lazy(() => import('./pages/TransactionsPage').then((module) => ({ default: module.TransactionsPage })))
 
@@ -24,8 +27,13 @@ function LoadingPage() {
 }
 
 export default function App() {
+  const queryClient = useQueryClient()
   const [user, setUser] = useState<User | null>(session().user)
-  useEffect(() => subscribeSession(() => setUser(session().user)), [])
+  useEffect(() => subscribeSession(() => {
+    // Never carry privileged evidence between authenticated principals.
+    queryClient.clear()
+    setUser(session().user)
+  }), [queryClient])
   if (!user) return <LoginPage onLogin={setUser} />
   function logout() {
     clearSession()
@@ -43,6 +51,8 @@ export default function App() {
         <Route path="/regole" element={<RulesPage />} />
         <Route path="/ricerca" element={<SearchPage />} />
         <Route path="/dispositivi" element={<DevicesPage />} />
+        <Route path="/sessioni" element={<SessionsPage />} />
+        <Route path="/diagnostica" element={<DiagnosticsPage />} />
         <Route path="/importazioni" element={<ImportsPage />} />
         <Route path="/login" element={<Navigate to="/" replace />} />
         <Route path="*" element={<Alert severity="warning" action={<Button href="/">Dashboard</Button>}>Pagina non trovata.</Alert>} />

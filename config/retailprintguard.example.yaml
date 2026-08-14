@@ -19,7 +19,10 @@ proxy:
   storage_failure_policy: continue
 devices:
   - id: pos_1
-    name: POS Cucina
+    name: Stampante BAR POS80BL
+    mac_address: "02:00:00:00:01:01"
+    department: Bar
+    role: comande_bar
     type: pos
     listen_ip: 192.0.2.220
     listen_port: 9100
@@ -30,7 +33,10 @@ devices:
     enabled: true
     allowed_networks: [192.0.2.0/24]
   - id: pos_2
-    name: POS Bar
+    name: Stampante CUCINA POS80BL
+    mac_address: "02:00:00:00:01:02"
+    department: Cucina
+    role: comande_cucina
     type: pos
     listen_ip: 192.0.2.221
     listen_port: 9100
@@ -41,7 +47,10 @@ devices:
     enabled: true
     allowed_networks: [192.0.2.0/24]
   - id: pos_3
-    name: POS Secondaria
+    name: Stampante PIZZERIA POS80BL
+    mac_address: "02:00:00:00:01:03"
+    department: Pizzeria
+    role: comande_pizzeria
     type: pos
     listen_ip: 192.0.2.222
     listen_port: 9100
@@ -52,7 +61,10 @@ devices:
     enabled: true
     allowed_networks: [192.0.2.0/24]
   - id: rch_1
-    name: RCH Print! F
+    name: CASSA RCH Print! F
+    mac_address: "02:00:00:00:01:04"
+    department: Cassa
+    role: fiscale_gestionale
     type: rch
     listen_ip: 192.0.2.231
     listen_port: 23

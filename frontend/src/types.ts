@@ -35,6 +35,9 @@ export interface Device {
   id: string
   name: string
   type: string
+  mac_address?: string
+  department?: string
+  role?: string
   enabled: boolean
   online: boolean
   listen_endpoint: string
@@ -46,6 +49,42 @@ export interface Device {
   pending_jobs: number
   service_version?: string
   last_error?: string
+}
+
+export interface ProxySession {
+  id: string
+  device_id: string
+  source_endpoint: string
+  target_endpoint: string
+  opened_at: string
+  closed_at?: string
+  close_reason?: string
+  request_bytes: number
+  response_bytes: number
+  complete: boolean
+}
+
+export interface SystemEvent {
+  id: string
+  service: string
+  severity: string
+  event_type: string
+  message: string
+  device_id?: string
+  session_id?: string
+  job_id?: string
+  correlation_id?: string
+  occurred_at: string
+  error?: string
+}
+
+export interface Diagnostics {
+  generated_at: string
+  database: string
+  spool: string
+  parser_errors: number
+  incomplete_jobs: number
+  recent_events: SystemEvent[]
 }
 
 export interface DocumentLine {
