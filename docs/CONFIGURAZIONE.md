@@ -23,7 +23,10 @@ database_url_env: RPG_DATABASE_URL
 
 devices:
   - id: pos_1
-    name: POS Cucina
+    name: Stampante BAR POS80BL
+    mac_address: "02:00:00:00:01:01"
+    department: BAR
+    role: comande_bar
     type: pos
     listen_ip: 192.0.2.220
     listen_port: 9100
@@ -35,7 +38,10 @@ devices:
     allowed_networks: [192.0.2.0/24]
 
   - id: pos_2
-    name: POS Bar
+    name: Stampante CUCINA POS80BL
+    mac_address: "02:00:00:00:01:02"
+    department: CUCINA
+    role: comande_cucina
     type: pos
     listen_ip: 192.0.2.221
     listen_port: 9100
@@ -47,7 +53,10 @@ devices:
     allowed_networks: [192.0.2.0/24]
 
   - id: pos_3
-    name: POS Secondaria
+    name: Stampante PIZZERIA POS80BL
+    mac_address: "02:00:00:00:01:03"
+    department: PIZZERIA
+    role: comande_pizzeria
     type: pos
     listen_ip: 192.0.2.222
     listen_port: 9100
@@ -59,7 +68,10 @@ devices:
     allowed_networks: [192.0.2.0/24]
 
   - id: rch_1
-    name: RCH
+    name: CASSA RCH Print! F
+    mac_address: "02:00:00:00:01:04"
+    department: CASSA
+    role: fiscale_gestionale
     type: rch
     listen_ip: 192.0.2.231
     listen_port: 23
@@ -82,6 +94,9 @@ protocol-neutral e il parser usa soltanto forme osservate.
 | `id` | univoco, 2–64 caratteri, pattern `[a-z][a-z0-9_-]+` |
 | `name` | 1–120 caratteri, etichetta operativa |
 | `type` | `pos` oppure `rch` |
+| `mac_address` | MAC amministrativo opzionale in formato canonico; non usato per il routing |
+| `department` | reparto operativo opzionale, mostrato in UI |
+| `role` | ruolo funzionale opzionale del dispositivo |
 | `listen_ip`/`listen_port` | endpoint virtuale assegnato al server |
 | `target_ip`/`target_port` | endpoint fisico della stampante |
 | `parser` | `escpos` per POS, `rch_observed` per RCH |
@@ -101,6 +116,11 @@ La validazione globale impedisce:
 - un target coincidente con qualsiasi listener abilitato;
 - path di spool, archivio e log uguali o impostati su radici di sistema
   pericolose.
+
+Il MAC non viene usato come controllo di autenticazione o risoluzione del
+target: IP e porta configurati restano gli endpoint autorevoli. I MAC
+dell'esempio sono valori localmente amministrati sintetici; non committare
+quelli del sito.
 
 Il vincolo sui target duplicati è intenzionalmente conservativo: una stampante
 fisica non può ricevere due route logiche concorrenti nella stessa istanza.

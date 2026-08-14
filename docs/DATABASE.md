@@ -1,5 +1,9 @@
 # Database MariaDB
 
+La vista di assurance su integrità, idempotenza, deduplica e migrazione è in
+[DATABASE_MODEL.md](DATABASE_MODEL.md). Questo documento e le migrazioni Alembic
+restano il riferimento tecnico per tabelle e relazioni.
+
 ## Principi
 
 Lo schema di produzione è progettato per MariaDB con InnoDB e `utf8mb4`.

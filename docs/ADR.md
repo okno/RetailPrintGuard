@@ -76,7 +76,8 @@ separati. L'algoritmo è rielaborabile e versionato.
 
 **Stato:** accettata.
 
-Le sedici regole producono evidenze leggibili e soglie versionate. Un modello ML
+Le regole richieste e la regola composita post-preconto producono evidenze
+leggibili e soglie versionate. Un modello ML
 potrà essere un segnale aggiuntivo, mai una dipendenza del relay o una prova non
 spiegabile.
 
@@ -118,3 +119,12 @@ MariaDB tramite `source_key`; schema non noto o hash errato è quarantena logica
 Installer e proxy verificano che i listener siano assegnati ma non cambiano
 indirizzi, route, DNS o firewall. La rete è un prerequisito esplicito e deve
 essere gestita dal sistema del sito o da uno strumento separato e approvato.
+
+## ADR-016 — Semantica correttiva del trasporto
+
+**Stato:** accettata nel codice, deployment pendente.
+
+Reverse tail idle-resetting, abort sincrono prima del rilascio lock, doppia
+sequenza osservata/persistita, capture non bloccante e recovery `PARTIAL` sono
+vincoli espliciti. Motivazione, alternative e gate sono in
+[ARCHITECTURE_DECISION_TRANSPORT.md](ARCHITECTURE_DECISION_TRANSPORT.md).

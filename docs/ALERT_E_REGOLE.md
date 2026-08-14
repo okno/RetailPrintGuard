@@ -20,7 +20,7 @@ flowchart LR
 
 ## Correlazione spiegabile
 
-La versione corrente è `rpg-correlation-1.0.0`. Il punteggio usa criteri
+La versione correttiva corrente è `rpg-correlation-1.1.0`. Il punteggio usa criteri
 disponibili senza penalizzare automaticamente un campo assente. Tra i pesi
 massimi:
 
@@ -66,6 +66,7 @@ fiscalizzazione.
 
 | Codice | Default | Condizione principale |
 |---|---|---|
+| `MODIFICA_POST_PRECONTO` | HIGH, 20% e 1,00 € | diff righe/importo tra preconto e chiusura fiscale o economica validata |
 | `PREBILL_FISCAL_AMOUNT_DROP` | HIGH, 20% e 1,00 € | preconto maggiore del fiscale aggregato |
 | `ITEM_REMOVED_AFTER_PREBILL` | HIGH | riga presente prima e rimossa dopo |
 | `PRICE_REDUCED_AFTER_PREBILL` | HIGH | prezzo unitario diminuito |

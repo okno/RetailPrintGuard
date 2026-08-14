@@ -163,7 +163,7 @@ riavvolga per default il watermark di correlazione:
 
 ```bash
 RPG_PARSER_NAME='retailprintguard-escpos'
-RPG_PARSER_VERSION='1.0.0'
+RPG_PARSER_VERSION='1.1.0'
 RPG_PARSER_BUILD_SHA256='incollare-qui-i-64-caratteri-esadecimali-verificati'
 RPG_PARSER_CHANGE_REASON='inserire change-id e motivazione approvata'
 [[ "${RPG_PARSER_BUILD_SHA256}" =~ ^[0-9a-f]{64}$ ]] || exit 1

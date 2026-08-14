@@ -98,8 +98,8 @@ Il frontend:
 
 - non è presente una pagina dedicata a sessioni/job nonostante gli endpoint;
 - il diff è reso come JSON leggibile, non come griglia semantica affiancata;
-- il fascicolo completo di evidenze non ha ancora un endpoint PDF/ZIP; esiste
-  l'export CSV degli alert;
+- il documento singolo dispone di RAW/TXT/JSON/PDF; il fascicolo ZIP
+  multi-documento non è ancora disponibile;
 - filtri per periodo e operatore alert non sono tutti esposti dalla pagina;
 - non sono implementati aggiornamenti realtime SSE/WebSocket;
 - ordinamento server-side generico e persistenza avanzata dei filtri non sono

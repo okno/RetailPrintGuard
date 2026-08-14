@@ -1,10 +1,33 @@
 # Rapporto test
 
-## Snapshot
+> I conteggi in questo documento appartengono ai gate storici indicati nelle
+> rispettive sezioni. Non attestano automaticamente il worktree correttivo
+> post-incidente. Il piano corrente è in [TEST_PLAN.md](TEST_PLAN.md) e i
+> risultati finali saranno consolidati in
+> [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
-Data: 13 agosto 2026. Il gate RetailPrintGuard è stato eseguito immediatamente
-prima del commit iniziale `fffb8d3`; le sole modifiche successive sono
-documentazione di provenienza dei repository congelati.
+## Gate candidato 0.2.0
+
+**Stato:** completato offline il 14 agosto 2026; hardware e produzione esclusi.
+
+| Controllo globale | Risultato finale |
+|---|---|
+| pytest pass | `123` |
+| pytest skip motivati | `24` (23 test Bash indisponibili sul runner Windows, 1 symlink) |
+| frontend test pass | `5` |
+| warning accettati | `1` deprecazione Starlette/httpx |
+
+La regressione mirata del trasporto include cinque partizioni deterministiche
+del payload; il renderer PDF è deterministico, versionato e bounded. Ruff,
+compileall, tre test migrazione, sintassi dei 23 script, ShellCheck e
+l'installazione delle 32 dipendenze con `--require-hashes` sono passati. Bandit
+non era installato nel runner e resta un gate non eseguito, non un PASS.
+
+## Snapshot storico
+
+Data: 13 agosto 2026. Il gate RetailPrintGuard fu eseguito immediatamente prima
+del commit iniziale `fffb8d3`. È riportato solo come baseline storica e non
+descrive la release 0.2.0.
 
 | Controllo | Ambiente | Risultato |
 |---|---|---|
@@ -73,7 +96,8 @@ test stack in una release compatibile.
 
 - tipi documento/evento e timestamp UTC;
 - schema completo, migrazione upgrade/downgrade SQLite;
-- correlazione, diff, split payment e 16 regole;
+- correlazione, diff, split payment, 16 regole di capitolato e la regola
+  composita `MODIFICA_POST_PRECONTO`;
 - parser DB idempotente, reparse versionato, retry bounded e corretta
   associazione delle risposte RCH al reverse RAW;
 - API login, route protette, RBAC raw/export/rule, workflow alert e audit;

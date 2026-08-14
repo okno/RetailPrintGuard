@@ -236,7 +236,7 @@ def _write_config(tmp_path: Path, listen_ip: str, target_ip: str) -> Path:
                 "target_ip": target_ip,
                 "target_port": 9100,
                 "parser": "escpos",
-                "allowed_networks": ["10.20.0.0/24"],
+                "allowed_networks": ["198.18.0.0/24"],
             }
         ],
     }
@@ -245,8 +245,10 @@ def _write_config(tmp_path: Path, listen_ip: str, target_ip: str) -> Path:
     return path
 
 
-def test_site_validator_accepts_private_values_and_rejects_rfc5737(tmp_path: Path) -> None:
-    valid = _write_config(tmp_path, "10.20.0.10", "10.20.0.20")
+def test_site_validator_accepts_nondocumentation_values_and_rejects_rfc5737(
+    tmp_path: Path,
+) -> None:
+    valid = _write_config(tmp_path, "198.18.0.10", "198.18.0.20")
     command = [
         sys.executable,
         str(SCRIPTS / "validate_site_config.py"),
@@ -258,7 +260,7 @@ def test_site_validator_accepts_private_values_and_rejects_rfc5737(tmp_path: Pat
         command, check=False, capture_output=True
     ).returncode == 0
     settings = load_settings(valid)
-    assert str(settings.devices[0].listen_ip) == "10.20.0.10"
+    assert str(settings.devices[0].listen_ip) == "198.18.0.10"
 
     documentation = _write_config(tmp_path, "192.0.2.10", "192.0.2.20")
     rejected = subprocess.run(  # noqa: S603

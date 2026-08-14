@@ -247,3 +247,33 @@ cancellano il finding.
 
 L'implementazione corrente espone parte di questi dati via log, status e DB;
 non include ancora un exporter Prometheus completo.
+
+## Strumenti di assurance
+
+Gli strumenti seguenti non devono essere usati come sostituto di una change
+approvata:
+
+```bash
+# Gate repository; nessun listener viene aperto.
+./scripts/run_tests.sh
+
+# Validazione read-only di una copia spool.
+./scripts/verify_raw_integrity.sh \
+  --config config/retailprintguard.example.yaml \
+  --canonical-root /percorso/copia-spool
+
+# Export da API con token in file protetto e checksum verificato.
+./scripts/export_document.sh --token-file /percorso/protetto/token \
+  --document-id '<UUID>' --format json --output ./documento.json
+
+# Mostra soltanto il piano di reprocessing.
+sudo ./scripts/reprocess_captures.sh \
+  --reason 'Ricalcolo parser approvato'
+```
+
+`run_offline_replay.sh` usa sempre `--validate-only` e non apre socket verso
+dispositivi. `reprocess_captures.sh` è dry-run per default; in `--execute`
+richiede worker parser/correlazione/antifrode fermi, crea e verifica un backup e
+richiede nome/versione/hash esatti della build parser per registrare
+l'attivazione, quindi lascia i worker fermi per la review. Non ferma né avvia i
+proxy.

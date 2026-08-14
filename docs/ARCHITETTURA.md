@@ -1,5 +1,10 @@
 # Architettura
 
+Per la distinzione fra release osservata e comportamento correttivo vedere
+[DATA_FLOW_AS_IS.md](DATA_FLOW_AS_IS.md),
+[DATA_FLOW_TO_BE.md](DATA_FLOW_TO_BE.md) e la decisione dettagliata
+[ARCHITECTURE_DECISION_TRANSPORT.md](ARCHITECTURE_DECISION_TRANSPORT.md).
+
 ## Scelta
 
 RetailPrintGuard è un monorepo modulare. Condivide dominio, configurazione,
@@ -141,7 +146,7 @@ append-only.
 
 ## Correlazione
 
-L'algoritmo corrente `rpg-correlation-1.0.0` usa, quando disponibili, codice
+L'algoritmo correttivo `rpg-correlation-1.1.0` usa, quando disponibili, codice
 ordine, codice documento, riferimenti embedded, tavolo, operatore, terminale,
 sessione, data operativa, prossimità temporale, totale, similarità righe,
 sequenza e dispositivo. I gruppi sono deterministici e il punteggio è limitato
