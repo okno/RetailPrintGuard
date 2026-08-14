@@ -52,6 +52,8 @@ def test_expected_services_are_separate_and_hardened() -> None:
     assert "NoNewPrivileges=yes" in backup
     assert "ProtectSystem=strict" in backup
     assert "SupplementaryGroups=retailprintguard-spool" in backup
+    assert "RestrictSUIDSGID=yes" in backup
+    assert "CapabilityBoundingSet=\n" in backup
     timer = (SYSTEMD / "retailprintguard-backup.timer").read_text(encoding="utf-8")
     assert "Persistent=yes" in timer
     assert "retailprintguard-backup.service" in timer
@@ -164,6 +166,9 @@ def test_backup_and_restore_fail_closed_for_evidence() -> None:
     restore = (SCRIPTS / "restore.sh").read_text(encoding="utf-8")
     assert 'find "${RPG_SPOOL_ROOT}" -type f -name .ready -print0 >"${marker_list}"' in backup
     assert "cannot enumerate ready evidence for backup" in backup
+    assert backup.count("--no-owner --no-group") == 2
+    assert backup.count("--chmod=D0750,F0640") == 2
+    assert "empty capability bounding" in backup
     assert 'cmp -s -- "${candidate}" "${existing}"' in restore
     assert "restore collision differs from backup" in restore
     assert '--chown="${copied_owner}"' in restore

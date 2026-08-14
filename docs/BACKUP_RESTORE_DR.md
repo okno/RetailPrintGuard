@@ -38,6 +38,14 @@ Il comando acquisisce un lock di manutenzione e crea:
 - riferimenti alle release codice/web correnti;
 - `MANIFEST.sha256` di tutti i file.
 
+Lo staging dell'archivio è intenzionalmente root-owned: contenuti e timestamp
+vengono conservati, UID/GID sorgenti non vengono replicati e i mode delle sole
+evidenze sono normalizzati a `0750` per le directory e `0640` per i file. Questo
+mantiene operativo il backup nell'unità systemd senza `CAP_CHOWN` e con
+`RestrictSUIDSGID=yes`; durante il restore le identità locali dei proxy e dei
+worker vengono applicate esplicitamente dopo la verifica delle collisioni e
+degli hash.
+
 Le sessioni proxy possono continuare: i job attivi `.partial` non entrano nel
 backup e saranno inclusi dopo la pubblicazione in quello successivo.
 
