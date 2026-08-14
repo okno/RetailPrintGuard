@@ -105,6 +105,8 @@ class ApiRepository(Protocol):
 
     def database_health(self) -> str: ...
 
+    def spool_health(self) -> str: ...
+
 
 class RepositoryUnavailable(RuntimeError):
     """Raised when the control-plane database cannot satisfy a request."""
@@ -123,7 +125,11 @@ class EmptyRepository:
     def diagnostics(self) -> DiagnosticsView:
         from datetime import UTC, datetime
 
-        return DiagnosticsView(generated_at=datetime.now(UTC), database="unconfigured")
+        return DiagnosticsView(
+            generated_at=datetime.now(UTC),
+            database="unconfigured",
+            spool=self.spool_health(),
+        )
 
     def list_devices(self) -> Sequence[DeviceView]:
         return ()
@@ -185,3 +191,6 @@ class EmptyRepository:
 
     def database_health(self) -> str:
         return "unconfigured"
+
+    def spool_health(self) -> str:
+        return "unknown"

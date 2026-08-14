@@ -70,9 +70,9 @@ def _read_secret(path: Path) -> bytes:
 def build_production_repository(settings: Settings) -> ApiRepository:
     """Load the SQLAlchemy adapter lazily so the API never reaches proxy code."""
 
-    from retailprintguard.db.repository import SqlAlchemyApiRepository
+    from retailprintguard.db.repository import create_api_repository
 
-    return SqlAlchemyApiRepository.from_url(settings.database_url().get_secret_value())
+    return create_api_repository(settings)
 
 
 def cli(argv: list[str] | None = None) -> int:

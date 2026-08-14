@@ -5,14 +5,17 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { api, scopedQueryKey } from '../api/client'
 import { ErrorState, LoadingState } from '../components/State'
 import { PageHeader } from '../components/PageHeader'
+import { TRANSACTION_DETAIL_PARAM } from '../routes'
 import type { Transaction } from '../types'
 
 const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
 
 export function TransactionDetailPage() {
-  const { id } = useParams()
+  const params = useParams()
+  const transactionId = params[TRANSACTION_DETAIL_PARAM]
   const navigate = useNavigate()
-  const query = useQuery({ queryKey: scopedQueryKey('transaction', id), queryFn: () => api<Transaction>(`/transactions/${id}`), enabled: Boolean(id) })
+  const query = useQuery({ queryKey: scopedQueryKey('transaction', transactionId), queryFn: () => api<Transaction>(`/transactions/${encodeURIComponent(transactionId ?? '')}`), enabled: Boolean(transactionId) })
+  if (!transactionId) return <ErrorState error={new Error('Identificativo transazione mancante o URL non valida.')} />
   if (query.isLoading) return <LoadingState />
   if (query.error || !query.data) return <ErrorState error={query.error} />
   const item = query.data

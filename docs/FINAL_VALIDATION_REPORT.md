@@ -4,6 +4,21 @@
 installabile in staging; l'attivazione sui dispositivi reali resta subordinata
 al collaudo controllato descritto nel piano di deployment.
 
+## Hotfix 0.3.1
+
+Il candidato `codex/web-documents-hotfix` corregge il contratto delle rotte
+frontend, la diagnostica spool, la selezione della versione parser attiva e la
+presentazione leggibile dei documenti. Le risposte di protocollo RCH restano
+evidenze consultabili ma sono separate dalla lista operativa; job distinti non
+sono deduplicati né cancellati.
+
+Il gate backend ha prodotto `141 passed`, `24 skipped` e zero fallimenti;
+Ruff, compileall e controllo diff sono passati. ESLint, TypeScript e i dieci
+test frontend sono passati. La build Vite deve essere eseguita e verificata sul
+server Linux prima dello switch della release, perché il runtime Node Windows
+locale si è fermato senza errore durante la trasformazione. Il reparse storico
+rimane un'operazione append-only separata dall'aggiornamento applicativo.
+
 ## Release 0.3.0
 
 Il candidato `codex/pos-semantic-parser` introduce il parser ESC/POS `1.2.0`,

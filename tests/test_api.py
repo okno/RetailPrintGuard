@@ -33,7 +33,9 @@ class FakeRepository(EmptyRepository):
         self.alert_id = uuid4()
         self.audits: list[AuditEntry] = []
         self.rule_enabled = True
+        self.spool_state = "ok"
         self.last_alert_filters: dict[str, object] = {}
+        self.last_document_filters: dict[str, object] = {}
 
     def authenticate(self, username: str, password: str) -> UserPrincipal | None:
         if username == "auditor" and password == "correct-password":
@@ -97,6 +99,12 @@ class FakeRepository(EmptyRepository):
             sha256="a" * 64,
             complete=True,
         )
+
+    def list_documents(
+        self, *, limit: int, offset: int, filters: dict[str, object]
+    ) -> tuple[list[DocumentView], int]:
+        self.last_document_filters = filters
+        return [], 0
 
     def get_document_raw(
         self, document_id: UUID, *, direction: str = "request"
@@ -179,6 +187,9 @@ class FakeRepository(EmptyRepository):
     def database_health(self) -> str:
         return "ok"
 
+    def spool_health(self) -> str:
+        return self.spool_state
+
 
 def _client() -> tuple[TestClient, FakeRepository]:
     repository = FakeRepository()
@@ -203,6 +214,8 @@ def test_health_is_public_and_security_headers_are_present() -> None:
 
     assert response.status_code == 200
     assert response.json()["database"] == "ok"
+    assert response.json()["spool"] == "ok"
+    assert response.json()["status"] == "ok"
     assert response.headers["X-Correlation-ID"] == "test-correlation-123"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["X-Frame-Options"] == "DENY"
@@ -225,7 +238,21 @@ def test_login_dashboard_and_bad_password() -> None:
     diagnostics = client.get("/api/v1/system/diagnostics", headers=headers)
     assert diagnostics.status_code == 200
     assert diagnostics.json()["database"] == "ok"
+    assert diagnostics.json()["spool"] == "ok"
     assert diagnostics.json()["recent_events"] == []
+
+
+def test_health_degrades_when_spool_is_not_healthy() -> None:
+    repository = FakeRepository()
+    repository.spool_state = "degraded"
+    client = TestClient(create_app(repository=repository, jwt_secret=b"x" * 64))
+
+    response = client.get("/api/v1/system/health")
+
+    assert response.status_code == 200
+    assert response.json()["database"] == "ok"
+    assert response.json()["spool"] == "degraded"
+    assert response.json()["status"] == "degraded"
 
 
 def test_protected_routes_reject_missing_token() -> None:
@@ -233,6 +260,17 @@ def test_protected_routes_reject_missing_token() -> None:
     assert client.get("/api/v1/devices").status_code == 401
     assert client.get("/api/v1/documents").status_code == 401
     assert client.get("/api/v1/alerts").status_code == 401
+
+
+def test_documents_route_forwards_server_side_technical_exclusion() -> None:
+    client, repository = _client()
+    response = client.get(
+        "/api/v1/documents?exclude_type=DEVICE_RESPONSE",
+        headers=_login(client),
+    )
+
+    assert response.status_code == 200
+    assert repository.last_document_filters["exclude_type"] == "DEVICE_RESPONSE"
 
 
 def test_raw_download_requires_auditor_and_is_audited() -> None:

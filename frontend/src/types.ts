@@ -124,6 +124,7 @@ export interface DocumentRecord {
   tax_total?: string
   status: string
   normalized_text: string
+  receipt_text?: string
   parser_name: string
   parser_version: string
   confidence: number

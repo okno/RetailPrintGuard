@@ -79,13 +79,10 @@ class ApiContext:
         repository: ApiRepository,
         tokens: TokenService,
         throttle: LoginThrottle,
-        *,
-        spool_health: str = "unknown",
     ) -> None:
         self.repository = repository
         self.tokens = tokens
         self.throttle = throttle
-        self.spool_health = spool_health
 
 
 def create_router(context: ApiContext) -> APIRouter:
@@ -240,9 +237,7 @@ def create_router(context: ApiContext) -> APIRouter:
         _: AnyUser, repo: Annotated[ApiRepository, Depends(repository)]
     ) -> DiagnosticsView:
         result = repo.diagnostics()
-        return result.model_copy(
-            update={"database": repo.database_health(), "spool": context.spool_health}
-        )
+        return result.model_copy(update={"database": repo.database_health()})
 
     @router.get("/sessions", response_model=Page[SessionView], tags=["sessions"])
     def sessions(
@@ -328,13 +323,19 @@ def create_router(context: ApiContext) -> APIRouter:
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
         document_type: str | None = Query(default=None, alias="type"),
+        exclude_type: str | None = None,
         device_id: str | None = None,
         order_code: str | None = None,
     ) -> Page[DocumentView]:
         items, total = repo.list_documents(
             limit=limit,
             offset=offset,
-            filters={"type": document_type, "device_id": device_id, "order_code": order_code},
+            filters={
+                "type": document_type,
+                "exclude_type": exclude_type,
+                "device_id": device_id,
+                "order_code": order_code,
+            },
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
 
@@ -645,12 +646,13 @@ def create_router(context: ApiContext) -> APIRouter:
     @router.get("/system/health", response_model=HealthView, tags=["system"])
     def health(repo: Annotated[ApiRepository, Depends(repository)]) -> HealthView:
         database = repo.database_health()
-        overall = "ok" if database == "ok" else "degraded"
+        spool = repo.spool_health() if database == "ok" else "unknown"
+        overall = "ok" if database == "ok" and spool == "ok" else "degraded"
         return HealthView(
             status=overall,
             version=__version__,
             database=database,
-            spool=context.spool_health,
+            spool=spool,
             timestamp=datetime.now(UTC),
         )
 

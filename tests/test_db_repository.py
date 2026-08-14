@@ -15,6 +15,7 @@ from retailprintguard.api.schemas import AlertUpdate, AuditEntry, RoleName
 from retailprintguard.common.domain import DocumentType
 from retailprintguard.db import Base, create_db_engine, session_factory
 from retailprintguard.db.models import (
+    ActiveParserVersion,
     AuditLog,
     Device,
     DeviceStatus,
@@ -402,6 +403,148 @@ def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> Non
     engine.dispose()
 
 
+def test_document_views_honor_active_parser_and_exclude_technical_responses() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    newer_parser_id = uuid4()
+    response_document_id = uuid4()
+    with factory.begin() as session:
+        document = session.get(Document, ids["document"])
+        assert document is not None
+        active_version = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == ids["document"],
+                DocumentVersion.version_sequence == 1,
+            )
+        )
+        assert active_version is not None
+        active_version.document_type = "PRE_BILL"
+        active_version.subtype = "PRECONTO"
+        active_version.external_document_code = "PB-0001"
+        active_version.order_code = None
+        active_version.table_code = "25-B"
+        document.document_type = "KITCHEN_ORDER"
+        document.subtype = "SHADOW_NEW"
+        document.order_code = "SHADOW-NEW"
+        newer_parser = ParserVersion(
+            id=newer_parser_id,
+            name="synthetic",
+            version="2",
+            build_sha256="7" * 64,
+            protocol="test",
+        )
+        session.add(newer_parser)
+        session.add(
+            ActiveParserVersion(
+                parser_name="synthetic",
+                parser_version_id=ids["parser"],
+                activation_reason="keep validated version active",
+            )
+        )
+        session.flush()
+        session.add(
+            DocumentVersion(
+                document_id=ids["document"],
+                parser_version_id=newer_parser_id,
+                raw_payload_id=ids["raw"],
+                version_sequence=2,
+                document_type="KITCHEN_ORDER",
+                subtype="SHADOW_NEW",
+                order_code="SHADOW-NEW",
+                gross_total=Decimal("9.00"),
+                status="COMPLETE",
+                normalized_text="SHADOW PARSER OUTPUT",
+                parse_confidence=90,
+                evidence_level="INFERRED",
+                source_manifest_sha256="a" * 64,
+                source_payload_sha256="7" * 64,
+                source_path="/spool/job-one/client.raw",
+                complete=True,
+                chain_scope=f"document:{ids['job']}:shadow",
+                chain_sequence=1,
+                previous_record_hash="0" * 64,
+                record_hash="7" * 64,
+            )
+        )
+        session.add(
+            Document(
+                id=response_document_id,
+                device_id=ids["device"],
+                session_id=ids["session"],
+                job_id=ids["job"],
+                source_document_key="response-one",
+                document_type="DEVICE_RESPONSE",
+                subtype="ACK",
+                captured_at=NOW + timedelta(seconds=1),
+            )
+        )
+        session.flush()
+        session.add(
+            DocumentVersion(
+                document_id=response_document_id,
+                parser_version_id=ids["parser"],
+                raw_payload_id=ids["raw"],
+                version_sequence=1,
+                document_type="DEVICE_RESPONSE",
+                subtype="ACK",
+                status="COMPLETE",
+                normalized_text="ACK",
+                parse_confidence=100,
+                evidence_level="CONFIRMED",
+                source_manifest_sha256="a" * 64,
+                source_payload_sha256="8" * 64,
+                source_path="/spool/job-one/device.raw",
+                complete=True,
+                chain_scope=f"document:{ids['job']}:response",
+                chain_sequence=1,
+                previous_record_hash="0" * 64,
+                record_hash="8" * 64,
+            )
+        )
+
+    repository = SqlAlchemyApiRepository(factory)
+    selected = repository.get_document(ids["document"])
+    assert selected is not None
+    assert (selected.type, selected.subtype, selected.order_code) == (
+        "PRE_BILL",
+        "PRECONTO",
+        None,
+    )
+    assert selected.normalized_text == "PRECONTO ORD-80 TOTALE 100,00"
+    assert selected.receipt_text == "PRECONTO ORD-80 TOTALE 100,00"
+    leaked, leaked_total = repository.list_documents(
+        limit=20,
+        offset=0,
+        filters={"order_code": "SHADOW-NEW"},
+    )
+    assert leaked_total == 0
+    assert leaked == []
+
+    primary, primary_total = repository.list_documents(
+        limit=20,
+        offset=0,
+        filters={"exclude_type": "DEVICE_RESPONSE"},
+    )
+    assert primary_total == 1
+    assert [item.id for item in primary] == [ids["document"]]
+    technical, technical_total = repository.list_documents(
+        limit=20,
+        offset=0,
+        filters={"type": "DEVICE_RESPONSE"},
+    )
+    assert technical_total == 1
+    assert [item.id for item in technical] == [response_document_id]
+    dashboard = repository.dashboard()
+    assert (dashboard.documents, dashboard.orders, dashboard.pre_bills) == (1, 0, 1)
+
+    with factory.begin() as session:
+        job = session.get(PrintJob, ids["job"])
+        assert job is not None
+        job.import_status = "PARSE_FAILED"
+    assert repository.diagnostics().parser_errors == 1
+    engine.dispose()
+
+
 def _envelope(*, source_key: str, manifest_sha256: str) -> NormalizedEnvelope:
     payload = b"synthetic raw"
     artifact = ArtifactSnapshot(
@@ -581,6 +724,101 @@ def test_device_status_refresh_reports_spool_bytes_partial_and_pending_jobs(
         assert status.spool_bytes == sum(
             path.stat().st_size for path in spool.rglob("*") if path.is_file()
         )
+    engine.dispose()
+
+
+def test_api_spool_health_uses_fresh_persisted_device_metrics() -> None:
+    engine, factory = _factory()
+    now = datetime.now(UTC)
+    with factory.begin() as session:
+        device = Device(
+            external_id="pos_health",
+            name="POS health",
+            device_type="pos",
+            parser_kind="escpos",
+            listen_ip="192.0.2.30",
+            listen_port=9100,
+            target_ip="192.0.2.40",
+            target_port=9100,
+        )
+        session.add(device)
+        session.flush()
+        device_id = device.id
+
+    repository = SqlAlchemyApiRepository(
+        factory,
+        spool_metric_stale_after=timedelta(minutes=5),
+        spool_warning_bytes=1_000,
+    )
+    assert repository.spool_health() == "unknown"
+
+    with factory.begin() as session:
+        session.add(
+            DeviceStatus(
+                device_id=device_id,
+                observed_at=now,
+                status="ONLINE",
+                spool_bytes=120,
+                metrics={"spool_scanned_at": now.isoformat(), "partial_jobs": 0},
+            )
+        )
+    assert repository.spool_health() == "ok"
+    assert repository.diagnostics().spool == "ok"
+
+    with factory.begin() as session:
+        session.add(
+            DeviceStatus(
+                device_id=device_id,
+                observed_at=now + timedelta(seconds=1),
+                status="ONLINE",
+                spool_bytes=120,
+                metrics={
+                    "spool_scanned_at": (now - timedelta(minutes=6)).isoformat(),
+                    "partial_jobs": 0,
+                },
+            )
+        )
+    assert repository.spool_health() == "unknown"
+
+    with factory.begin() as session:
+        session.add(
+            DeviceStatus(
+                device_id=device_id,
+                observed_at=now + timedelta(seconds=2),
+                status="ONLINE",
+                spool_bytes=120,
+                metrics={
+                    "spool_scanned_at": now.isoformat(),
+                    "spool_metric_error": "PermissionError",
+                    "partial_jobs": 0,
+                },
+            )
+        )
+    assert repository.spool_health() == "degraded"
+
+    with factory.begin() as session:
+        session.add(
+            DeviceStatus(
+                device_id=device_id,
+                observed_at=now + timedelta(seconds=3),
+                status="ONLINE",
+                spool_bytes=1_000,
+                metrics={"spool_scanned_at": now.isoformat(), "partial_jobs": 0},
+            )
+        )
+    assert repository.spool_health() == "degraded"
+
+    with factory.begin() as session:
+        session.add(
+            DeviceStatus(
+                device_id=device_id,
+                observed_at=now + timedelta(seconds=4),
+                status="ONLINE",
+                spool_bytes=120,
+                metrics={"spool_scanned_at": now.isoformat(), "partial_jobs": 1},
+            )
+        )
+    assert repository.spool_health() == "degraded"
     engine.dispose()
 
 

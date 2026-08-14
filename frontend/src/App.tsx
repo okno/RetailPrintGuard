@@ -5,6 +5,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { clearSession, session, subscribeSession } from './api/client'
 import { Layout } from './components/Layout'
 import { LoginPage } from './pages/LoginPage'
+import { DOCUMENT_DETAIL_ROUTE, TRANSACTION_DETAIL_ROUTE } from './routes'
 import type { User } from './types'
 
 const AlertsPage = lazy(() => import('./pages/AlertsPage').then((module) => ({ default: module.AlertsPage })))
@@ -44,9 +45,9 @@ export default function App() {
       <Routes>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/transazioni" element={<TransactionsPage />} />
-        <Route path="/transazioni/:transactionId" element={<TransactionDetailPage />} />
+        <Route path={TRANSACTION_DETAIL_ROUTE} element={<TransactionDetailPage />} />
         <Route path="/documenti" element={<DocumentsPage />} />
-        <Route path="/documenti/:documentId" element={<DocumentDetailPage />} />
+        <Route path={DOCUMENT_DETAIL_ROUTE} element={<DocumentDetailPage />} />
         <Route path="/alert" element={<AlertsPage />} />
         <Route path="/regole" element={<RulesPage />} />
         <Route path="/ricerca" element={<SearchPage />} />

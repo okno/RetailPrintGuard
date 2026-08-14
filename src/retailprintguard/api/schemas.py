@@ -174,6 +174,7 @@ class DocumentView(BaseModel):
     tax_total: Decimal | None = None
     status: str
     normalized_text: str
+    receipt_text: str | None = None
     parser_name: str
     parser_version: str
     confidence: int

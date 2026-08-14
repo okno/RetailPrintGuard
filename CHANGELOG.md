@@ -3,6 +3,25 @@
 Tutte le modifiche rilevanti sono documentate in questo file. Il progetto segue
 la struttura di Keep a Changelog.
 
+## [0.3.1] — 2026-08-14
+
+### Fixed
+
+- corretti i parametri delle rotte frontend per i dettagli di documenti e
+  transazioni: la pagina ora interroga realmente l'API usando l'UUID indicato
+  nell'URL;
+- la diagnostica usa le metriche spool persistite dall'ingestion worker e non
+  sovrascrive più lo stato reale con `unknown`;
+- API, dashboard, ricerca e transazioni selezionano la versione parser attiva,
+  mantenendo coerenti reparse, attivazione e rollback;
+- la vista scontrino e il PDF usano una proiezione leggibile che nasconde le
+  annotazioni tecniche ESC/POS senza modificare testo normalizzato o RAW;
+- le risposte tecniche RCH sono separate dalla vista documentale primaria, ma
+  restano consultabili come evidenze; stampe distinte in job differenti non
+  vengono eliminate o fuse;
+- errori e retry del parser concorrono allo stato diagnostico e i contatori
+  dashboard derivano dai documenti della versione parser selezionata.
+
 ## [0.3.0] — 2026-08-14
 
 ### Added

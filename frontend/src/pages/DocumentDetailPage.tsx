@@ -8,6 +8,7 @@ import { ErrorState, LoadingState } from '../components/State'
 import { PageHeader } from '../components/PageHeader'
 import { StatusChip } from '../components/StatusChip'
 import { formatDateTime } from '../format'
+import { DOCUMENT_DETAIL_PARAM } from '../routes'
 import type { DocumentRecord } from '../types'
 
 function hex(data: Uint8Array) {
@@ -18,16 +19,20 @@ function hex(data: Uint8Array) {
 }
 
 export function DocumentDetailPage() {
-  const { id } = useParams()
+  const params = useParams()
+  const documentId = params[DOCUMENT_DETAIL_PARAM]
   const navigate = useNavigate()
   const [tab, setTab] = useState(0)
   const [raw, setRaw] = useState<string>()
   const [artifactError, setArtifactError] = useState<unknown>()
   const query = useQuery({
-    queryKey: scopedQueryKey('document', id),
-    queryFn: () => api<DocumentRecord>(`/documents/${id}`),
-    enabled: Boolean(id),
+    queryKey: scopedQueryKey('document', documentId),
+    queryFn: () => api<DocumentRecord>(`/documents/${encodeURIComponent(documentId ?? '')}`),
+    enabled: Boolean(documentId),
   })
+  if (!documentId) {
+    return <ErrorState error={new Error('Identificativo documento mancante o URL non valida.')} />
+  }
   if (query.isLoading) return <LoadingState />
   if (query.error || !query.data) return <ErrorState error={query.error} />
   const doc = query.data
@@ -46,7 +51,7 @@ export function DocumentDetailPage() {
   async function loadRaw() {
     await runArtifact(async () => {
       setRaw(hex(await rawDocument(doc.id)))
-      setTab(2)
+      setTab(3)
     })
   }
 
@@ -72,12 +77,14 @@ export function DocumentDetailPage() {
           <Tabs value={tab} onChange={(_, value) => setTab(value)} aria-label="Viste documento">
             <Tab label="Scontrino" />
             <Tab label="Righe strutturate" />
+            <Tab label="Testo parser" />
             <Tab label="RAW tecnico" disabled={!canDownloadEvidence} />
           </Tabs>
           <CardContent>
-            {tab === 0 && <Paper variant="outlined" sx={{ mx: 'auto', maxWidth: 520, p: 3, bgcolor: '#fffef9', fontFamily: 'ui-monospace,Consolas,monospace', whiteSpace: 'pre-wrap', lineHeight: 1.55 }}>{doc.normalized_text || 'Nessun testo normalizzato.'}</Paper>}
+            {tab === 0 && <Paper variant="outlined" sx={{ mx: 'auto', maxWidth: 520, p: 3, bgcolor: '#fffef9', fontFamily: 'ui-monospace,Consolas,monospace', whiteSpace: 'pre-wrap', lineHeight: 1.55 }}>{doc.receipt_text || doc.normalized_text || 'Nessun testo documento disponibile.'}</Paper>}
             {tab === 1 && <Box sx={{ overflowX: 'auto' }}><Table size="small"><TableHead><TableRow><TableCell>#</TableCell><TableCell>Portata</TableCell><TableCell>Descrizione</TableCell><TableCell align="right">Q.tà</TableCell><TableCell align="right">Prezzo</TableCell><TableCell align="right">Totale</TableCell><TableCell>Stato</TableCell></TableRow></TableHead><TableBody>{doc.lines.map((line) => <TableRow key={line.sequence} sx={{ textDecoration: line.removed ? 'line-through' : 'none', bgcolor: line.removed ? 'error.50' : 'transparent' }}><TableCell>{line.sequence}</TableCell><TableCell>{line.course_code ?? '—'}</TableCell><TableCell>{line.description ?? line.raw_text ?? '—'}</TableCell><TableCell align="right">{line.quantity ?? '—'}</TableCell><TableCell align="right">{line.unit_price ?? '—'}</TableCell><TableCell align="right">{line.line_total ?? '—'}</TableCell><TableCell>{line.removed ? 'Rimosso' : line.cancelled ? 'Annullato' : line.state ?? 'Attivo'}</TableCell></TableRow>)}</TableBody></Table></Box>}
-            {tab === 2 && <Box><Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>Anteprima esadecimale limitata a 64 KiB; il download completo è separato e auditato.</Typography>{raw ? <Paper component="pre" variant="outlined" sx={{ p: 2, maxHeight: 520, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>{raw}</Paper> : <Button startIcon={<DownloadOutlined />} onClick={loadRaw}>Richiedi anteprima originale</Button>}</Box>}
+            {tab === 2 && <Paper component="pre" variant="outlined" sx={{ p: 2, maxHeight: 520, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>{doc.normalized_text || 'Nessun testo normalizzato.'}</Paper>}
+            {tab === 3 && <Box><Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>Anteprima esadecimale limitata a 64 KiB; il download completo è separato e auditato.</Typography>{raw ? <Paper component="pre" variant="outlined" sx={{ p: 2, maxHeight: 520, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>{raw}</Paper> : <Button startIcon={<DownloadOutlined />} onClick={loadRaw}>Richiedi anteprima originale</Button>}</Box>}
           </CardContent>
         </Card>
       </Grid>

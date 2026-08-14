@@ -6,6 +6,26 @@
 > risultati finali saranno consolidati in
 > [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
+## Release 0.3.1 — visualizzazione documenti e diagnostica
+
+**Stato:** gate software offline completato il 14 agosto 2026. La verifica
+finale su browser e dati operativi deve essere eseguita dopo l'aggiornamento
+controllato della produzione; nessun RAW operativo è incluso nella release.
+
+| Controllo | Risultato |
+|---|---|
+| suite Python completa | `141 passed`, `24 skipped`, `0 failed` |
+| Ruff, compileall e `git diff --check` | PASS |
+| frontend ESLint e TypeScript | PASS |
+| frontend Vitest completo | `10 passed`, `0 failed` |
+| selezione versione parser attiva e paginazione documenti | PASS su SQLite; SQL MariaDB compilabile |
+| build Vite | da certificare sul server Linux prima dell'attivazione; il runtime Windows locale è rimasto fermo su `transforming...` senza errore |
+
+Le regressioni coprono i parametri UUID delle rotte documento/transazione, la
+separazione delle risposte tecniche senza deduplicare job distinti, la
+proiezione scontrino leggibile, lo stato spool derivato dalle metriche e il
+divieto di propagare campi da una versione parser shadow a quella attiva.
+
 ## Release 0.3.0 — parser POS e correlazione `1.2.0`
 
 **Stato:** gate offline completato il 14 agosto 2026; nessun RAW o dato

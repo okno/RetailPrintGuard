@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, and_, func, or_, select, text
+from sqlalchemy import Select, and_, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -49,6 +49,7 @@ from retailprintguard.common.config import Settings
 from retailprintguard.common.domain import AlertStatus, DocumentType
 from retailprintguard.common.hashchain import ZERO_HASH, chained_hash
 from retailprintguard.db.models import (
+    ActiveParserVersion,
     AuditLog,
     Device,
     DeviceStatus,
@@ -93,9 +94,12 @@ from retailprintguard.ingestion.repository import (
     ImportDisposition,
     RepositoryImportResult,
 )
+from retailprintguard.render.text import receipt_text
 
 MONEY_ZERO = Decimal("0.0000")
 DEVICE_ACTIVITY_STALE_AFTER = timedelta(minutes=10)
+DEFAULT_SPOOL_METRIC_STALE_AFTER = timedelta(minutes=10)
+DEFAULT_SPOOL_WARNING_BYTES = 1_073_741_824
 FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT.value, DocumentType.REFUND.value}
 SOURCE_TYPES = {
     DocumentType.ORDER.value,
@@ -115,11 +119,43 @@ def _page(limit: int, offset: int, *, maximum: int = 10_000) -> tuple[int, int]:
 def _latest_version_id() -> Any:
     return (
         select(DocumentVersion.id)
+        .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
+        .outerjoin(
+            ActiveParserVersion,
+            ActiveParserVersion.parser_name == ParserVersion.name,
+        )
         .where(DocumentVersion.document_id == Document.id)
-        .order_by(DocumentVersion.version_sequence.desc(), DocumentVersion.id.desc())
+        .order_by(
+            (ActiveParserVersion.parser_version_id == DocumentVersion.parser_version_id).desc(),
+            DocumentVersion.version_sequence.desc(),
+            DocumentVersion.id.desc(),
+        )
         .limit(1)
         .correlate(Document)
         .scalar_subquery()
+    )
+
+
+def _version_value(version: DocumentVersion, document: Document, field: str) -> Any:
+    """Read immutable semantics, falling back only for a wholly legacy row."""
+
+    if version.document_type is None and version.subtype is None:
+        return getattr(document, field)
+    return getattr(version, field)
+
+
+def _version_column(version_column: Any, legacy_column: Any) -> Any:
+    """SQL equivalent of :func:`_version_value` without cross-version leakage."""
+
+    return case(
+        (
+            and_(
+                DocumentVersion.document_type.is_(None),
+                DocumentVersion.subtype.is_(None),
+            ),
+            legacy_column,
+        ),
+        else_=version_column,
     )
 
 
@@ -221,13 +257,35 @@ def _stored_line_diff(
 class SqlAlchemyApiRepository:
     """Concrete, synchronous API repository backed by MariaDB/SQLAlchemy 2."""
 
-    def __init__(self, factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        factory: sessionmaker[Session],
+        *,
+        spool_metric_stale_after: timedelta = DEFAULT_SPOOL_METRIC_STALE_AFTER,
+        spool_warning_bytes: int = DEFAULT_SPOOL_WARNING_BYTES,
+    ) -> None:
+        if spool_metric_stale_after <= timedelta(0):
+            raise ValueError("spool metric freshness window must be positive")
+        if spool_warning_bytes <= 0:
+            raise ValueError("spool warning threshold must be positive")
         self._factory = factory
         self._passwords = PasswordService()
+        self._spool_metric_stale_after = spool_metric_stale_after
+        self._spool_warning_bytes = spool_warning_bytes
 
     @classmethod
-    def from_url(cls, database_url: str) -> SqlAlchemyApiRepository:
-        return cls(session_factory(create_db_engine(database_url)))
+    def from_url(
+        cls,
+        database_url: str,
+        *,
+        spool_metric_stale_after: timedelta = DEFAULT_SPOOL_METRIC_STALE_AFTER,
+        spool_warning_bytes: int = DEFAULT_SPOOL_WARNING_BYTES,
+    ) -> SqlAlchemyApiRepository:
+        return cls(
+            session_factory(create_db_engine(database_url)),
+            spool_metric_stale_after=spool_metric_stale_after,
+            spool_warning_bytes=spool_warning_bytes,
+        )
 
     @contextmanager
     def _read(self) -> Iterator[Session]:
@@ -289,12 +347,36 @@ class SqlAlchemyApiRepository:
 
     def dashboard(self) -> DashboardView:
         with self._read() as session:
-            documents = session.scalar(select(func.count()).select_from(Document)) or 0
-            orders = session.scalar(select(func.count()).select_from(Order)) or 0
+            semantic_type = _version_column(
+                DocumentVersion.document_type,
+                Document.document_type,
+            ).label("document_type")
+            selected_documents = (
+                select(semantic_type)
+                .select_from(DocumentVersion)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(DocumentVersion.id == _latest_version_id())
+                .subquery()
+            )
             type_counts = dict(
                 session.execute(
-                    select(Document.document_type, func.count()).group_by(Document.document_type)
+                    select(selected_documents.c.document_type, func.count()).group_by(
+                        selected_documents.c.document_type
+                    )
                 ).all()
+            )
+            documents = sum(
+                count
+                for document_type, count in type_counts.items()
+                if document_type != DocumentType.DEVICE_RESPONSE.value
+            )
+            orders = sum(
+                type_counts.get(document_type.value, 0)
+                for document_type in (
+                    DocumentType.ORDER,
+                    DocumentType.ORDER_CHANGE,
+                    DocumentType.KITCHEN_ORDER,
+                )
             )
             open_states = ("OPEN", "UNDER_REVIEW")
             open_alerts = (
@@ -346,7 +428,11 @@ class SqlAlchemyApiRepository:
                 session.scalar(
                     select(func.count())
                     .select_from(DocumentVersion)
-                    .where(func.coalesce(json_length, 0) > 0)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        DocumentVersion.id == _latest_version_id(),
+                        func.coalesce(json_length, 0) > 0,
+                    )
                 )
                 or 0
             )
@@ -388,7 +474,19 @@ class SqlAlchemyApiRepository:
                 session.scalar(
                     select(func.count())
                     .select_from(DocumentVersion)
-                    .where(func.coalesce(json_length, 0) > 0)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        DocumentVersion.id == _latest_version_id(),
+                        func.coalesce(json_length, 0) > 0,
+                    )
+                )
+                or 0
+            )
+            parser_errors += (
+                session.scalar(
+                    select(func.count())
+                    .select_from(PrintJob)
+                    .where(PrintJob.import_status.in_(("PARSE_RETRY", "PARSE_FAILED")))
                 )
                 or 0
             )
@@ -414,6 +512,7 @@ class SqlAlchemyApiRepository:
             ).all()
             return DiagnosticsView(
                 generated_at=datetime.now(UTC),
+                spool=self._spool_health(session, now=datetime.now(UTC)),
                 parser_errors=parser_errors,
                 incomplete_jobs=incomplete_jobs,
                 recent_events=[
@@ -433,6 +532,51 @@ class SqlAlchemyApiRepository:
                     for event in events
                 ],
             )
+
+    def _spool_health(self, session: Session, *, now: datetime) -> str:
+        enabled_device_ids = set(
+            session.scalars(select(Device.id).where(Device.enabled.is_(True))).all()
+        )
+        if not enabled_device_ids:
+            return "unknown"
+
+        statuses = self._latest_device_statuses(session)
+        total_bytes = 0
+        has_partial_jobs = False
+        for device_id in enabled_device_ids:
+            status = statuses.get(device_id)
+            if status is None:
+                return "unknown"
+            metrics = status.metrics if isinstance(status.metrics, dict) else {}
+            if metrics.get("spool_metric_error"):
+                return "degraded"
+            scanned_value = metrics.get("spool_scanned_at")
+            if not isinstance(scanned_value, str):
+                return "unknown"
+            try:
+                scanned_at = datetime.fromisoformat(scanned_value)
+            except ValueError:
+                return "unknown"
+            if scanned_at.tzinfo is None:
+                return "unknown"
+            if scanned_at.astimezone(UTC) < now - self._spool_metric_stale_after:
+                return "unknown"
+            total_bytes += max(0, status.spool_bytes)
+            try:
+                has_partial_jobs = has_partial_jobs or int(metrics.get("partial_jobs", 0)) > 0
+            except (TypeError, ValueError):
+                return "unknown"
+
+        if has_partial_jobs or total_bytes >= self._spool_warning_bytes:
+            return "degraded"
+        return "ok"
+
+    def spool_health(self) -> str:
+        try:
+            with self._read() as session:
+                return self._spool_health(session, now=datetime.now(UTC))
+        except RepositoryUnavailable:
+            return "unknown"
 
     @staticmethod
     def _latest_device_statuses(session: Session) -> dict[UUID, DeviceStatus]:
@@ -601,22 +745,12 @@ class SqlAlchemyApiRepository:
         if not documents:
             return []
         document_ids = [document.id for document in documents]
-        latest = (
-            select(
-                DocumentVersion.document_id,
-                func.max(DocumentVersion.version_sequence).label("version_sequence"),
-            )
-            .where(DocumentVersion.document_id.in_(document_ids))
-            .group_by(DocumentVersion.document_id)
-            .subquery()
-        )
         versions = session.scalars(
-            select(DocumentVersion).join(
-                latest,
-                and_(
-                    latest.c.document_id == DocumentVersion.document_id,
-                    latest.c.version_sequence == DocumentVersion.version_sequence,
-                ),
+            select(DocumentVersion)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(
+                Document.id.in_(document_ids),
+                DocumentVersion.id == _latest_version_id(),
             )
         ).all()
         version_by_document = {version.document_id: version for version in versions}
@@ -682,14 +816,18 @@ class SqlAlchemyApiRepository:
                     id=document.id,
                     device_id=device.external_id if device else str(document.device_id),
                     job_id=document.job_id,
-                    type=document.document_type,
-                    subtype=document.subtype,
-                    external_code=document.external_document_code,
-                    order_code=document.order_code,
-                    table_code=document.table_code,
-                    operator_code=document.operator_code,
-                    terminal_code=document.terminal_code,
-                    document_timestamp=document.document_timestamp,
+                    type=_version_value(version, document, "document_type"),
+                    subtype=_version_value(version, document, "subtype"),
+                    external_code=_version_value(
+                        version, document, "external_document_code"
+                    ),
+                    order_code=_version_value(version, document, "order_code"),
+                    table_code=_version_value(version, document, "table_code"),
+                    operator_code=_version_value(version, document, "operator_code"),
+                    terminal_code=_version_value(version, document, "terminal_code"),
+                    document_timestamp=_version_value(
+                        version, document, "document_timestamp"
+                    ),
                     captured_at=document.captured_at,
                     gross_total=version.gross_total,
                     net_total=version.net_total,
@@ -697,6 +835,7 @@ class SqlAlchemyApiRepository:
                     tax_total=version.tax_total,
                     status=version.status,
                     normalized_text=version.normalized_text,
+                    receipt_text=receipt_text(version.normalized_text),
                     parser_name=parser.name if parser else "unknown",
                     parser_version=parser.version if parser else "unknown",
                     confidence=version.parse_confidence,
@@ -758,13 +897,30 @@ class SqlAlchemyApiRepository:
     ) -> tuple[list[DocumentView], int]:
         limit, offset = _page(limit, offset)
         with self._read() as session:
-            statement: Select[Any] = select(Document).join(Device)
+            semantic_type = _version_column(
+                DocumentVersion.document_type,
+                Document.document_type,
+            )
+            semantic_order_code = _version_column(
+                DocumentVersion.order_code,
+                Document.order_code,
+            )
+            statement: Select[Any] = (
+                select(Document)
+                .join(Device)
+                .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+                .where(DocumentVersion.id == _latest_version_id())
+            )
             if filters.get("type"):
-                statement = statement.where(Document.document_type == str(filters["type"]))
+                statement = statement.where(semantic_type == str(filters["type"]))
+            elif filters.get("exclude_type"):
+                statement = statement.where(semantic_type != str(filters["exclude_type"]))
             if filters.get("device_id"):
                 statement = statement.where(Device.external_id == str(filters["device_id"]))
             if filters.get("order_code"):
-                statement = statement.where(Document.order_code == str(filters["order_code"]))
+                statement = statement.where(
+                    semantic_order_code == str(filters["order_code"])
+                )
             count = (
                 session.scalar(
                     select(func.count()).select_from(statement.order_by(None).subquery())
@@ -811,9 +967,11 @@ class SqlAlchemyApiRepository:
                 return None
             version = session.scalar(
                 select(DocumentVersion)
-                .where(DocumentVersion.document_id == document.id)
-                .order_by(DocumentVersion.version_sequence.desc())
-                .limit(1)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    Document.id == document.id,
+                    DocumentVersion.id == _latest_version_id(),
+                )
             )
             raw = session.get(RawPayload, version.raw_payload_id) if version else None
             if raw is not None and raw.direction != stored_direction:
@@ -936,21 +1094,31 @@ class SqlAlchemyApiRepository:
             .where(DocumentCorrelationMember.correlation_id == correlation.id)
             .order_by(Document.captured_at, Document.id)
         ).all()
-        versions: dict[UUID, DocumentVersion] = {}
-        for document in documents:
-            version = session.scalar(
+        versions = {
+            version.document_id: version
+            for version in session.scalars(
                 select(DocumentVersion)
-                .where(DocumentVersion.document_id == document.id)
-                .order_by(DocumentVersion.version_sequence.desc())
-                .limit(1)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    Document.id.in_([document.id for document in documents]),
+                    DocumentVersion.id == _latest_version_id(),
+                )
             )
-            if version is not None:
-                versions[document.id] = version
+        }
+
+        def semantics(document: Document, field: str) -> Any:
+            version = versions.get(document.id)
+            if version is None:
+                return getattr(document, field)
+            return _version_value(version, document, field)
+
         prebill_documents = [
-            document for document in documents if document.document_type == "PRE_BILL"
+            document for document in documents if semantics(document, "document_type") == "PRE_BILL"
         ]
         fiscal_documents = [
-            document for document in documents if document.document_type in FISCAL_TYPES
+            document
+            for document in documents
+            if semantics(document, "document_type") in FISCAL_TYPES
         ]
         prebill_total = (
             versions[prebill_documents[-1].id].gross_total
@@ -960,7 +1128,7 @@ class SqlAlchemyApiRepository:
         fiscal_total = sum(
             (
                 -(versions[document.id].gross_total or MONEY_ZERO)
-                if document.document_type == "REFUND"
+                if semantics(document, "document_type") == "REFUND"
                 else (versions[document.id].gross_total or MONEY_ZERO)
             )
             for document in fiscal_documents
@@ -970,7 +1138,8 @@ class SqlAlchemyApiRepository:
             (
                 versions[document.id].gross_total
                 for document in documents
-                if document.document_type in SOURCE_TYPES and document.id in versions
+                if semantics(document, "document_type") in SOURCE_TYPES
+                and document.id in versions
             ),
             None,
         )
@@ -985,7 +1154,14 @@ class SqlAlchemyApiRepository:
             )
             or 0
         )
-        order_code = next((item.order_code for item in documents if item.order_code), None)
+        order_code = next(
+            (
+                value
+                for item in documents
+                if (value := semantics(item, "order_code"))
+            ),
+            None,
+        )
         order = None
         if order_code:
             order = session.scalar(
@@ -998,8 +1174,10 @@ class SqlAlchemyApiRepository:
             {
                 "event_kind": "DOCUMENT",
                 "document_id": str(document.id),
-                "type": document.document_type,
-                "occurred_at": (document.document_timestamp or document.captured_at).isoformat(),
+                "type": semantics(document, "document_type"),
+                "occurred_at": (
+                    semantics(document, "document_timestamp") or document.captured_at
+                ).isoformat(),
                 "total": (
                     str(versions[document.id].gross_total)
                     if document.id in versions and versions[document.id].gross_total is not None
@@ -1125,14 +1303,29 @@ class SqlAlchemyApiRepository:
             id=correlation.transaction_id,
             order_id=order.id if order else None,
             occurred_at=(
-                min((document.document_timestamp or document.captured_at) for document in documents)
+                min(
+                    semantics(document, "document_timestamp") or document.captured_at
+                    for document in documents
+                )
                 if documents
                 else correlation.created_at
             ),
-            table_code=next((item.table_code for item in documents if item.table_code), None),
+            table_code=next(
+                (
+                    value
+                    for item in documents
+                    if (value := semantics(item, "table_code"))
+                ),
+                None,
+            ),
             order_code=order_code,
             operator_code=next(
-                (item.operator_code for item in documents if item.operator_code), None
+                (
+                    value
+                    for item in documents
+                    if (value := semantics(item, "operator_code"))
+                ),
+                None,
             ),
             initial_total=initial,
             pre_bill_total=prebill_total,
@@ -1176,10 +1369,21 @@ class SqlAlchemyApiRepository:
                 select(
                     DocumentCorrelationMember.correlation_id.label("correlation_id"),
                     func.min(
-                        func.coalesce(Document.document_timestamp, Document.captured_at)
+                        func.coalesce(
+                            _version_column(
+                                DocumentVersion.document_timestamp,
+                                Document.document_timestamp,
+                            ),
+                            Document.captured_at,
+                        )
                     ).label("occurred_at"),
                 )
                 .join(Document, Document.id == DocumentCorrelationMember.document_id)
+                .join(
+                    DocumentVersion,
+                    DocumentVersion.document_id == Document.id,
+                )
+                .where(DocumentVersion.id == _latest_version_id())
                 .group_by(DocumentCorrelationMember.correlation_id)
                 .subquery()
             )
@@ -1199,18 +1403,30 @@ class SqlAlchemyApiRepository:
             )
             document_filters = []
             if filters.get("table_code"):
-                document_filters.append(Document.table_code == str(filters["table_code"]))
+                document_filters.append(
+                    _version_column(DocumentVersion.table_code, Document.table_code)
+                    == str(filters["table_code"])
+                )
             if filters.get("order_code"):
-                document_filters.append(Document.order_code == str(filters["order_code"]))
+                document_filters.append(
+                    _version_column(DocumentVersion.order_code, Document.order_code)
+                    == str(filters["order_code"])
+                )
             if filters.get("operator_code"):
                 document_filters.append(
-                    Document.operator_code == str(filters["operator_code"])
+                    _version_column(DocumentVersion.operator_code, Document.operator_code)
+                    == str(filters["operator_code"])
                 )
             if document_filters:
                 statement = statement.where(
                     DocumentCorrelation.id.in_(
                         select(DocumentCorrelationMember.correlation_id)
                         .join(Document, Document.id == DocumentCorrelationMember.document_id)
+                        .join(
+                            DocumentVersion,
+                            DocumentVersion.document_id == Document.id,
+                        )
+                        .where(DocumentVersion.id == _latest_version_id())
                         .where(*document_filters)
                     )
                 )
@@ -1628,10 +1844,19 @@ class SqlAlchemyApiRepository:
         amount = _as_decimal(value.replace(",", "."))
         with self._read() as session:
             document_predicates = [
-                Document.external_document_code.ilike(pattern, escape="\\"),
-                Document.order_code.ilike(pattern, escape="\\"),
-                Document.table_code.ilike(pattern, escape="\\"),
-                Document.operator_code.ilike(pattern, escape="\\"),
+                _version_column(
+                    DocumentVersion.external_document_code,
+                    Document.external_document_code,
+                ).ilike(pattern, escape="\\"),
+                _version_column(DocumentVersion.order_code, Document.order_code).ilike(
+                    pattern, escape="\\"
+                ),
+                _version_column(DocumentVersion.table_code, Document.table_code).ilike(
+                    pattern, escape="\\"
+                ),
+                _version_column(DocumentVersion.operator_code, Document.operator_code).ilike(
+                    pattern, escape="\\"
+                ),
                 Device.external_id.ilike(pattern, escape="\\"),
                 Device.name.ilike(pattern, escape="\\"),
                 DocumentVersion.normalized_text.ilike(pattern, escape="\\"),
@@ -1644,10 +1869,10 @@ class SqlAlchemyApiRepository:
             ]
             if amount is not None:
                 document_predicates.append(DocumentVersion.gross_total == amount)
-            documents = session.scalars(
-                select(Document)
+            document_rows = session.execute(
+                select(Document, DocumentVersion)
                 .join(Device, Device.id == Document.device_id)
-                .outerjoin(DocumentVersion, DocumentVersion.id == _latest_version_id())
+                .join(DocumentVersion, DocumentVersion.id == _latest_version_id())
                 .where(or_(*document_predicates))
                 .order_by(Document.captured_at.desc())
                 .limit(500)
@@ -1656,16 +1881,22 @@ class SqlAlchemyApiRepository:
                 SearchHit(
                     entity_type="DOCUMENT",
                     entity_id=document.id,
-                    occurred_at=document.document_timestamp or document.captured_at,
-                    title=(
-                        document.external_document_code
-                        or document.order_code
-                        or document.document_type
+                    occurred_at=(
+                        _version_value(version, document, "document_timestamp")
+                        or document.captured_at
                     ),
-                    subtitle=f"{document.document_type} · {document.table_code or '-'}",
+                    title=(
+                        _version_value(version, document, "external_document_code")
+                        or _version_value(version, document, "order_code")
+                        or _version_value(version, document, "document_type")
+                    ),
+                    subtitle=(
+                        f"{_version_value(version, document, 'document_type')} · "
+                        f"{_version_value(version, document, 'table_code') or '-'}"
+                    ),
                     highlights=[value],
                 )
-                for document in documents
+                for document, version in document_rows
             ]
             for device in session.scalars(
                 select(Device)
@@ -2747,7 +2978,12 @@ def _sync_devices(factory: sessionmaker[Session], settings: Settings) -> None:
 
 
 def create_api_repository(settings: Settings) -> SqlAlchemyApiRepository:
-    return SqlAlchemyApiRepository.from_url(settings.database_url().get_secret_value())
+    freshness_seconds = max(300.0, settings.ingestion.scan_interval_seconds * 3)
+    return SqlAlchemyApiRepository.from_url(
+        settings.database_url().get_secret_value(),
+        spool_metric_stale_after=timedelta(seconds=freshness_seconds),
+        spool_warning_bytes=settings.ingestion.spool_warning_bytes,
+    )
 
 
 def create_ingestion_repository(settings: Settings) -> SqlAlchemyIngestionRepository:

@@ -73,7 +73,10 @@ def _wrap(value: str, width: int = 42) -> Iterable[str]:
 
 
 def _document_lines(document: Any) -> list[_RenderLine]:
-    normalized = _safe_text(document.normalized_text, fallback="")
+    normalized = _safe_text(
+        getattr(document, "receipt_text", None) or document.normalized_text,
+        fallback="",
+    )
     if len(normalized) > _MAX_SOURCE_CHARACTERS:
         raise DocumentRenderError("normalized document exceeds the PDF rendering safety limit")
 
@@ -138,7 +141,7 @@ def _document_lines(document: Any) -> list[_RenderLine]:
         lines.extend(
             (
                 _RenderLine("-" * 42, "rule"),
-                _RenderLine("TESTO NORMALIZZATO", "label"),
+                _RenderLine("TESTO DOCUMENTO", "label"),
             )
         )
         lines.extend(_RenderLine(value) for value in _wrap(normalized, 42))
