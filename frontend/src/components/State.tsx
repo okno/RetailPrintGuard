@@ -1,4 +1,5 @@
 import { Alert, Box, CircularProgress, Typography } from '@mui/material'
+import { ApiError } from '../api/client'
 
 export function LoadingState({ label = 'Caricamento…' }: { label?: string }) {
   return (
@@ -10,9 +11,16 @@ export function LoadingState({ label = 'Caricamento…' }: { label?: string }) {
 }
 
 export function ErrorState({ error }: { error: unknown }) {
+  const message = error instanceof Error ? error.message : 'Impossibile caricare i dati.'
+  const apiError = error instanceof ApiError ? error : undefined
   return (
     <Alert severity="error" role="alert">
-      {error instanceof Error ? error.message : 'Impossibile caricare i dati.'}
+      <Typography component="span" variant="body2">{message}</Typography>
+      {apiError?.correlationId && (
+        <Typography component="div" variant="caption" sx={{ mt: .5, fontFamily: 'monospace' }}>
+          ID diagnostico: {apiError.correlationId}
+        </Typography>
+      )}
     </Alert>
   )
 }

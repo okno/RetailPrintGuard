@@ -1,13 +1,13 @@
 import { Card, FormControl, InputLabel, MenuItem, Select, Table, TableBody, TableCell, TableHead, TablePagination, TableRow, TextField, Box } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { api } from '../api/client'
+import { api, scopedQueryKey } from '../api/client'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import { PageHeader } from '../components/PageHeader'
 import { StatusChip } from '../components/StatusChip'
 import type { DocumentRecord, Page } from '../types'
+import { mediumDateTime as date } from '../format'
 
-const date = new Intl.DateTimeFormat('it-IT', { dateStyle: 'short', timeStyle: 'medium' })
 const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
 
 export function DocumentsPage() {
@@ -15,7 +15,7 @@ export function DocumentsPage() {
   const navigate = useNavigate()
   const limit = Number(params.get('limit') ?? 25)
   const offset = Number(params.get('offset') ?? 0)
-  const query = useQuery({ queryKey: ['documents', params.toString()], queryFn: () => api<Page<DocumentRecord>>(`/documents?${params.toString() || `limit=${limit}&offset=${offset}`}`) })
+  const query = useQuery({ queryKey: scopedQueryKey('documents', params.toString()), queryFn: () => api<Page<DocumentRecord>>(`/documents?${params.toString() || `limit=${limit}&offset=${offset}`}`) })
   function filter(key: string, value: string) { const next = new URLSearchParams(params); value ? next.set(key, value) : next.delete(key); next.set('offset', '0'); next.set('limit', String(limit)); setParams(next) }
   return <><PageHeader title="Documenti" subtitle="Archivio normalizzato con accesso controllato all’evidenza originale." />
     <Card sx={{ p: 2, mb: 2 }}><Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' }, gap: 2 }}><FormControl size="small"><InputLabel>Tipo</InputLabel><Select label="Tipo" value={params.get('type') ?? ''} onChange={(e) => filter('type', String(e.target.value))}><MenuItem value="">Tutti</MenuItem>{['ORDER','KITCHEN_ORDER','PRE_BILL','MANAGEMENT_DOCUMENT','COMMERCIAL_DOCUMENT','CONFORMING_COPY','CANCELLATION','REPRINT','UNKNOWN'].map((type) => <MenuItem key={type} value={type}>{type.replaceAll('_',' ')}</MenuItem>)}</Select></FormControl><TextField size="small" label="Dispositivo" value={params.get('device_id') ?? ''} onChange={(e) => filter('device_id', e.target.value)} /><TextField size="small" label="Codice ordine" value={params.get('order_code') ?? ''} onChange={(e) => filter('order_code', e.target.value)} /></Box></Card>
