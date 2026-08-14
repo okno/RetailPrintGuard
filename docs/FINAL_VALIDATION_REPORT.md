@@ -4,6 +4,15 @@
 installabile in staging; l'attivazione sui dispositivi reali resta subordinata
 al collaudo controllato descritto nel piano di deployment.
 
+## Addendum hotfix 0.2.1
+
+Il gate successivo alla pubblicazione di `0.2.0` corregge il backup eseguito
+dall'unità systemd senza ampliare le capability. Le copie spool/archive non
+replicano UID/GID e normalizzano i mode di staging a `0750/0640`; il restore
+continua ad applicare identità locali verificate. La suite completa resta verde
+con `123 passed`, `24 skipped` e nessun fallimento. Questo addendum non modifica
+il requisito di collaudo hardware indicato nella decisione originale.
+
 ## Identità candidata
 
 | Campo | Valore |

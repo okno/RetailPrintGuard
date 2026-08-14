@@ -6,6 +6,24 @@
 > risultati finali saranno consolidati in
 > [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
+## Hotfix 0.2.1
+
+**Stato:** completato offline il 14 agosto 2026; hardware e produzione esclusi.
+
+La regressione riproduce `rsync` con capability bounding set vuoto: il comando
+storico termina con codice `23`, mentre la copia con UID/GID esclusi e mode
+normalizzati termina con codice `0` e contenuto identico. Il contratto è stato
+verificato anche sotto sandbox systemd con `RestrictSUIDSGID=yes`.
+
+| Controllo | Risultato |
+|---|---|
+| suite Python completa | `123 passed`, `24 skipped`, `0 failed` |
+| test operativi mirati | `13 passed`, `23 skipped`, `0 failed` |
+| Ruff | PASS |
+| `bash -n` e ShellCheck su backup/libreria | PASS |
+| identità versione backend/frontend | `0.2.1` |
+| `git diff --check` | PASS |
+
 ## Gate candidato 0.2.0
 
 **Stato:** completato offline il 14 agosto 2026; hardware e produzione esclusi.

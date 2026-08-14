@@ -3,6 +3,18 @@
 Tutte le modifiche rilevanti sono documentate in questo file. Il progetto segue
 la struttura di Keep a Changelog.
 
+## [0.2.1] — 2026-08-14
+
+### Fixed
+
+- il backup pianificato conserva contenuti e timestamp senza replicare UID/GID
+  nello staging root-only e normalizza i mode delle evidenze a `0750/0640`;
+  resta quindi compatibile con l'unità systemd priva di `CAP_CHOWN` e con
+  `RestrictSUIDSGID=yes`, mentre il restore applica esplicitamente le identità
+  locali verificate;
+- aggiunta una regressione sul contratto tra hardening dell'unità backup e
+  opzioni `rsync`.
+
 ## [0.2.0] — 2026-08-14
 
 ### Added

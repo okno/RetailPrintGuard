@@ -69,12 +69,18 @@ if [[ -d "${RPG_SPOOL_ROOT}" ]]; then
         [[ "${relative}" != "${job_dir}" && "${relative}" != *".."* ]] || \
             rpg_die "unsafe ready-job path discovered: ${job_dir}"
         install -d -m 0700 -- "${stage}/evidence/spool/$(dirname -- "${relative}")"
-        rsync -a -- "${job_dir}/" "${stage}/evidence/spool/${relative}/"
+        # The hardened unit deliberately has an empty capability bounding
+        # set plus RestrictSUIDSGID. The root-owned staging tree therefore
+        # normalizes evidence modes and restore.sh reapplies trusted ownership.
+        rsync -a --no-owner --no-group --chmod=D0750,F0640 -- \
+            "${job_dir}/" "${stage}/evidence/spool/${relative}/"
     done <"${marker_list}"
     rm -f -- "${marker_list}"
 fi
 if [[ -d "${RPG_ARCHIVE_ROOT}" ]]; then
-    rsync -a --exclude='*.partial' -- "${RPG_ARCHIVE_ROOT}/" \
+    rsync -a --no-owner --no-group --chmod=D0750,F0640 \
+        --exclude='*.partial' -- \
+        "${RPG_ARCHIVE_ROOT}/" \
         "${stage}/evidence/archive/"
 fi
 
