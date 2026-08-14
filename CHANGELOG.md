@@ -3,7 +3,7 @@
 Tutte le modifiche rilevanti sono documentate in questo file. Il progetto segue
 la struttura di Keep a Changelog.
 
-## [Unreleased]
+## [0.3.0] — 2026-08-14
 
 ### Added
 

@@ -6,7 +6,7 @@
 > risultati finali saranno consolidati in
 > [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
-## Candidato parser POS e correlazione `1.2.0`
+## Release 0.3.0 — parser POS e correlazione `1.2.0`
 
 **Stato:** gate offline completato il 14 agosto 2026; nessun RAW o dato
 operativo è incluso nelle fixture pubbliche.

@@ -4,6 +4,24 @@
 installabile in staging; l'attivazione sui dispositivi reali resta subordinata
 al collaudo controllato descritto nel piano di deployment.
 
+## Release 0.3.0
+
+Il candidato `codex/pos-semantic-parser` introduce il parser ESC/POS `1.2.0`,
+la correlazione `rpg-correlation-1.2.0` e la revisione Alembic
+`b7631f2a9c4e`. Il gate finale ha prodotto `135 passed`, `24 skipped` e zero
+fallimenti; Ruff, compileall, quattro test migrazione, Bash/ShellCheck, privacy
+scan, lint, TypeScript, cinque test frontend e build Vite sono passati.
+
+Una verifica operativa read-only su un campione POS autorizzato ha confermato
+job completi, hash/timeline coerenti, nessun drop o errore di forwarding e
+attribuzione corretta ai tre device configurati. I valori operativi e i RAW
+non sono pubblicati. Questa verifica non sostituisce un confronto PCAP
+direct-vs-proxy né dimostra la semantica interna delle stampanti.
+
+Il tag immutabile previsto è `v0.3.0`; la migrazione è append-only e conserva
+RAW e versioni parser precedenti. L'installazione della release e il reparse
+storico restano due change separate con backup e checkpoint intermedi.
+
 ## Addendum hotfix 0.2.1
 
 Il gate successivo alla pubblicazione di `0.2.0` corregge il backup eseguito
