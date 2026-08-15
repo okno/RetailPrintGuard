@@ -1,30 +1,78 @@
-import { DescriptionOutlined, DevicesOutlined, EuroOutlined, ReceiptLongOutlined, ShieldOutlined, WarningAmberOutlined } from '@mui/icons-material'
+import {
+  AssignmentLateOutlined,
+  DescriptionOutlined,
+  DevicesOutlined,
+  EuroOutlined,
+  HistoryOutlined,
+  PriceChangeOutlined,
+  ShieldOutlined,
+  WarningAmberOutlined,
+} from '@mui/icons-material'
 import { Box, Card, CardContent, Grid, LinearProgress, List, ListItem, ListItemText, Typography } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
+import { PeriodPicker } from '../components/PeriodPicker'
 import { StatCard } from '../components/StatCard'
 import { ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
-import type { Dashboard, Device } from '../types'
+import { operationalReductionTransactionsPath } from '../dashboardDrilldown'
+import { apiPeriodParams } from '../period'
+import type { Dashboard, Device, Diagnostics } from '../types'
 
 const euros = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
-const bytes = new Intl.NumberFormat('it-IT', { notation: 'compact', style: 'unit', unit: 'byte' })
+
+function routeWithPeriod(path: string, period: URLSearchParams, extras?: Record<string, string>) {
+  const query = new URLSearchParams()
+  for (const key of ['from', 'to']) {
+    const value = period.get(key)
+    if (value) query.set(key, value)
+  }
+  for (const [key, value] of Object.entries(extras ?? {})) query.set(key, value)
+  return query.size ? `${path}?${query.toString()}` : path
+}
 
 export function DashboardPage() {
-  const dashboard = useQuery({ queryKey: scopedQueryKey('dashboard'), queryFn: () => api<Dashboard>('/dashboard') })
+  const [params, setParams] = useSearchParams()
+  // A seven-day default keeps the latest completed service visible after
+  // midnight while the operator can still switch explicitly to Oggi.
+  const period = apiPeriodParams(params, 'week')
+  const dashboard = useQuery({
+    queryKey: scopedQueryKey('dashboard', period.toString()),
+    queryFn: () => api<Dashboard>(`/dashboard?${period.toString()}`),
+  })
   const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices') })
+  const diagnostics = useQuery({
+    queryKey: scopedQueryKey('system', 'diagnostics'),
+    queryFn: () => api<Diagnostics>('/system/diagnostics'),
+    staleTime: 30_000,
+  })
   if (dashboard.isLoading) return <LoadingState />
   if (dashboard.error || !dashboard.data) return <ErrorState error={dashboard.error} />
   const data = dashboard.data
+  const operationalAlerts = data.operational_alerts ?? data.open_alerts
+  const economicDifference = data.operational_economic_difference ?? data.economic_difference
+  const reductionEpisodes = data.economic_reduction_episodes ?? (Number(economicDifference) > 0 ? 1 : 0)
+  const incompleteJobs = data.incomplete_jobs ?? diagnostics.data?.incomplete_jobs ?? 0
+  const archivedKnown = data.false_positive_alerts !== undefined || data.justified_alerts !== undefined
+  const archived = (data.false_positive_alerts ?? 0) + (data.justified_alerts ?? 0)
   return (
     <>
-      <PageHeader title="Quadro antifrode" subtitle="Evidenze, anomalie e stato dei flussi di stampa in un’unica vista." />
+      <PageHeader
+        title="Quadro antifrode"
+        subtitle="Rischi operativi del periodo: gli alert giustificati o falsi positivi restano nello storico ma non aumentano il rischio."
+        actions={<Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, minmax(150px, 1fr))' }, gap: 1 }}>
+          <PeriodPicker params={params} onChange={setParams} defaultPreset="week" />
+        </Box>}
+      />
       <Grid container spacing={2.2}>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Documenti acquisiti" value={data.documents} helper={`${data.pre_bills} preconti`} icon={<DescriptionOutlined />} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Alert aperti" value={data.open_alerts} helper={`${data.critical_alerts} critici`} icon={<ShieldOutlined />} tone="#b42318" /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Differenze economiche" value={euros.format(Number(data.economic_difference))} helper="alert attivi" icon={<EuroOutlined />} tone="#b54708" /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Spool locale" value={bytes.format(data.spool_bytes)} helper={`${data.parse_errors} errori parsing`} icon={<ReceiptLongOutlined />} tone="#2f6c7e" /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Documenti acquisiti" value={data.documents} helper={`${data.pre_bills} preconti nel periodo`} icon={<DescriptionOutlined />} to={routeWithPeriod('/documenti', period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Alert operativi attivi" value={operationalAlerts} helper={`${data.critical_alerts} critici; escluso lo storico chiuso`} icon={<ShieldOutlined />} tone="#b42318" to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con riduzione" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone="#b54708" to={operationalReductionTransactionsPath(period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Differenza economica unica" value={euros.format(Number(economicDifference))} helper="aggregata per episodio, non per alert" icon={<EuroOutlined />} tone="#b54708" to={operationalReductionTransactionsPath(period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Incompleti da revisionare" value={incompleteJobs} helper="il RAW originale non viene eliminato" icon={<AssignmentLateOutlined />} tone="#7a4e00" to={routeWithPeriod('/incompleti', period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Storico non operativo" value={archivedKnown ? archived : '—'} helper="falsi positivi e giustificati" icon={<HistoryOutlined />} tone="#52606d" to={routeWithPeriod('/alert', period, { view: 'archive' })} /></Grid>
         <Grid size={{ xs: 12, lg: 7 }}>
           <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Copertura documentale</Typography>
             {[

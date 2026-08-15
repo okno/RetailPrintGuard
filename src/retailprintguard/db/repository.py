@@ -21,7 +21,7 @@ from uuid import UUID
 
 from sqlalchemy import Select, and_, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from retailprintguard.api.auth import PasswordService
 from retailprintguard.api.repository import RawArtifact, RepositoryUnavailable
@@ -35,7 +35,9 @@ from retailprintguard.api.schemas import (
     DocumentLineView,
     DocumentView,
     ImportBatchView,
+    JobReviewRequest,
     JobView,
+    LinePriceAttributionView,
     OrderView,
     RoleName,
     RuleView,
@@ -50,6 +52,7 @@ from retailprintguard.common.domain import AlertStatus, DocumentType
 from retailprintguard.common.hashchain import ZERO_HASH, chained_hash
 from retailprintguard.db.models import (
     ActiveParserVersion,
+    AnalysisWatermark,
     AuditLog,
     Device,
     DeviceStatus,
@@ -66,6 +69,7 @@ from retailprintguard.db.models import (
     HashChainHead,
     ImportBatch,
     ImportItem,
+    LinePriceAttribution,
     Order,
     OrderEvent,
     OrderSnapshot,
@@ -94,13 +98,22 @@ from retailprintguard.ingestion.repository import (
     ImportDisposition,
     RepositoryImportResult,
 )
+from retailprintguard.pricing.service import PRICE_ATTRIBUTION_ALGORITHM
 from retailprintguard.render.text import receipt_text
 
 MONEY_ZERO = Decimal("0.0000")
 DEVICE_ACTIVITY_STALE_AFTER = timedelta(minutes=10)
 DEFAULT_SPOOL_METRIC_STALE_AFTER = timedelta(minutes=10)
 DEFAULT_SPOOL_WARNING_BYTES = 1_073_741_824
-FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT.value, DocumentType.REFUND.value}
+SALE_FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT.value}
+OPERATIONAL_ALERT_STATES = ("OPEN", "UNDER_REVIEW", "CONFIRMED")
+ARCHIVED_ALERT_STATES = ("FALSE_POSITIVE", "JUSTIFIED", "CLOSED")
+PRIMARY_ECONOMIC_REDUCTION_RULE = "MODIFICA_POST_PRECONTO"
+COMPAT_ECONOMIC_REDUCTION_RULE = "PREBILL_FISCAL_AMOUNT_DROP"
+ECONOMIC_REDUCTION_RULE_CODES = (
+    PRIMARY_ECONOMIC_REDUCTION_RULE,
+    COMPAT_ECONOMIC_REDUCTION_RULE,
+)
 SOURCE_TYPES = {
     DocumentType.ORDER.value,
     DocumentType.ORDER_CHANGE.value,
@@ -108,6 +121,17 @@ SOURCE_TYPES = {
     DocumentType.PRE_BILL.value,
     DocumentType.MANAGEMENT_DOCUMENT.value,
 }
+
+_VERSION_SEMANTIC_FIELDS = (
+    "document_type",
+    "subtype",
+    "external_document_code",
+    "order_code",
+    "table_code",
+    "operator_code",
+    "terminal_code",
+    "document_timestamp",
+)
 
 
 def _page(limit: int, offset: int, *, maximum: int = 10_000) -> tuple[int, int]:
@@ -139,7 +163,7 @@ def _latest_version_id() -> Any:
 def _version_value(version: DocumentVersion, document: Document, field: str) -> Any:
     """Read immutable semantics, falling back only for a wholly legacy row."""
 
-    if version.document_type is None and version.subtype is None:
+    if all(getattr(version, name) is None for name in _VERSION_SEMANTIC_FIELDS):
         return getattr(document, field)
     return getattr(version, field)
 
@@ -150,8 +174,10 @@ def _version_column(version_column: Any, legacy_column: Any) -> Any:
     return case(
         (
             and_(
-                DocumentVersion.document_type.is_(None),
-                DocumentVersion.subtype.is_(None),
+                *(
+                    getattr(DocumentVersion, name).is_(None)
+                    for name in _VERSION_SEMANTIC_FIELDS
+                )
             ),
             legacy_column,
         ),
@@ -166,6 +192,14 @@ def _as_decimal(value: Any) -> Decimal | None:
         return value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
+
+
+def _as_nonnegative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _aware(value: datetime | None, fallback: datetime) -> datetime:
@@ -252,6 +286,167 @@ def _stored_line_diff(
                     {**common, "before": old["discount"], "after": new["discount"]}
                 )
     return result
+
+
+def _latest_transaction_occurrences() -> Any:
+    """Return one sale occurrence for each current transaction projection.
+
+    The occurrence is derived from the immutable document evidence belonging to
+    the latest non-superseded correlation.  It intentionally does not use the
+    time at which a fraud worker happened to open or re-evaluate an alert.
+    """
+
+    ranked = (
+        select(
+            DocumentCorrelation.id.label("correlation_id"),
+            DocumentCorrelation.transaction_id.label("transaction_id"),
+            func.row_number()
+            .over(
+                partition_by=DocumentCorrelation.transaction_id,
+                order_by=(
+                    DocumentCorrelation.created_at.desc(),
+                    DocumentCorrelation.id.desc(),
+                ),
+            )
+            .label("row_number"),
+        )
+        .where(DocumentCorrelation.status != "SUPERSEDED")
+        .subquery()
+    )
+    return (
+        select(
+            ranked.c.correlation_id,
+            ranked.c.transaction_id,
+            func.min(
+                func.coalesce(
+                    _version_column(
+                        DocumentVersion.document_timestamp,
+                        Document.document_timestamp,
+                    ),
+                    Document.captured_at,
+                )
+            ).label("occurred_at"),
+        )
+        .select_from(ranked)
+        .join(
+            DocumentCorrelationMember,
+            DocumentCorrelationMember.correlation_id == ranked.c.correlation_id,
+        )
+        .join(Document, Document.id == DocumentCorrelationMember.document_id)
+        .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+        .where(
+            ranked.c.row_number == 1,
+            DocumentVersion.id == _latest_version_id(),
+        )
+        .group_by(ranked.c.correlation_id, ranked.c.transaction_id)
+        .subquery()
+    )
+
+
+def _historical_correlation_occurrences() -> Any:
+    """Return immutable occurrence timestamps for every correlation revision."""
+
+    return (
+        select(
+            DocumentCorrelationMember.correlation_id.label("correlation_id"),
+            func.min(
+                func.coalesce(
+                    _version_column(
+                        DocumentVersion.document_timestamp,
+                        Document.document_timestamp,
+                    ),
+                    Document.captured_at,
+                )
+            ).label("occurred_at"),
+        )
+        .join(Document, Document.id == DocumentCorrelationMember.document_id)
+        .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+        .where(DocumentVersion.id == _latest_version_id())
+        .group_by(DocumentCorrelationMember.correlation_id)
+        .subquery()
+    )
+
+
+def _alert_has_device(device_external_id: str) -> Any:
+    """Build an isolated membership predicate for an alert's correlated devices."""
+
+    member = aliased(DocumentCorrelationMember, name="alert_device_member")
+    document = aliased(Document, name="alert_device_document")
+    device = aliased(Device, name="alert_device")
+    return (
+        select(1)
+        .select_from(member)
+        .join(document, document.id == member.document_id)
+        .join(device, device.id == document.device_id)
+        .where(
+            member.correlation_id == FraudAlert.correlation_id,
+            device.external_id == device_external_id,
+        )
+        .correlate(FraudAlert)
+        .exists()
+    )
+
+
+def _alert_has_operator(operator_code: str) -> Any:
+    """Match an operator from the active immutable parser version.
+
+    The mutable ``documents`` projection is consulted only when the selected
+    version is a wholly legacy row, mirroring :func:`_version_value` without
+    allowing values produced by an inactive shadow parser to leak into filters.
+    All aliases are local to the ``EXISTS`` predicate so it can be combined with
+    the independent device predicate without duplicate JOIN names.
+    """
+
+    member = aliased(DocumentCorrelationMember, name="alert_operator_member")
+    document = aliased(Document, name="alert_operator_document")
+    version = aliased(DocumentVersion, name="alert_operator_version")
+    candidate = aliased(DocumentVersion, name="alert_operator_candidate")
+    parser = aliased(ParserVersion, name="alert_operator_parser")
+    active = aliased(ActiveParserVersion, name="alert_operator_active_parser")
+    selected_version_id = (
+        select(candidate.id)
+        .join(parser, parser.id == candidate.parser_version_id)
+        .outerjoin(active, active.parser_name == parser.name)
+        .where(candidate.document_id == document.id)
+        .order_by(
+            (active.parser_version_id == candidate.parser_version_id).desc(),
+            candidate.version_sequence.desc(),
+            candidate.id.desc(),
+        )
+        .limit(1)
+        .correlate(document)
+        .scalar_subquery()
+    )
+    effective_operator = case(
+        (
+            and_(
+                *(
+                    getattr(version, field).is_(None)
+                    for field in _VERSION_SEMANTIC_FIELDS
+                )
+            ),
+            document.operator_code,
+        ),
+        else_=version.operator_code,
+    )
+    return (
+        select(1)
+        .select_from(member)
+        .join(document, document.id == member.document_id)
+        .join(
+            version,
+            and_(
+                version.document_id == document.id,
+                version.id == selected_version_id,
+            ),
+        )
+        .where(
+            member.correlation_id == FraudAlert.correlation_id,
+            effective_operator == operator_code,
+        )
+        .correlate(FraudAlert)
+        .exists()
+    )
 
 
 class SqlAlchemyApiRepository:
@@ -345,8 +540,22 @@ class SqlAlchemyApiRepository:
                 active=user.active,
             )
 
-    def dashboard(self) -> DashboardView:
+    def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView:
+        filters = filters or {}
         with self._read() as session:
+            document_period = []
+            occurrence = _latest_transaction_occurrences()
+            archive_occurrence = _historical_correlation_occurrences()
+            episode_period = []
+            archive_period = []
+            if filters.get("from") is not None:
+                document_period.append(Document.captured_at >= filters["from"])
+                episode_period.append(occurrence.c.occurred_at >= filters["from"])
+                archive_period.append(archive_occurrence.c.occurred_at >= filters["from"])
+            if filters.get("to") is not None:
+                document_period.append(Document.captured_at < filters["to"])
+                episode_period.append(occurrence.c.occurred_at < filters["to"])
+                archive_period.append(archive_occurrence.c.occurred_at < filters["to"])
             semantic_type = _version_column(
                 DocumentVersion.document_type,
                 Document.document_type,
@@ -355,7 +564,7 @@ class SqlAlchemyApiRepository:
                 select(semantic_type)
                 .select_from(DocumentVersion)
                 .join(Document, Document.id == DocumentVersion.document_id)
-                .where(DocumentVersion.id == _latest_version_id())
+                .where(DocumentVersion.id == _latest_version_id(), *document_period)
                 .subquery()
             )
             type_counts = dict(
@@ -378,14 +587,18 @@ class SqlAlchemyApiRepository:
                     DocumentType.KITCHEN_ORDER,
                 )
             )
-            open_states = ("OPEN", "UNDER_REVIEW")
             open_alerts = (
                 session.scalar(
                     select(func.count())
                     .select_from(FraudAlert)
+                    .join(
+                        occurrence,
+                        occurrence.c.transaction_id == FraudAlert.transaction_id,
+                    )
                     .where(
                         FraudAlert.is_canonical.is_(True),
-                        FraudAlert.status.in_(open_states),
+                        FraudAlert.status.in_(OPERATIONAL_ALERT_STATES),
+                        *episode_period,
                     )
                 )
                 or 0
@@ -394,22 +607,131 @@ class SqlAlchemyApiRepository:
                 session.scalar(
                     select(func.count())
                     .select_from(FraudAlert)
+                    .join(
+                        occurrence,
+                        occurrence.c.transaction_id == FraudAlert.transaction_id,
+                    )
                     .where(
                         FraudAlert.is_canonical.is_(True),
-                        FraudAlert.status.in_(open_states),
+                        FraudAlert.status.in_(OPERATIONAL_ALERT_STATES),
                         FraudAlert.severity == "CRITICAL",
+                        *episode_period,
                     )
                 )
                 or 0
             )
+            economic_candidates = (
+                select(
+                    FraudAlert.transaction_id.label("transaction_id"),
+                    func.max(
+                        case(
+                            (
+                                FraudRule.code == PRIMARY_ECONOMIC_REDUCTION_RULE,
+                                FraudAlert.difference_amount,
+                            ),
+                            else_=None,
+                        )
+                    ).label("primary_difference"),
+                    func.max(
+                        case(
+                            (
+                                FraudRule.code == COMPAT_ECONOMIC_REDUCTION_RULE,
+                                FraudAlert.difference_amount,
+                            ),
+                            else_=None,
+                        )
+                    ).label("compat_difference"),
+                )
+                .select_from(FraudAlert)
+                .join(
+                    FraudRuleVersion,
+                    FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
+                )
+                .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+                .join(
+                    occurrence,
+                    occurrence.c.transaction_id == FraudAlert.transaction_id,
+                )
+                .where(
+                    FraudAlert.is_canonical.is_(True),
+                    FraudAlert.status.in_(OPERATIONAL_ALERT_STATES),
+                    FraudAlert.transaction_id.is_not(None),
+                    FraudAlert.difference_amount > MONEY_ZERO,
+                    FraudRule.code.in_(ECONOMIC_REDUCTION_RULE_CODES),
+                    *episode_period,
+                )
+                .group_by(FraudAlert.transaction_id)
+                .subquery()
+            )
+            economic_difference = func.coalesce(
+                economic_candidates.c.primary_difference,
+                economic_candidates.c.compat_difference,
+            )
+            economic_episodes = (
+                select(
+                    economic_candidates.c.transaction_id,
+                    economic_difference.label("difference_amount"),
+                )
+                .where(economic_difference > MONEY_ZERO)
+                .subquery()
+            )
+            economic_episode_count = (
+                session.scalar(select(func.count()).select_from(economic_episodes)) or 0
+            )
             economic = (
                 session.scalar(
-                    select(func.coalesce(func.sum(FraudAlert.difference_amount), 0)).where(
-                        FraudAlert.is_canonical.is_(True),
-                        FraudAlert.status.in_(open_states)
-                    )
+                    select(func.coalesce(func.sum(economic_episodes.c.difference_amount), 0))
                 )
                 or MONEY_ZERO
+            )
+            false_positives = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(FraudAlert)
+                    .join(
+                        archive_occurrence,
+                        archive_occurrence.c.correlation_id == FraudAlert.correlation_id,
+                    )
+                    .where(
+                        FraudAlert.is_canonical.is_(True),
+                        FraudAlert.status == "FALSE_POSITIVE",
+                        *archive_period,
+                    )
+                )
+                or 0
+            )
+            justified = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(FraudAlert)
+                    .join(
+                        archive_occurrence,
+                        archive_occurrence.c.correlation_id == FraudAlert.correlation_id,
+                    )
+                    .where(
+                        FraudAlert.is_canonical.is_(True),
+                        FraudAlert.status == "JUSTIFIED",
+                        *archive_period,
+                    )
+                )
+                or 0
+            )
+            incomplete_period = []
+            if filters.get("from") is not None:
+                incomplete_period.append(PrintJob.captured_at >= filters["from"])
+            if filters.get("to") is not None:
+                incomplete_period.append(PrintJob.captured_at < filters["to"])
+            incomplete_jobs = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(PrintJob)
+                    .where(
+                        self._incomplete_job_predicate(),
+                        PrintJob.review_state == "PENDING",
+                        *incomplete_period,
+                    )
+                )
+                or 0
             )
             device_count = session.scalar(select(func.count()).select_from(Device)) or 0
             latest_status = self._latest_device_statuses(session)
@@ -432,6 +754,7 @@ class SqlAlchemyApiRepository:
                     .where(
                         DocumentVersion.id == _latest_version_id(),
                         func.coalesce(json_length, 0) > 0,
+                        *document_period,
                     )
                 )
                 or 0
@@ -439,10 +762,19 @@ class SqlAlchemyApiRepository:
             trend = [
                 {"date": str(day), "count": count}
                 for day, count in session.execute(
-                    select(func.date(FraudAlert.opened_at), func.count())
-                    .where(FraudAlert.is_canonical.is_(True))
-                    .group_by(func.date(FraudAlert.opened_at))
-                    .order_by(func.date(FraudAlert.opened_at).desc())
+                    select(func.date(occurrence.c.occurred_at), func.count())
+                    .select_from(FraudAlert)
+                    .join(
+                        occurrence,
+                        occurrence.c.transaction_id == FraudAlert.transaction_id,
+                    )
+                    .where(
+                        FraudAlert.is_canonical.is_(True),
+                        FraudAlert.status.in_(OPERATIONAL_ALERT_STATES),
+                        *episode_period,
+                    )
+                    .group_by(func.date(occurrence.c.occurred_at))
+                    .order_by(func.date(occurrence.c.occurred_at).desc())
                     .limit(30)
                 ).all()
             ]
@@ -460,6 +792,12 @@ class SqlAlchemyApiRepository:
                 spool_bytes=spool_bytes,
                 parse_errors=parse_errors,
                 alert_trend=trend,
+                operational_alerts=open_alerts,
+                economic_reduction_episodes=economic_episode_count,
+                operational_economic_difference=economic,
+                incomplete_jobs=incomplete_jobs,
+                false_positive_alerts=false_positives,
+                justified_alerts=justified,
             )
 
     def diagnostics(self) -> DiagnosticsView:
@@ -496,11 +834,10 @@ class SqlAlchemyApiRepository:
                     .select_from(PrintJob)
                     .where(
                         or_(
-                            PrintJob.capture_complete.is_(False),
-                            PrintJob.timeline_complete.is_(False),
-                            PrintJob.status.in_(("FAILED", "INCOMPLETE", "MALFORMED")),
-                            PrintJob.import_status.in_(("FAILED", "QUARANTINED")),
-                        )
+                            self._incomplete_job_predicate(),
+                            PrintJob.import_status.in_(("PARSE_RETRY", "PARSE_FAILED")),
+                        ),
+                        PrintJob.review_state == "PENDING",
                     )
                 )
                 or 0
@@ -685,6 +1022,42 @@ class SqlAlchemyApiRepository:
                 for item, device in rows
             ], count
 
+    @staticmethod
+    def _incomplete_job_predicate() -> Any:
+        return or_(
+            PrintJob.capture_complete.is_(False),
+            PrintJob.timeline_complete.is_(False),
+            PrintJob.status.in_(("FAILED", "INCOMPLETE", "MALFORMED")),
+            PrintJob.import_status.in_(
+                ("FAILED", "QUARANTINED", "PARSE_RETRY", "PARSE_FAILED")
+            ),
+        )
+
+    @staticmethod
+    def _job_view(
+        job: PrintJob, device: Device, direction_sizes: dict[str, int]
+    ) -> JobView:
+        return JobView(
+            id=job.id,
+            device_id=device.external_id,
+            session_id=job.session_id,
+            external_job_id=job.source_job_id,
+            captured_at=job.captured_at,
+            status=job.status,
+            request_bytes=int(direction_sizes.get("CLIENT_TO_DEVICE", 0) or 0),
+            response_bytes=int(direction_sizes.get("DEVICE_TO_CLIENT", 0) or 0),
+            manifest_sha256=job.manifest_sha256,
+            spool_path=job.manifest_path,
+            imported_at=job.imported_at,
+            parser_status=job.import_status,
+            warnings=[str(value) for value in (job.warnings or [])],
+            review_state=job.review_state,
+            analysis_excluded=job.analysis_excluded,
+            reviewed_at=job.reviewed_at,
+            reviewed_by=job.reviewed_by_user_id,
+            review_reason=job.review_reason,
+        )
+
     def list_jobs(
         self, *, limit: int, offset: int, filters: dict[str, Any]
     ) -> tuple[list[JobView], int]:
@@ -695,6 +1068,19 @@ class SqlAlchemyApiRepository:
                 statement = statement.where(Device.external_id == str(filters["device_id"]))
             if filters.get("status"):
                 statement = statement.where(PrintJob.status == str(filters["status"]))
+            incomplete = self._incomplete_job_predicate()
+            if filters.get("incomplete") is True:
+                statement = statement.where(incomplete)
+            elif filters.get("incomplete") is False:
+                statement = statement.where(~incomplete)
+            if filters.get("from") is not None:
+                statement = statement.where(PrintJob.captured_at >= filters["from"])
+            if filters.get("to") is not None:
+                statement = statement.where(PrintJob.captured_at < filters["to"])
+            if filters.get("review_state"):
+                statement = statement.where(
+                    PrintJob.review_state == str(filters["review_state"])
+                )
             count = (
                 session.scalar(
                     select(func.count()).select_from(statement.order_by(None).subquery())
@@ -720,24 +1106,206 @@ class SqlAlchemyApiRepository:
             result: list[JobView] = []
             for job, device in rows:
                 direction_sizes = sizes[job.id]
-                result.append(
-                    JobView(
-                        id=job.id,
-                        device_id=device.external_id,
-                        session_id=job.session_id,
-                        external_job_id=job.source_job_id,
-                        captured_at=job.captured_at,
-                        status=job.status,
-                        request_bytes=int(direction_sizes.get("CLIENT_TO_DEVICE", 0) or 0),
-                        response_bytes=int(direction_sizes.get("DEVICE_TO_CLIENT", 0) or 0),
-                        manifest_sha256=job.manifest_sha256,
-                        spool_path=job.manifest_path,
-                        imported_at=job.imported_at,
-                        parser_status=job.import_status,
-                        warnings=[str(value) for value in (job.warnings or [])],
+                result.append(self._job_view(job, device, direction_sizes))
+            return result, count
+
+    def review_job(
+        self,
+        job_id: UUID,
+        review: JobReviewRequest,
+        actor: UserPrincipal,
+        *,
+        correlation_id: str,
+    ) -> JobView | None:
+        state_by_action = {
+            "VERIFY_USABLE": ("VERIFIED_USABLE", False),
+            "EXCLUDE_FROM_ANALYSIS": ("EXCLUDED", True),
+            # Reopening means "needs a new decision", not implicit trust.  Keep
+            # incomplete evidence out of analysis until VERIFY_USABLE explicitly
+            # clears the exclusion.
+            "REOPEN_REVIEW": ("PENDING", True),
+        }
+        now = datetime.now(UTC)
+        with self._write() as session:
+            row = session.execute(
+                select(PrintJob, Device)
+                .join(Device)
+                .where(PrintJob.id == job_id)
+                .with_for_update()
+            ).one_or_none()
+            if row is None:
+                return None
+            job, device = row
+            is_incomplete = bool(
+                not job.capture_complete
+                or not job.timeline_complete
+                or job.status in {"FAILED", "INCOMPLETE", "MALFORMED"}
+                or job.import_status
+                in {"FAILED", "QUARANTINED", "PARSE_RETRY", "PARSE_FAILED"}
+            )
+            if not is_incomplete:
+                raise ValueError("only technically incomplete jobs can be reviewed")
+            target_state, excluded = state_by_action[review.action]
+            previous_state = job.review_state
+            previous_excluded = job.analysis_excluded
+            job.review_state = target_state
+            job.analysis_excluded = excluded
+            job.reviewed_at = now
+            job.reviewed_by_user_id = actor.id
+            job.review_reason = review.reason
+            watermark = session.get(AnalysisWatermark, "correlation")
+            if watermark is not None:
+                session.delete(watermark)
+            if excluded:
+                self._justify_alerts_for_excluded_job(
+                    session,
+                    job=job,
+                    actor=actor,
+                    reason=review.reason,
+                    occurred_at=now,
+                )
+            # Re-inclusion deliberately does not resurrect historical correlations or
+            # alerts here.  Clearing the correlation watermark schedules a fresh,
+            # deterministic replay; only a finding that still exists in that replay
+            # may become operational again.  This prevents an old correlation that
+            # had already been superseded for another reason from being revived.
+            self._append_audit_session(
+                session,
+                AuditEntry(
+                    actor_id=actor.id,
+                    action=f"JOB_REVIEW_{review.action}",
+                    entity_type="print_job",
+                    entity_id=str(job.id),
+                    correlation_id=correlation_id,
+                    occurred_at=now,
+                    metadata={
+                        "previous_review_state": previous_state,
+                        "new_review_state": target_state,
+                        "previous_analysis_excluded": previous_excluded,
+                        "analysis_excluded": excluded,
+                        "reason": review.reason,
+                    },
+                ),
+            )
+            direction_sizes = {
+                direction: int(byte_count or 0)
+                for direction, byte_count in session.execute(
+                    select(RawPayload.direction, func.sum(RawPayload.byte_count))
+                    .where(RawPayload.job_id == job.id)
+                    .group_by(RawPayload.direction)
+                )
+            }
+            session.flush()
+            return self._job_view(job, device, direction_sizes)
+
+    @staticmethod
+    def _justify_alerts_for_excluded_job(
+        session: Session,
+        *,
+        job: PrintJob,
+        actor: UserPrincipal,
+        reason: str,
+        occurred_at: datetime,
+    ) -> None:
+        document_ids = set(
+            session.scalars(select(Document.id).where(Document.job_id == job.id))
+        )
+        if not document_ids:
+            return
+        correlation_ids = set(
+            session.scalars(
+                select(DocumentCorrelationMember.correlation_id).where(
+                    DocumentCorrelationMember.document_id.in_(document_ids)
+                )
+            )
+        )
+        if not correlation_ids:
+            return
+        correlations = session.scalars(
+            select(DocumentCorrelation)
+            .where(
+                DocumentCorrelation.id.in_(correlation_ids),
+                DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
+            )
+            .with_for_update()
+        ).all()
+        for correlation in correlations:
+            correlation.status = "SUPERSEDED"
+        alerts = session.scalars(
+            select(FraudAlert)
+            .where(
+                FraudAlert.correlation_id.in_(correlation_ids),
+                FraudAlert.is_canonical.is_(True),
+                FraudAlert.status.in_(OPERATIONAL_ALERT_STATES),
+            )
+            .order_by(FraudAlert.opened_at, FraudAlert.id)
+            .with_for_update()
+        ).all()
+        for alert in alerts:
+            previous_status = alert.status
+            alert.status = "JUSTIFIED"
+            alert.closed_at = occurred_at
+            alert.updated_at = occurred_at
+            alert.closure_reason = (
+                "Evidenza tecnica esclusa dall'analisi da un amministratore: " + reason
+            )
+            evidence_sequence = (
+                session.scalar(
+                    select(func.max(FraudAlertEvidence.sequence)).where(
+                        FraudAlertEvidence.fraud_alert_id == alert.id
                     )
                 )
-            return result, count
+                or 0
+            ) + 1
+            session.add(
+                FraudAlertEvidence(
+                    fraud_alert_id=alert.id,
+                    sequence=evidence_sequence,
+                    print_job_id=job.id,
+                    evidence_type="JOB_EXCLUDED_FROM_ANALYSIS",
+                    summary="Alert giustificato dopo esclusione auditata del job incompleto",
+                    evidence={
+                        "kind": "job_excluded_from_analysis",
+                        "job_id": str(job.id),
+                        "reason": reason,
+                    },
+                )
+            )
+            latest = session.scalar(
+                select(FraudAlertHistory)
+                .where(FraudAlertHistory.fraud_alert_id == alert.id)
+                .order_by(FraudAlertHistory.sequence.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            sequence = 1 if latest is None else latest.sequence + 1
+            previous_hash = ZERO_HASH if latest is None else latest.record_hash
+            history_payload = {
+                "alert_id": str(alert.id),
+                "sequence": sequence,
+                "actor_user_id": str(actor.id),
+                "event_type": "ALERT_JOB_EXCLUDED",
+                "previous_status": previous_status,
+                "new_status": "JUSTIFIED",
+                "note": None,
+                "reason": alert.closure_reason,
+                "occurred_at": occurred_at.isoformat(),
+                "previous_hash": previous_hash,
+            }
+            session.add(
+                FraudAlertHistory(
+                    fraud_alert_id=alert.id,
+                    sequence=sequence,
+                    actor_user_id=actor.id,
+                    event_type="ALERT_JOB_EXCLUDED",
+                    previous_status=previous_status,
+                    new_status="JUSTIFIED",
+                    reason=alert.closure_reason,
+                    occurred_at=occurred_at,
+                    previous_record_hash=previous_hash,
+                    record_hash=chained_hash(history_payload, previous_hash),
+                )
+            )
 
     def _document_views(
         self, session: Session, documents: Sequence[Document]
@@ -770,6 +1338,7 @@ class SqlAlchemyApiRepository:
         }
         version_ids = [version.id for version in versions]
         lines_by_version: dict[UUID, list[DocumentLine]] = {}
+        price_attributions_by_line: dict[UUID, list[LinePriceAttribution]] = {}
         payments_by_version: dict[UUID, list[Payment]] = {}
         for line in session.scalars(
             select(DocumentLine)
@@ -777,6 +1346,32 @@ class SqlAlchemyApiRepository:
             .order_by(DocumentLine.document_version_id, DocumentLine.sequence)
         ):
             lines_by_version.setdefault(line.document_version_id, []).append(line)
+        line_ids = {
+            line.id for version_lines in lines_by_version.values() for line in version_lines
+        }
+        if line_ids:
+            for attribution in session.scalars(
+                select(LinePriceAttribution)
+                .join(
+                    DocumentCorrelation,
+                    DocumentCorrelation.id == LinePriceAttribution.correlation_id,
+                )
+                .where(
+                    LinePriceAttribution.target_line_id.in_(line_ids),
+                    LinePriceAttribution.algorithm_version
+                    == PRICE_ATTRIBUTION_ALGORITHM,
+                    DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
+                )
+                .order_by(
+                    LinePriceAttribution.target_line_id,
+                    LinePriceAttribution.source_observed_at,
+                    LinePriceAttribution.source_kind,
+                    LinePriceAttribution.id,
+                )
+            ):
+                price_attributions_by_line.setdefault(
+                    attribution.target_line_id, []
+                ).append(attribution)
         for payment in session.scalars(
             select(Payment)
             .where(Payment.document_version_id.in_(version_ids))
@@ -825,6 +1420,11 @@ class SqlAlchemyApiRepository:
                     table_code=_version_value(version, document, "table_code"),
                     operator_code=_version_value(version, document, "operator_code"),
                     terminal_code=_version_value(version, document, "terminal_code"),
+                    covers=_as_nonnegative_int(
+                        (version.raw_metadata or {}).get("covers")
+                        if isinstance(version.raw_metadata, dict)
+                        else None
+                    ),
                     document_timestamp=_version_value(
                         version, document, "document_timestamp"
                     ),
@@ -844,6 +1444,7 @@ class SqlAlchemyApiRepository:
                     warnings=[str(value) for value in (version.warnings or [])],
                     lines=[
                         DocumentLineView(
+                            id=line.id,
                             sequence=line.sequence,
                             course_code=line.course_code,
                             item_code=line.item_code,
@@ -859,6 +1460,9 @@ class SqlAlchemyApiRepository:
                             removed=line.removed,
                             cancelled=line.cancelled,
                             raw_text=line.raw_text,
+                            **self._line_price_projection(
+                                price_attributions_by_line.get(line.id, [])
+                            ),
                         )
                         for line in lines
                     ],
@@ -887,6 +1491,90 @@ class SqlAlchemyApiRepository:
                 )
             )
         return result
+
+    @staticmethod
+    def _line_price_projection(
+        attributions: Sequence[LinePriceAttribution],
+    ) -> dict[str, Any]:
+        views = [
+            LinePriceAttributionView(
+                id=item.id,
+                correlation_id=item.correlation_id,
+                source_document_id=item.source_document_id,
+                source_document_version_id=item.source_document_version_id,
+                source_line_id=item.source_line_id,
+                source_kind=item.source_kind,
+                observed_unit_price=item.observed_unit_price,
+                observed_line_total=item.observed_line_total,
+                confidence=item.confidence,
+                status=item.status,
+                match_basis=item.match_basis,
+                algorithm_version=item.algorithm_version,
+                criteria=item.criteria or {},
+                source_observed_at=item.source_observed_at,
+            )
+            for item in attributions
+        ]
+        # The display projection is deliberately separate from the observed
+        # POS unit_price.  A value is promoted only when every usable source
+        # agrees.  Price changes across prebill/management/fiscal evidence are
+        # retained as provenance and surfaced as a conflict, never hidden by
+        # choosing the latest document.
+        eligible = [
+            item
+            for item in attributions
+            if item.status in {"RESOLVED", "AGREED"}
+            and item.observed_unit_price is not None
+        ]
+        observed_unit_prices = {
+            item.observed_unit_price
+            for item in attributions
+            if item.observed_unit_price is not None
+        }
+        observed_line_totals = {
+            item.observed_line_total
+            for item in attributions
+            if item.observed_line_total is not None
+        }
+        conflicting_sources = (
+            any(
+                item.status == "AMBIGUOUS"
+                and (
+                    item.observed_unit_price is not None
+                    or item.observed_line_total is not None
+                )
+                for item in attributions
+            )
+            or len(observed_unit_prices) > 1
+            or len(observed_line_totals) > 1
+        )
+        priorities = {"FISCAL": 3, "MANAGEMENT": 2, "PREBILL": 1}
+        selected = (
+            None
+            if conflicting_sources
+            else max(
+                eligible,
+                key=lambda item: (
+                    priorities.get(item.source_kind, 0),
+                    item.source_observed_at,
+                    str(item.id),
+                ),
+                default=None,
+            )
+        )
+        return {
+            "derived_unit_price": (
+                None if selected is None else selected.observed_unit_price
+            ),
+            "derived_price_source": (
+                "CONFLICTING_SOURCES"
+                if conflicting_sources
+                else None
+                if selected is None
+                else selected.source_kind
+            ),
+            "price_attributions": views,
+        }
 
     def _document_view(self, session: Session, document: Document) -> DocumentView | None:
         views = self._document_views(session, [document])
@@ -921,6 +1609,10 @@ class SqlAlchemyApiRepository:
                 statement = statement.where(
                     semantic_order_code == str(filters["order_code"])
                 )
+            if filters.get("from") is not None:
+                statement = statement.where(Document.captured_at >= filters["from"])
+            if filters.get("to") is not None:
+                statement = statement.where(Document.captured_at < filters["to"])
             count = (
                 session.scalar(
                     select(func.count()).select_from(statement.order_by(None).subquery())
@@ -1115,10 +1807,34 @@ class SqlAlchemyApiRepository:
         prebill_documents = [
             document for document in documents if semantics(document, "document_type") == "PRE_BILL"
         ]
-        fiscal_documents = [
+        commercial_documents = [
             document
             for document in documents
-            if semantics(document, "document_type") in FISCAL_TYPES
+            if semantics(document, "document_type") in SALE_FISCAL_TYPES
+        ]
+        fiscal_documents = [
+            document
+            for document in commercial_documents
+            if document.id in versions
+            and versions[document.id].complete
+            and versions[document.id].gross_total is not None
+        ]
+        economic_closures = [
+            document
+            for document in documents
+            if semantics(document, "document_type") == DocumentType.MANAGEMENT_DOCUMENT.value
+            and document.id in versions
+            and versions[document.id].gross_total is not None
+            and isinstance(versions[document.id].raw_metadata, dict)
+            and (
+                bool(versions[document.id].raw_metadata.get("economic_close"))
+                or versions[document.id].raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+            )
+        ]
+        cancellation_documents = [
+            document
+            for document in documents
+            if semantics(document, "document_type") == DocumentType.CANCELLATION.value
         ]
         prebill_total = (
             versions[prebill_documents[-1].id].gross_total
@@ -1126,14 +1842,29 @@ class SqlAlchemyApiRepository:
             else None
         )
         fiscal_total = sum(
-            (
-                -(versions[document.id].gross_total or MONEY_ZERO)
-                if semantics(document, "document_type") == "REFUND"
-                else (versions[document.id].gross_total or MONEY_ZERO)
-            )
+            (versions[document.id].gross_total or MONEY_ZERO)
             for document in fiscal_documents
-            if document.id in versions
         )
+        management_total = sum(
+            (versions[document.id].gross_total or MONEY_ZERO)
+            for document in economic_closures
+        )
+        if fiscal_documents:
+            observed_final_total: Decimal | None = fiscal_total
+            final_documents = fiscal_documents
+            settlement_basis = "FISCAL"
+        elif economic_closures:
+            observed_final_total = management_total
+            final_documents = economic_closures
+            settlement_basis = "ECONOMIC_MANAGEMENT_CLOSE"
+        elif cancellation_documents:
+            observed_final_total = MONEY_ZERO
+            final_documents = cancellation_documents
+            settlement_basis = "CANCELLATION"
+        else:
+            observed_final_total = None
+            final_documents = []
+            settlement_basis = "PARTIAL_FISCAL" if commercial_documents else "NONE"
         initial = next(
             (
                 versions[document.id].gross_total
@@ -1150,6 +1881,7 @@ class SqlAlchemyApiRepository:
                 .where(
                     FraudAlert.is_canonical.is_(True),
                     FraudAlert.transaction_id == correlation.transaction_id,
+                    FraudAlert.status.in_(OPERATIONAL_ALERT_STATES),
                 )
             )
             or 0
@@ -1162,8 +1894,14 @@ class SqlAlchemyApiRepository:
             ),
             None,
         )
-        order = None
-        if order_code:
+        order = session.scalar(
+            select(Order)
+            .join(OrderEvent, OrderEvent.order_id == Order.id)
+            .where(OrderEvent.source_document_id.in_([document.id for document in documents]))
+            .order_by(OrderEvent.occurred_at.desc(), Order.id.desc())
+            .limit(1)
+        )
+        if order is None and order_code:
             order = session.scalar(
                 select(Order)
                 .where(Order.order_code == order_code)
@@ -1287,18 +2025,22 @@ class SqlAlchemyApiRepository:
                         .order_by(DocumentLine.sequence)
                     )
                 )
-        fiscal_version_ids = [
-            versions[document.id].id for document in fiscal_documents if document.id in versions
+        final_version_ids = [
+            versions[document.id].id for document in final_documents if document.id in versions
         ]
-        if fiscal_version_ids:
+        if final_version_ids:
             fiscal_lines = list(
                 session.scalars(
                     select(DocumentLine)
-                    .where(DocumentLine.document_version_id.in_(fiscal_version_ids))
+                    .where(DocumentLine.document_version_id.in_(final_version_ids))
                     .order_by(DocumentLine.document_version_id, DocumentLine.sequence)
                 )
             )
-        difference = None if prebill_total is None else prebill_total - fiscal_total
+        difference = (
+            None
+            if prebill_total is None or observed_final_total is None
+            else prebill_total - observed_final_total
+        )
         return TransactionView(
             id=correlation.transaction_id,
             order_id=order.id if order else None,
@@ -1329,7 +2071,7 @@ class SqlAlchemyApiRepository:
             ),
             initial_total=initial,
             pre_bill_total=prebill_total,
-            fiscal_total=fiscal_total,
+            fiscal_total=observed_final_total,
             difference=difference,
             status="ALERT" if alert_count else "CORRELATED",
             document_count=len(documents),
@@ -1338,7 +2080,11 @@ class SqlAlchemyApiRepository:
             timeline=timeline,
             diff={
                 "pre_bill_total": str(prebill_total) if prebill_total is not None else None,
-                "fiscal_total": str(fiscal_total),
+                "fiscal_total": str(fiscal_total) if fiscal_documents else None,
+                "observed_final_total": (
+                    str(observed_final_total) if observed_final_total is not None else None
+                ),
+                "settlement_basis": settlement_basis,
                 "difference": str(difference) if difference is not None else None,
                 "lines": _stored_line_diff(prebill_lines, fiscal_lines),
             },
@@ -1349,54 +2095,10 @@ class SqlAlchemyApiRepository:
     ) -> tuple[list[TransactionView], int]:
         limit, offset = _page(limit, offset)
         with self._read() as session:
-            ranked = (
-                select(
-                    DocumentCorrelation.id.label("correlation_id"),
-                    func.row_number()
-                    .over(
-                        partition_by=DocumentCorrelation.transaction_id,
-                        order_by=(
-                            DocumentCorrelation.created_at.desc(),
-                            DocumentCorrelation.id.desc(),
-                        ),
-                    )
-                    .label("row_number"),
-                )
-                .where(DocumentCorrelation.status != "SUPERSEDED")
-                .subquery()
-            )
-            occurrence = (
-                select(
-                    DocumentCorrelationMember.correlation_id.label("correlation_id"),
-                    func.min(
-                        func.coalesce(
-                            _version_column(
-                                DocumentVersion.document_timestamp,
-                                Document.document_timestamp,
-                            ),
-                            Document.captured_at,
-                        )
-                    ).label("occurred_at"),
-                )
-                .join(Document, Document.id == DocumentCorrelationMember.document_id)
-                .join(
-                    DocumentVersion,
-                    DocumentVersion.document_id == Document.id,
-                )
-                .where(DocumentVersion.id == _latest_version_id())
-                .group_by(DocumentCorrelationMember.correlation_id)
-                .subquery()
-            )
+            occurrence = _latest_transaction_occurrences()
             statement: Select[Any] = (
                 select(DocumentCorrelation)
                 .join(
-                    ranked,
-                    and_(
-                        ranked.c.correlation_id == DocumentCorrelation.id,
-                        ranked.c.row_number == 1,
-                    ),
-                )
-                .outerjoin(
                     occurrence,
                     occurrence.c.correlation_id == DocumentCorrelation.id,
                 )
@@ -1430,11 +2132,36 @@ class SqlAlchemyApiRepository:
                         .where(*document_filters)
                     )
                 )
+            if filters.get("operational_economic_only"):
+                economic_transactions = (
+                    select(FraudAlert.transaction_id)
+                    .select_from(FraudAlert)
+                    .join(
+                        FraudRuleVersion,
+                        FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
+                    )
+                    .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+                    .where(
+                        FraudAlert.is_canonical.is_(True),
+                        FraudAlert.status.in_(OPERATIONAL_ALERT_STATES),
+                        FraudAlert.difference_amount > MONEY_ZERO,
+                        FraudRule.code.in_(ECONOMIC_REDUCTION_RULE_CODES),
+                    )
+                    .group_by(FraudAlert.transaction_id)
+                )
+                statement = statement.where(
+                    DocumentCorrelation.transaction_id.in_(economic_transactions)
+                )
             statement = statement.order_by(
                 occurrence.c.occurred_at.desc(), DocumentCorrelation.id.desc()
             )
+            if filters.get("from") is not None:
+                statement = statement.where(occurrence.c.occurred_at >= filters["from"])
+            if filters.get("to") is not None:
+                statement = statement.where(occurrence.c.occurred_at < filters["to"])
             minimum_value = filters.get("minimum_difference")
-            if minimum_value is None:
+            reduction_only = bool(filters.get("reduction_only"))
+            if minimum_value is None and not reduction_only:
                 count = (
                     session.scalar(
                         select(func.count()).select_from(statement.order_by(None).subquery())
@@ -1457,7 +2184,12 @@ class SqlAlchemyApiRepository:
                 view
                 for correlation in correlations
                 if (view := self._transaction_view(session, correlation)).difference is not None
-                and abs(view.difference) >= minimum
+                and (
+                    view.difference >= minimum
+                    if reduction_only
+                    else abs(view.difference) >= minimum
+                )
+                and (not reduction_only or view.difference > MONEY_ZERO)
             ]
             return views[offset : offset + limit], len(views)
 
@@ -1465,10 +2197,29 @@ class SqlAlchemyApiRepository:
         with self._read() as session:
             correlation = session.scalar(
                 select(DocumentCorrelation)
-                .where(DocumentCorrelation.transaction_id == transaction_id)
-                .order_by(DocumentCorrelation.created_at.desc())
+                .where(
+                    DocumentCorrelation.transaction_id == transaction_id,
+                    DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
+                )
+                .order_by(
+                    DocumentCorrelation.created_at.desc(),
+                    DocumentCorrelation.id.desc(),
+                )
                 .limit(1)
             )
+            if correlation is None:
+                correlation = session.scalar(
+                    select(DocumentCorrelation)
+                    .where(
+                        DocumentCorrelation.transaction_id == transaction_id,
+                        DocumentCorrelation.status == "SUPERSEDED",
+                    )
+                    .order_by(
+                        DocumentCorrelation.created_at.desc(),
+                        DocumentCorrelation.id.desc(),
+                    )
+                    .limit(1)
+                )
             return None if correlation is None else self._transaction_view(session, correlation)
 
     def _alert_views(
@@ -1608,28 +2359,42 @@ class SqlAlchemyApiRepository:
                 statement = statement.where(FraudAlert.severity == str(filters["severity"]))
             if filters.get("status"):
                 statement = statement.where(FraudAlert.status == str(filters["status"]))
+            if filters.get("view") == "operational":
+                statement = statement.where(
+                    FraudAlert.status.in_(OPERATIONAL_ALERT_STATES)
+                )
+            elif filters.get("view") == "archive":
+                statement = statement.where(FraudAlert.status.in_(ARCHIVED_ALERT_STATES))
+            if filters.get("from") is not None or filters.get("to") is not None:
+                if filters.get("view") == "operational":
+                    alert_occurrence = _latest_transaction_occurrences()
+                    statement = statement.join(
+                        alert_occurrence,
+                        alert_occurrence.c.transaction_id == FraudAlert.transaction_id,
+                    )
+                else:
+                    alert_occurrence = _historical_correlation_occurrences()
+                    statement = statement.join(
+                        alert_occurrence,
+                        alert_occurrence.c.correlation_id == FraudAlert.correlation_id,
+                    )
+                if filters.get("from") is not None:
+                    statement = statement.where(
+                        alert_occurrence.c.occurred_at >= filters["from"]
+                    )
+                if filters.get("to") is not None:
+                    statement = statement.where(
+                        alert_occurrence.c.occurred_at < filters["to"]
+                    )
             if filters.get("rule"):
                 statement = statement.where(FraudRule.code == str(filters["rule"]))
             if filters.get("device_id"):
-                statement = (
-                    statement.join(
-                        DocumentCorrelationMember,
-                        DocumentCorrelationMember.correlation_id == FraudAlert.correlation_id,
-                    )
-                    .join(Document, Document.id == DocumentCorrelationMember.document_id)
-                    .join(Device, Device.id == Document.device_id)
-                    .where(Device.external_id == str(filters["device_id"]))
-                    .distinct()
+                statement = statement.where(
+                    _alert_has_device(str(filters["device_id"]))
                 )
             if filters.get("operator_code"):
-                statement = (
-                    statement.join(
-                        DocumentCorrelationMember,
-                        DocumentCorrelationMember.correlation_id == FraudAlert.correlation_id,
-                    )
-                    .join(Document, Document.id == DocumentCorrelationMember.document_id)
-                    .where(Document.operator_code == str(filters["operator_code"]))
-                    .distinct()
+                statement = statement.where(
+                    _alert_has_operator(str(filters["operator_code"]))
                 )
             count = (
                 session.scalar(
@@ -1834,8 +2599,16 @@ class SqlAlchemyApiRepository:
                 for row in rows
             ], count
 
-    def search(self, *, query: str, limit: int, offset: int) -> tuple[list[SearchHit], int]:
+    def search(
+        self,
+        *,
+        query: str,
+        limit: int,
+        offset: int,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[SearchHit], int]:
         limit, offset = _page(limit, offset, maximum=200)
+        filters = filters or {}
         value = query.strip()
         if len(value) < 2:
             return [], 0
@@ -1843,6 +2616,17 @@ class SqlAlchemyApiRepository:
         pattern = f"%{escaped_value}%"
         amount = _as_decimal(value.replace(",", "."))
         with self._read() as session:
+            document_period = []
+            order_period = []
+            device_period = []
+            if filters.get("from") is not None:
+                document_period.append(Document.captured_at >= filters["from"])
+                order_period.append(Order.opened_at >= filters["from"])
+                device_period.append(Device.created_at >= filters["from"])
+            if filters.get("to") is not None:
+                document_period.append(Document.captured_at < filters["to"])
+                order_period.append(Order.opened_at < filters["to"])
+                device_period.append(Device.created_at < filters["to"])
             document_predicates = [
                 _version_column(
                     DocumentVersion.external_document_code,
@@ -1873,7 +2657,7 @@ class SqlAlchemyApiRepository:
                 select(Document, DocumentVersion)
                 .join(Device, Device.id == Document.device_id)
                 .join(DocumentVersion, DocumentVersion.id == _latest_version_id())
-                .where(or_(*document_predicates))
+                .where(or_(*document_predicates), *document_period)
                 .order_by(Document.captured_at.desc())
                 .limit(500)
             ).all()
@@ -1907,7 +2691,8 @@ class SqlAlchemyApiRepository:
                         Device.mac_address.ilike(pattern, escape="\\"),
                         Device.department.ilike(pattern, escape="\\"),
                         Device.role.ilike(pattern, escape="\\"),
-                    )
+                    ),
+                    *device_period,
                 )
                 .order_by(Device.external_id)
                 .limit(100)
@@ -1932,7 +2717,8 @@ class SqlAlchemyApiRepository:
                         Order.order_code.ilike(pattern, escape="\\"),
                         Order.table_code.ilike(pattern, escape="\\"),
                         Order.operator_code.ilike(pattern, escape="\\"),
-                    )
+                    ),
+                    *order_period,
                 )
                 .order_by(Order.opened_at.desc())
                 .limit(500)

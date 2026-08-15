@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
-from retailprintguard.api.auth import LoginThrottle
+from retailprintguard.api.auth import LoginThrottle, PasswordService
 from retailprintguard.api.main import create_app
 from retailprintguard.api.repository import EmptyRepository, RawArtifact
 from retailprintguard.api.schemas import (
@@ -18,10 +18,17 @@ from retailprintguard.api.schemas import (
     DashboardView,
     DeviceView,
     DocumentView,
+    JobReviewRequest,
+    JobView,
     RoleName,
     RuleView,
+    SearchHit,
+    TransactionView,
     UserPrincipal,
 )
+
+REVIEW_PASSWORD = "confirmation-password-123"
+REVIEW_PASSWORD_HASH = PasswordService().hash(REVIEW_PASSWORD)
 
 
 class FakeRepository(EmptyRepository):
@@ -34,8 +41,13 @@ class FakeRepository(EmptyRepository):
         self.audits: list[AuditEntry] = []
         self.rule_enabled = True
         self.spool_state = "ok"
+        self.last_dashboard_filters: dict[str, object] = {}
+        self.last_job_filters: dict[str, object] = {}
+        self.last_search_filters: dict[str, object] = {}
         self.last_alert_filters: dict[str, object] = {}
         self.last_document_filters: dict[str, object] = {}
+        self.last_transaction_filters: dict[str, object] = {}
+        self.last_job_review: tuple[UUID, JobReviewRequest, UserPrincipal, str] | None = None
 
     def authenticate(self, username: str, password: str) -> UserPrincipal | None:
         if username == "auditor" and password == "correct-password":
@@ -58,7 +70,8 @@ class FakeRepository(EmptyRepository):
             )
         return None
 
-    def dashboard(self) -> DashboardView:
+    def dashboard(self, *, filters: dict[str, object] | None = None) -> DashboardView:
+        self.last_dashboard_filters = filters or {}
         return DashboardView(
             documents=7,
             pre_bills=2,
@@ -104,6 +117,64 @@ class FakeRepository(EmptyRepository):
         self, *, limit: int, offset: int, filters: dict[str, object]
     ) -> tuple[list[DocumentView], int]:
         self.last_document_filters = filters
+        return [], 0
+
+    def list_jobs(
+        self, *, limit: int, offset: int, filters: dict[str, object]
+    ) -> tuple[list[JobView], int]:
+        del limit, offset
+        self.last_job_filters = filters
+        return [], 0
+
+    def review_job(
+        self,
+        job_id: UUID,
+        review: JobReviewRequest,
+        actor: UserPrincipal,
+        *,
+        correlation_id: str,
+    ) -> JobView | None:
+        if job_id != self.job_id:
+            return None
+        self.last_job_review = (job_id, review, actor, correlation_id)
+        state = {
+            "VERIFY_USABLE": "VERIFIED_USABLE",
+            "EXCLUDE_FROM_ANALYSIS": "EXCLUDED",
+            "REOPEN_REVIEW": "PENDING",
+        }[review.action]
+        return JobView(
+            id=job_id,
+            device_id="pos_1",
+            session_id=self.session_id,
+            external_job_id="synthetic-job",
+            captured_at=datetime.now(UTC),
+            status="PARTIAL",
+            request_bytes=10,
+            response_bytes=1,
+            manifest_sha256="a" * 64,
+            spool_path="/synthetic/manifest.json",
+            review_state=state,
+            analysis_excluded=state == "EXCLUDED",
+            review_reason=review.reason,
+        )
+
+    def search(
+        self,
+        *,
+        query: str,
+        limit: int,
+        offset: int,
+        filters: dict[str, object] | None = None,
+    ) -> tuple[list[SearchHit], int]:
+        del query, limit, offset
+        self.last_search_filters = filters or {}
+        return [], 0
+
+    def list_transactions(
+        self, *, limit: int, offset: int, filters: dict[str, object]
+    ) -> tuple[list[TransactionView], int]:
+        del limit, offset
+        self.last_transaction_filters = filters
         return [], 0
 
     def get_document_raw(
@@ -193,7 +264,11 @@ class FakeRepository(EmptyRepository):
 
 def _client() -> tuple[TestClient, FakeRepository]:
     repository = FakeRepository()
-    app = create_app(repository=repository, jwt_secret=b"x" * 64)
+    app = create_app(
+        repository=repository,
+        jwt_secret=b"x" * 64,
+        review_password_hash=REVIEW_PASSWORD_HASH,
+    )
     return TestClient(app), repository
 
 
@@ -271,6 +346,66 @@ def test_documents_route_forwards_server_side_technical_exclusion() -> None:
 
     assert response.status_code == 200
     assert repository.last_document_filters["exclude_type"] == "DEVICE_RESPONSE"
+
+
+def test_utc_period_is_validated_and_forwarded_to_filtered_routes() -> None:
+    client, repository = _client()
+    headers = _login(client)
+    query = "from=2042-05-06T10%3A00%3A00%2B02%3A00&to=2042-05-07T10%3A00%3A00%2B02%3A00"
+
+    assert client.get(f"/api/v1/dashboard?{query}", headers=headers).status_code == 200
+    assert repository.last_dashboard_filters == {
+        "from": datetime(2042, 5, 6, 8, 0, tzinfo=UTC),
+        "to": datetime(2042, 5, 7, 8, 0, tzinfo=UTC),
+    }
+
+    assert client.get(f"/api/v1/documents?{query}", headers=headers).status_code == 200
+    assert repository.last_document_filters["from"] == datetime(2042, 5, 6, 8, 0, tzinfo=UTC)
+    assert repository.last_document_filters["to"] == datetime(2042, 5, 7, 8, 0, tzinfo=UTC)
+
+    assert client.get(f"/api/v1/jobs?incomplete=true&{query}", headers=headers).status_code == 200
+    assert repository.last_job_filters["incomplete"] is True
+    assert repository.last_job_filters["from"] == datetime(2042, 5, 6, 8, 0, tzinfo=UTC)
+
+    assert client.get(f"/api/v1/search?q=tavolo&{query}", headers=headers).status_code == 200
+    assert repository.last_search_filters["to"] == datetime(2042, 5, 7, 8, 0, tzinfo=UTC)
+
+    assert client.get(f"/api/v1/transactions?{query}", headers=headers).status_code == 200
+    assert repository.last_transaction_filters["from"] == datetime(
+        2042, 5, 6, 8, 0, tzinfo=UTC
+    )
+    assert repository.last_transaction_filters["to"] == datetime(
+        2042, 5, 7, 8, 0, tzinfo=UTC
+    )
+
+
+def test_utc_period_rejects_naive_and_reversed_intervals() -> None:
+    client, _ = _client()
+    headers = _login(client)
+    naive = client.get("/api/v1/documents?from=2042-05-06T10%3A00%3A00", headers=headers)
+    reversed_period = client.get(
+        "/api/v1/documents?from=2042-05-07T10%3A00%3A00Z&to=2042-05-06T10%3A00%3A00Z",
+        headers=headers,
+    )
+
+    assert naive.status_code == 422
+    assert "fuso orario" in naive.json()["detail"]
+    assert reversed_period.status_code == 422
+    assert "successivo" in reversed_period.json()["detail"]
+
+
+def test_transaction_operational_reduction_filters_are_forwarded() -> None:
+    client, repository = _client()
+    response = client.get(
+        "/api/v1/transactions"
+        "?operational_economic_only=true&reduction_only=true&minimum_difference=0.01",
+        headers=_login(client),
+    )
+
+    assert response.status_code == 200
+    assert repository.last_transaction_filters["operational_economic_only"] is True
+    assert repository.last_transaction_filters["reduction_only"] is True
+    assert repository.last_transaction_filters["minimum_difference"] == Decimal("0.01")
 
 
 def test_raw_download_requires_auditor_and_is_audited() -> None:
@@ -352,7 +487,57 @@ def test_alert_workflow_and_csv_export() -> None:
         "status": "OPEN",
         "device_id": "pos_1",
         "operator_code": "op_1",
+        "view": None,
+        "from": None,
+        "to": None,
     }
+
+
+def test_alert_list_and_export_accept_explicit_all_view() -> None:
+    client, repository = _client()
+    headers = _login(client)
+
+    listed = client.get("/api/v1/alerts?view=all", headers=headers)
+    assert listed.status_code == 200
+    assert repository.last_alert_filters["view"] == "all"
+    exported = client.get("/api/v1/alerts/export.csv?view=all", headers=headers)
+    assert exported.status_code == 200
+    assert repository.last_alert_filters["view"] == "all"
+
+
+def test_incomplete_job_review_requires_admin_and_confirmation_secret() -> None:
+    client, repository = _client()
+    payload = {
+        "action": "VERIFY_USABLE",
+        "reason": "Il contenuto normalizzato e completo e verificato.",
+        "confirmation_password": REVIEW_PASSWORD,
+    }
+    denied = client.post(
+        f"/api/v1/jobs/{repository.job_id}/review",
+        headers=_login(client),
+        json=payload,
+    )
+    assert denied.status_code == 403
+
+    admin = _login(client, "admin")
+    wrong = client.post(
+        f"/api/v1/jobs/{repository.job_id}/review",
+        headers=admin,
+        json={**payload, "confirmation_password": "wrong-password-value"},
+    )
+    assert wrong.status_code == 403
+    client, repository = _client()
+    admin = _login(client, "admin")
+    reviewed = client.post(
+        f"/api/v1/jobs/{repository.job_id}/review",
+        headers=admin,
+        json=payload,
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["review_state"] == "VERIFIED_USABLE"
+    assert reviewed.json()["analysis_excluded"] is False
+    assert repository.last_job_review is not None
+    assert repository.last_job_review[1].confirmation_password == REVIEW_PASSWORD
 
 
 def test_invalid_alert_transition_is_a_validation_error() -> None:

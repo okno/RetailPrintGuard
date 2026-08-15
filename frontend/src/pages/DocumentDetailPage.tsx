@@ -1,5 +1,5 @@
 import { ArrowBack, CodeOutlined, DownloadOutlined } from '@mui/icons-material'
-import { Alert, Box, Button, Card, CardContent, Grid, Paper, Tab, Table, TableBody, TableCell, TableHead, TableRow, Tabs, Typography } from '@mui/material'
+import { Alert, Box, Button, Card, CardContent, Chip, Grid, Paper, Tab, Table, TableBody, TableCell, TableHead, TableRow, Tabs, Typography } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -9,7 +9,45 @@ import { PageHeader } from '../components/PageHeader'
 import { StatusChip } from '../components/StatusChip'
 import { formatDateTime } from '../format'
 import { DOCUMENT_DETAIL_PARAM } from '../routes'
+import { confidencePercent } from '../documentPresentation'
 import type { DocumentRecord } from '../types'
+
+const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
+
+function LinePrice({ line }: { line: DocumentRecord['lines'][number] }) {
+  const value = line.unit_price ?? line.derived_unit_price
+  if (value === undefined && line.derived_price_source === 'CONFLICTING_SOURCES') {
+    const candidates = [...new Set(
+      (line.price_attributions ?? [])
+        .filter((item) => item.observed_unit_price !== undefined)
+        .map((item) => `${item.source_kind}: ${money.format(Number(item.observed_unit_price))}`),
+    )]
+    return <Chip
+      size="small"
+      variant="outlined"
+      color="warning"
+      label="Prezzi in conflitto"
+      title={candidates.join(' · ') || 'Le fonti correlate riportano prezzi differenti.'}
+    />
+  }
+  if (value === undefined) return <>—</>
+  const derived = line.unit_price === undefined
+  const confidences = (line.price_attributions ?? [])
+    .filter((item) => item.source_kind === line.derived_price_source && item.observed_unit_price === line.derived_unit_price)
+    .map((item) => Number(item.confidence))
+    .filter(Number.isFinite)
+  const confidence = confidencePercent(confidences.length ? Math.max(...confidences) : undefined)
+  return <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: .5 }}>
+    <span>{money.format(Number(value))}</span>
+    {derived && <Chip
+      size="small"
+      variant="outlined"
+      color="info"
+      label={`Derivato ${line.derived_price_source ?? ''}${confidence === undefined ? '' : ` · ${confidence}%`}`.trim()}
+      title="Valore attribuito da un documento correlato; il prezzo originale della comanda non è stato modificato."
+    />}
+  </Box>
+}
 
 function hex(data: Uint8Array) {
   return Array.from(data.slice(0, 65_536))
@@ -82,14 +120,14 @@ export function DocumentDetailPage() {
           </Tabs>
           <CardContent>
             {tab === 0 && <Paper variant="outlined" sx={{ mx: 'auto', maxWidth: 520, p: 3, bgcolor: '#fffef9', fontFamily: 'ui-monospace,Consolas,monospace', whiteSpace: 'pre-wrap', lineHeight: 1.55 }}>{doc.receipt_text || doc.normalized_text || 'Nessun testo documento disponibile.'}</Paper>}
-            {tab === 1 && <Box sx={{ overflowX: 'auto' }}><Table size="small"><TableHead><TableRow><TableCell>#</TableCell><TableCell>Portata</TableCell><TableCell>Descrizione</TableCell><TableCell align="right">Q.tà</TableCell><TableCell align="right">Prezzo</TableCell><TableCell align="right">Totale</TableCell><TableCell>Stato</TableCell></TableRow></TableHead><TableBody>{doc.lines.map((line) => <TableRow key={line.sequence} sx={{ textDecoration: line.removed ? 'line-through' : 'none', bgcolor: line.removed ? 'error.50' : 'transparent' }}><TableCell>{line.sequence}</TableCell><TableCell>{line.course_code ?? '—'}</TableCell><TableCell>{line.description ?? line.raw_text ?? '—'}</TableCell><TableCell align="right">{line.quantity ?? '—'}</TableCell><TableCell align="right">{line.unit_price ?? '—'}</TableCell><TableCell align="right">{line.line_total ?? '—'}</TableCell><TableCell>{line.removed ? 'Rimosso' : line.cancelled ? 'Annullato' : line.state ?? 'Attivo'}</TableCell></TableRow>)}</TableBody></Table></Box>}
+            {tab === 1 && <Box sx={{ overflowX: 'auto' }}><Table size="small"><TableHead><TableRow><TableCell>#</TableCell><TableCell>Portata</TableCell><TableCell>Descrizione</TableCell><TableCell align="right">Q.tà</TableCell><TableCell align="right">Prezzo</TableCell><TableCell align="right">Totale</TableCell><TableCell>Stato</TableCell></TableRow></TableHead><TableBody>{doc.lines.map((line) => <TableRow key={line.id ?? line.sequence} sx={{ textDecoration: line.removed ? 'line-through' : 'none', bgcolor: line.removed ? 'error.50' : 'transparent' }}><TableCell>{line.sequence}</TableCell><TableCell>{line.course_code ?? '—'}</TableCell><TableCell>{line.description ?? line.raw_text ?? '—'}</TableCell><TableCell align="right">{line.quantity ?? '—'}</TableCell><TableCell align="right"><LinePrice line={line} /></TableCell><TableCell align="right">{line.line_total ? money.format(Number(line.line_total)) : '—'}</TableCell><TableCell>{line.removed ? 'Rimosso' : line.cancelled ? 'Annullato' : line.state ?? 'Attivo'}</TableCell></TableRow>)}</TableBody></Table></Box>}
             {tab === 2 && <Paper component="pre" variant="outlined" sx={{ p: 2, maxHeight: 520, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>{doc.normalized_text || 'Nessun testo normalizzato.'}</Paper>}
             {tab === 3 && <Box><Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>Anteprima esadecimale limitata a 64 KiB; il download completo è separato e auditato.</Typography>{raw ? <Paper component="pre" variant="outlined" sx={{ p: 2, maxHeight: 520, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>{raw}</Paper> : <Button startIcon={<DownloadOutlined />} onClick={loadRaw}>Richiedi anteprima originale</Button>}</Box>}
           </CardContent>
         </Card>
       </Grid>
       <Grid size={{ xs: 12, lg: 4 }}>
-        <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />{[['Acquisito', formatDateTime(doc.captured_at)], ['Codice ordine', doc.order_code], ['Tavolo', doc.table_code], ['Operatore', doc.operator_code], ['Hash SHA-256', doc.sha256], ['Confidenza', `${doc.confidence}%`]].map(([label, value]) => <Box key={label} sx={{ mt: 2 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography sx={{ wordBreak: 'break-all' }}>{value || '—'}</Typography></Box>)}</CardContent></Card>
+        <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />{[['Acquisito', formatDateTime(doc.captured_at)], ['Codice ordine', doc.order_code], ['Tavolo', doc.table_code], ['Coperti', doc.covers], ['Operatore', doc.operator_code], ['Hash SHA-256', doc.sha256], ['Confidenza', `${doc.confidence}%`]].map(([label, value]) => <Box key={label} sx={{ mt: 2 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography sx={{ wordBreak: 'break-all' }}>{value ?? '—'}</Typography></Box>)}</CardContent></Card>
         {doc.warnings.length > 0 && <Alert severity="warning" sx={{ mt: 2 }}>{doc.warnings.join(' · ')}</Alert>}
       </Grid>
     </Grid>

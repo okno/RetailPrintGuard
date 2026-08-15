@@ -15,6 +15,7 @@ from retailprintguard.api.schemas import (
     DiagnosticsView,
     DocumentView,
     ImportBatchView,
+    JobReviewRequest,
     JobView,
     OrderView,
     RuleView,
@@ -43,7 +44,7 @@ class RawArtifact:
 class ApiRepository(Protocol):
     def authenticate(self, username: str, password: str) -> UserPrincipal | None: ...
 
-    def dashboard(self) -> DashboardView: ...
+    def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView: ...
 
     def diagnostics(self) -> DiagnosticsView: ...
 
@@ -56,6 +57,15 @@ class ApiRepository(Protocol):
     def list_jobs(
         self, *, limit: int, offset: int, filters: dict[str, Any]
     ) -> tuple[list[JobView], int]: ...
+
+    def review_job(
+        self,
+        job_id: UUID,
+        review: JobReviewRequest,
+        actor: UserPrincipal,
+        *,
+        correlation_id: str,
+    ) -> JobView | None: ...
 
     def list_documents(
         self, *, limit: int, offset: int, filters: dict[str, Any]
@@ -99,7 +109,14 @@ class ApiRepository(Protocol):
 
     def list_imports(self, *, limit: int, offset: int) -> tuple[list[ImportBatchView], int]: ...
 
-    def search(self, *, query: str, limit: int, offset: int) -> tuple[list[SearchHit], int]: ...
+    def search(
+        self,
+        *,
+        query: str,
+        limit: int,
+        offset: int,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[SearchHit], int]: ...
 
     def append_audit(self, entry: AuditEntry) -> None: ...
 
@@ -119,7 +136,8 @@ class EmptyRepository:
         del username, password
         return None
 
-    def dashboard(self) -> DashboardView:
+    def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView:
+        del filters
         return DashboardView()
 
     def diagnostics(self) -> DiagnosticsView:
@@ -146,6 +164,17 @@ class EmptyRepository:
     list_alerts = _empty
     list_imports = _empty
     search = _empty
+
+    def review_job(
+        self,
+        job_id: UUID,
+        review: JobReviewRequest,
+        actor: UserPrincipal,
+        *,
+        correlation_id: str,
+    ) -> JobView | None:
+        del job_id, review, actor, correlation_id
+        return None
 
     def get_document(self, document_id: UUID) -> DocumentView | None:
         del document_id

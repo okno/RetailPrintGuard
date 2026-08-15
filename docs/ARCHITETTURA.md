@@ -151,11 +151,13 @@ append-only.
 
 ## Correlazione
 
-L'algoritmo correttivo `rpg-correlation-1.2.0` usa, quando disponibili, codice
+L'algoritmo correttivo `rpg-correlation-1.3.0` usa, quando disponibili, codice
 ordine, codice documento, riferimenti embedded, tavolo, operatore, terminale,
-sessione, data operativa, prossimità temporale, totale, similarità righe,
+data operativa, prossimità temporale, totale, similarità righe,
 sequenza e dispositivo. I gruppi sono deterministici e il punteggio è limitato
-a 100.
+a 100. La sessione TCP resta provenienza tecnica a peso zero e non rappresenta
+l'identità della vendita. Conflitti espliciti di ordine/tavolo/riferimento e una
+chiusura economica precedente costituiscono confini rigidi dell'episodio.
 
 I documenti fiscali multipli vengono aggregati prima di calcolare la differenza
 dal preconto. Un preconto da 100,00 € seguito da due documenti da 50,00 € può
@@ -169,11 +171,19 @@ applica ai seed. L'antifrode carica i membri delle correlazioni selezionate e
 solo confronti con stesso codice esterno/device entro un giorno, evitando una
 scansione in memoria dell'intero archivio a ogni ciclo.
 
-Una `DEVICE_RESPONSE` RCH senza riferimenti business viene bloccata prima sullo
-stesso `source_job_id`; in assenza di quel legame usa soltanto stessa sessione,
-stesso device e finestra temporale. Questo consente di mostrarla nella timeline
-del documento richiesto senza trasformare una semplice vicinanza in certezza:
-i criteri e la confidenza restano visibili nella correlazione.
+Una `DEVICE_RESPONSE` RCH senza riferimenti business può collegarsi soltanto
+tramite lo stesso `source_job_id` duplex. In assenza di quel legame resta
+separata: una sessione persistente non può unire ricevute differenti. Copie,
+ristampe, risposte e rimborsi sono membri ausiliari non colleganti.
+
+Il servizio pricing del control plane aggiunge attribuzioni append-only alle
+righe POS prive di prezzo, usando soltanto righe monetarie correlate di
+versioni complete di preconto, Documento Gestionale o Commerciale. Ogni
+attribuzione conserva
+versione algoritmo, riga/versione sorgente, criterio, confidenza e ambiguità;
+non modifica `document_lines` né RAW. Fonti discordanti restano visibili e non
+producono un prezzo derivato selezionato. Vedere
+[Episodi di vendita](ANTIFRODE_EPISODI_VENDITA.md).
 
 La scelta dell'interpretazione usa `active_parser_versions`: se manca il
 puntatore prevale la sequenza più recente, mentre un puntatore può selezionare

@@ -13,6 +13,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=RPG_CONFIG=/etc/retailprintguard/config.yaml
 Environment=RPG_JWT_SECRET_FILE=/etc/retailprintguard/jwt.secret
 EnvironmentFile=/etc/retailprintguard/database.env
+EnvironmentFile=-/etc/retailprintguard/review.env
 ExecStart=/opt/retailprintguard/current/.venv/bin/retailprintguard-api --config /etc/retailprintguard/config.yaml
 Restart=on-failure
 RestartSec=5s

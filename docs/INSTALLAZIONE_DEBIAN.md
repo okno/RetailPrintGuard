@@ -224,7 +224,7 @@ directory codice/web gestite; dati e DB restano comunque preservati.
 
 | Percorso | Contenuto |
 |---|---|
-| `/etc/retailprintguard` | config, env DB, segreti, sorgenti ingestion |
+| `/etc/retailprintguard` | config, env DB, segreti, hash conferma revisione, sorgenti ingestion |
 | `/opt/retailprintguard/releases` | release applicative immutabili |
 | `/opt/retailprintguard/current` | symlink release attiva |
 | `/var/lib/retailprintguard/spool` | catture canoniche |
@@ -262,3 +262,19 @@ password.
 
 Non usare SQL manuale e non inserire la password in file, command line, log o
 ticket. Verificare poi login e audit senza copiare il token in output condivisi.
+
+## Password di conferma per i job incompleti
+
+La revisione/esclusione di un job incompleto richiede, oltre a un account
+`ADMIN`, un segreto dedicato. Configurarlo con doppio prompt locale:
+
+```bash
+sudo /opt/retailprintguard/current/.venv/bin/retailprintguard-configure-review
+sudo systemctl restart retailprintguard-api.service
+```
+
+Il comando accetta soltanto il path gestito
+`/etc/retailprintguard/review.env`, rifiuta symlink, scrive atomicamente il solo
+hash Argon2id e assegna root/gruppo API con mode `0640`. La password in chiaro
+non va passata come argomento o memorizzata in YAML. Senza questa configurazione
+l'endpoint di revisione fallisce chiuso; proxy e forwarding non sono coinvolti.

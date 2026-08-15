@@ -4,6 +4,35 @@
 installabile in staging; l'attivazione sui dispositivi reali resta subordinata
 al collaudo controllato descritto nel piano di deployment.
 
+## Release 0.4.0 — antifrode per episodi di vendita
+
+Il candidato `codex/antifraud-sale-episodes` introduce correlazione e antifrode
+basate sull'episodio di vendita, prezzi POS derivati con provenienza, filtri
+temporali, PDF comanda compatto e revisione auditata dei job incompleti. La
+revisione non elimina mai RAW, manifest, documenti o storico degli alert.
+
+Il gate finale del 15 agosto 2026 ha prodotto `186 passed`, `25 skipped` e zero
+failure. Gli skip sono 23 test di sintassi Bash e un test POSIX del gate
+control-plane non disponibili al Python runner Windows, oltre a un test symlink
+condizionale. Ruff, compileall, migrazioni Alembic incluse nel full test,
+`git diff --check`, ESLint, TypeScript e 18 test frontend sono passati. Il wheel
+`retailprintguard-0.4.0` è stato costruito e contiene tutti i 10 entry point.
+Il privacy scan ha ispezionato 231 file senza trovare segreti o evidenze private.
+
+`bash -n` è passato sui 23 script tramite Git Bash. ShellCheck non era
+disponibile su questo host e non viene dichiarato come PASS. Anche la build Vite
+locale è rimasta bloccata senza errore nel runtime Windows: `pnpm build` sul
+server Linux è pertanto un gate obbligatorio prima dello staging. La QA visuale
+del PDF sintetico ha verificato layout 80 mm, portate, prezzi derivati e
+conflitti senza clipping.
+
+Il diff rispetto a `v0.3.1` è vuoto per proxy, configurazione/logging condivisi,
+lock runtime e unità POS/RCH. `--control-plane-only` verifica questa closure
+prima di pacchetti e DDL, mantiene i due processi proxy e controlla che entrambi
+i PID restino invariati. Decisione: `GO` per commit, tag e pubblicazione del
+sorgente; attivazione produzione soltanto dopo build Linux, backup verificato e
+preflight documentato.
+
 ## Hotfix 0.3.1
 
 Il candidato `codex/web-documents-hotfix` corregge il contratto delle rotte

@@ -3,6 +3,7 @@ import { Box, Button, Card, Dialog, DialogActions, DialogContent, DialogTitle, F
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { alertApiSearchParams, DEFAULT_ALERT_VIEW } from '../alertFilters'
 import { api, downloadApi, scopedQueryKey, session } from '../api/client'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import { PageHeader } from '../components/PageHeader'
@@ -18,12 +19,14 @@ export function AlertsPage() {
   const queryClient = useQueryClient()
   const limit = Number(params.get('limit') ?? 25)
   const offset = Number(params.get('offset') ?? 0)
+  const view = params.get('view') ?? DEFAULT_ALERT_VIEW
+  const requestParams = alertApiSearchParams(params, limit, offset)
   const roles = session().user?.roles ?? []
   const canReview = roles.some((role) => ['ADMIN', 'AUDITOR', 'OPERATOR'].includes(role))
   const canExport = roles.some((role) => ['ADMIN', 'AUDITOR'].includes(role))
   const query = useQuery({
-    queryKey: scopedQueryKey('alerts', params.toString()),
-    queryFn: () => api<Page<AlertRecord>>(`/alerts?${params.toString() || `limit=${limit}&offset=${offset}`}`),
+    queryKey: scopedQueryKey('alerts', requestParams.toString()),
+    queryFn: () => api<Page<AlertRecord>>(`/alerts?${requestParams.toString()}`),
   })
   const detail = useQuery({
     queryKey: scopedQueryKey('alert', selectedId),
@@ -48,7 +51,7 @@ export function AlertsPage() {
 
   async function exportAlerts() {
     setExportError(undefined)
-    const exported = new URLSearchParams(params)
+    const exported = new URLSearchParams(requestParams)
     exported.delete('limit')
     exported.delete('offset')
     try {
@@ -62,7 +65,8 @@ export function AlertsPage() {
   return <>
     <PageHeader title="Alert antifrode" subtitle="Workbench investigativo con evidenze, presa in carico e storico completo." actions={canExport ? <Button onClick={exportAlerts} startIcon={<DownloadOutlined />} variant="outlined">Esporta CSV</Button> : undefined} />
     {exportError && <Box sx={{ mb: 2 }}><ErrorState error={exportError} /></Box>}
-    <Card sx={{ p: 2, mb: 2 }}><Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(5,1fr)' }, gap: 2 }}>
+    <Card sx={{ p: 2, mb: 2 }}><Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(6,1fr)' }, gap: 2 }}>
+      <FormControl size="small"><InputLabel>Vista</InputLabel><Select label="Vista" value={view} onChange={(event) => filter('view', String(event.target.value))}><MenuItem value="operational">Operativi</MenuItem><MenuItem value="archive">Archivio</MenuItem><MenuItem value="all">Tutti</MenuItem></Select></FormControl>
       <FormControl size="small"><InputLabel>Severità</InputLabel><Select label="Severità" value={params.get('severity') ?? ''} onChange={(event) => filter('severity', String(event.target.value))}><MenuItem value="">Tutte</MenuItem>{['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}</Select></FormControl>
       <FormControl size="small"><InputLabel>Stato</InputLabel><Select label="Stato" value={params.get('status') ?? ''} onChange={(event) => filter('status', String(event.target.value))}><MenuItem value="">Tutti</MenuItem>{['OPEN', 'UNDER_REVIEW', 'CONFIRMED', 'FALSE_POSITIVE', 'JUSTIFIED', 'CLOSED'].map((value) => <MenuItem key={value} value={value}>{value.replaceAll('_', ' ')}</MenuItem>)}</Select></FormControl>
       <TextField size="small" label="Regola" value={params.get('rule') ?? ''} onChange={(event) => filter('rule', event.target.value)} />

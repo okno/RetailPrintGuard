@@ -22,6 +22,7 @@ from retailprintguard.db.models import (
     Document,
     DocumentVersion,
     FraudAlert,
+    LinePriceAttribution,
     ParserVersion,
     PrintJob,
     ProxySession,
@@ -41,6 +42,7 @@ REQUIRED_TABLES = {
     "documents",
     "document_versions",
     "document_lines",
+    "line_price_attributions",
     "orders",
     "order_events",
     "order_snapshots",
@@ -71,6 +73,10 @@ def test_complete_normalized_schema_and_mariadb_storage_contract() -> None:
     alert_ddl = str(CreateTable(FraudAlert.__table__).compile(dialect=mysql.dialect()))
     version_ddl = str(CreateTable(DocumentVersion.__table__).compile(dialect=mysql.dialect()))
     raw_ddl = str(CreateTable(RawPayload.__table__).compile(dialect=mysql.dialect()))
+    price_ddl = str(
+        CreateTable(LinePriceAttribution.__table__).compile(dialect=mysql.dialect())
+    )
+    job_ddl = str(CreateTable(PrintJob.__table__).compile(dialect=mysql.dialect()))
     assert "BINARY(16)" in device_ddl
     assert "ENGINE=InnoDB" in device_ddl
     assert "CHARSET=utf8mb4" in device_ddl
@@ -80,6 +86,14 @@ def test_complete_normalized_schema_and_mariadb_storage_contract() -> None:
     assert "canonical_duplicate_consistency" in alert_ddl
     assert "DECIMAL(19, 4)" in version_ddl
     assert "LONGBLOB" in raw_ddl
+    assert "DECIMAL(19, 4)" in price_ddl
+    assert "FOREIGN KEY(target_line_id)" in price_ddl
+    assert "FOREIGN KEY(source_line_id)" in price_ddl
+    assert "ON DELETE RESTRICT" in price_ddl
+    assert "review_state VARCHAR(32) NOT NULL" in job_ddl
+    assert "analysis_excluded BOOL NOT NULL" in job_ddl
+    assert "FOREIGN KEY(reviewed_by_user_id)" in job_ddl
+    assert "print_jobs_review_state" in job_ddl
 
 
 def test_uuid_decimal_utc_and_parser_version_history_round_trip() -> None:
@@ -658,3 +672,5 @@ def test_mariadb_offline_migration_ddl_is_renderable(
     assert "UPDATE document_versions SET" in ddl
     assert "ix_document_versions_order_document" in ddl
     assert "ALTER TABLE document_lines ADD COLUMN course_code VARCHAR(64)" in ddl
+    assert "CREATE TABLE line_price_attributions" in ddl
+    assert "uq_line_price_attr_identity" in ddl

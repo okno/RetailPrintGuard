@@ -178,6 +178,21 @@ L'API è predefinita su `127.0.0.1:8080`. `allowed_origins` è vuoto; abilitarlo
 solo con origini HTTPS esatte. Il rate limit locale del login non sostituisce
 quello del reverse proxy.
 
+La password di conferma per la revisione degli incompleti non ha alcun campo
+YAML configurabile. Soltanto il servizio API legge il nome ambiente fisso dal
+file systemd opzionale `/etc/retailprintguard/review.env`, creato esclusivamente
+dalla CLI interattiva:
+
+```bash
+sudo /opt/retailprintguard/current/.venv/bin/retailprintguard-configure-review
+sudo systemctl restart retailprintguard-api.service
+```
+
+La password in chiaro non viene persistita. Non aggiungere nomi di variabile,
+password o hash a `config.yaml`: senza il file protetto e un hash valido le
+azioni di revisione ad alto impatto falliscono chiuse, mentre la consultazione
+resta disponibile secondo RBAC.
+
 ### `retention`
 
 Il valore `0` significa nessuna cancellazione automatica. La presenza dei campi

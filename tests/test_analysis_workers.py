@@ -7,7 +7,9 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, update
 
+from retailprintguard.api.schemas import JobReviewRequest, RoleName, UserPrincipal
 from retailprintguard.common.hashchain import canonical_json
+from retailprintguard.correlation.engine import ALGORITHM_VERSION
 from retailprintguard.correlation.worker import (
     CorrelationWorker,
     _candidate_batch,
@@ -30,6 +32,7 @@ from retailprintguard.db.models import (
     FraudAlertHistory,
     FraudRule,
     FraudRuleVersion,
+    LinePriceAttribution,
     Order,
     OrderEvent,
     OrderSnapshot,
@@ -39,9 +42,11 @@ from retailprintguard.db.models import (
     ProxySession,
     RawPayload,
     SystemEvent,
+    User,
 )
 from retailprintguard.db.repository import SqlAlchemyApiRepository
 from retailprintguard.fraud.worker import FraudWorker
+from retailprintguard.pricing.service import PRICE_ATTRIBUTION_ALGORITHM
 
 NOW = datetime(2042, 8, 12, 13, 52, tzinfo=UTC)
 
@@ -89,6 +94,7 @@ def _document(
     order_code: str = "ORDER-80",
     table_code: str = "25-B",
     operator_code: str = "OP-1",
+    complete: bool = True,
 ) -> UUID:
     session_id, job_id, document_id = uuid4(), uuid4(), uuid4()
     session.add(  # type: ignore[attr-defined]
@@ -182,14 +188,14 @@ def _document(
         operator_code=operator_code,
         document_timestamp=when,
         gross_total=Decimal(total),
-        status="COMPLETE",
+        status="COMPLETE" if complete else "PARTIAL",
         normalized_text=f"{document_type} {total}",
         parse_confidence=100,
         evidence_level="CONFIRMED",
         source_manifest_sha256=manifest_hash,
         source_payload_sha256=raw.sha256,
         source_path=raw.source_path,
-        complete=True,
+        complete=complete,
         chain_scope=f"document:{job_id}",
         chain_sequence=1,
         previous_record_hash="0" * 64,
@@ -306,15 +312,13 @@ def test_database_workers_persist_scenario_a_idempotently() -> None:
     fraud = FraudWorker(factory)
     fraud_first = fraud.run_once()
     fraud_second = fraud.run_once()
-    assert fraud_first.alerts_inserted >= 4
+    assert fraud_first.alerts_inserted == 1
     assert fraud_second.alerts_inserted == 0
     with factory() as session:
         codes = set(
             session.scalars(select(FraudAlert.description).where(FraudAlert.status == "OPEN"))
         )
-        assert any("Riduzione significativa" in description for description in codes)
-        assert any("Articoli rimossi" in description for description in codes)
-        assert any("Prezzo ridotto" in description for description in codes)
+        assert any("Riduzione del valore di vendita" in description for description in codes)
         alert_count = session.scalar(select(func.count()).select_from(FraudAlert))
         assert session.scalar(select(func.count()).select_from(FraudAlertHistory)) == alert_count
         assert session.scalar(select(func.count()).select_from(FraudAlertEvidence)) >= alert_count
@@ -330,6 +334,146 @@ def test_database_workers_persist_scenario_a_idempotently() -> None:
     assert {"DOCUMENT", "ORDER_EVENT", "FRAUD_ALERT"} <= kinds
     assert transaction.diff["lines"]["removed"]
     assert transaction.diff["lines"]["price_changed"]
+    engine.dispose()
+
+
+def test_excluded_job_reopens_only_after_current_finding_is_reproduced() -> None:
+    engine, factory = _database()
+    _seed_scenario(factory, split=False)
+    correlation_worker = CorrelationWorker(factory)
+    fraud_worker = FraudWorker(factory)
+    correlation_worker.run_once()
+    fraud_worker.run_once()
+
+    actor_id = uuid4()
+    with factory.begin() as session:
+        current_correlation = session.scalar(
+            select(DocumentCorrelation).where(
+                DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED"))
+            )
+        )
+        assert current_correlation is not None
+        current_correlation_id = current_correlation.id
+        original_alert = session.scalar(select(FraudAlert).where(FraudAlert.status == "OPEN"))
+        assert original_alert is not None
+        original_alert_id = original_alert.id
+        stale = DocumentCorrelation(
+            transaction_id=uuid4(),
+            algorithm_version=ALGORITHM_VERSION,
+            input_fingerprint=_sha("stale-correlation-for-same-job"),
+            score=current_correlation.score,
+            status="SUPERSEDED",
+            matched_criteria=current_correlation.matched_criteria,
+            unmatched_criteria=current_correlation.unmatched_criteria,
+            explanation="Correlazione storica gia superata.",
+        )
+        session.add(stale)
+        session.flush()
+        for member in session.scalars(
+            select(DocumentCorrelationMember).where(
+                DocumentCorrelationMember.correlation_id == current_correlation.id
+            )
+        ):
+            session.add(
+                DocumentCorrelationMember(
+                    correlation_id=stale.id,
+                    document_id=member.document_id,
+                    role=member.role,
+                    contribution_score=member.contribution_score,
+                    criteria=member.criteria,
+                )
+            )
+        stale_correlation_id = stale.id
+        job = session.scalar(select(PrintJob).where(PrintJob.source_scope == "prebill"))
+        assert job is not None
+        job.capture_complete = False
+        job.status = "PARTIAL"
+        session.add(
+            User(
+                id=actor_id,
+                username="review-admin",
+                display_name="Review Admin",
+                password_hash="not-used-by-this-test",
+            )
+        )
+        job_id = job.id
+
+    repository = SqlAlchemyApiRepository(factory)
+    principal = UserPrincipal(
+        id=actor_id,
+        username="review-admin",
+        roles=(RoleName.ADMIN,),
+    )
+    excluded = repository.review_job(
+        job_id,
+        JobReviewRequest(
+            action="EXCLUDE_FROM_ANALYSIS",
+            reason="Capture incompleta esclusa temporaneamente dalla sola analisi.",
+            confirmation_password="not-persisted-password",
+        ),
+        principal,
+        correlation_id="exclude-current-finding",
+    )
+    assert excluded is not None and excluded.analysis_excluded
+    reopened = repository.review_job(
+        job_id,
+        JobReviewRequest(
+            action="REOPEN_REVIEW",
+            reason="Verifica tecnica conclusa; richiedo un nuovo calcolo deterministico.",
+            confirmation_password="not-persisted-password",
+        ),
+        principal,
+        correlation_id="reopen-current-finding",
+    )
+    assert reopened is not None and reopened.analysis_excluded
+
+    # The API action alone never resurrects stale analysis.
+    with factory() as session:
+        assert set(session.scalars(select(DocumentCorrelation.status))) == {"SUPERSEDED"}
+        assert set(session.scalars(select(FraudAlert.status))) == {"JUSTIFIED"}
+
+    correlation_worker.run_once()
+    fraud_worker.run_once()
+    with factory() as session:
+        # REOPEN_REVIEW means "review again": an incomplete PENDING job does
+        # not influence analysis until the administrator explicitly verifies it.
+        correlation = session.get(DocumentCorrelation, current_correlation_id)
+        alert = session.get(FraudAlert, original_alert_id)
+        assert correlation is not None and correlation.status == "SUPERSEDED"
+        assert alert is not None and alert.status == "JUSTIFIED"
+
+    verified = repository.review_job(
+        job_id,
+        JobReviewRequest(
+            action="VERIFY_USABLE",
+            reason="Il contenuto semantico e completo e puo essere usato nel ricalcolo.",
+            confirmation_password="not-persisted-password",
+        ),
+        principal,
+        correlation_id="verify-current-finding",
+    )
+    assert verified is not None and verified.review_state == "VERIFIED_USABLE"
+    correlation_worker.run_once()
+    fraud_worker.run_once()
+    with factory() as session:
+        current = session.scalars(
+            select(DocumentCorrelation).where(
+                DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED"))
+            )
+        ).all()
+        assert len(current) == 1
+        assert current[0].id == current_correlation_id
+        stale = session.get(DocumentCorrelation, stale_correlation_id)
+        assert stale is not None and stale.status == "SUPERSEDED"
+        alert = session.get(FraudAlert, original_alert_id)
+        assert alert is not None and alert.status == "OPEN"
+        history = session.scalars(
+            select(FraudAlertHistory)
+            .where(FraudAlertHistory.fraud_alert_id == alert.id)
+            .order_by(FraudAlertHistory.sequence)
+        ).all()
+        assert history[-1].event_type == "ALERT_AUTO_REOPENED_AFTER_JOB_REVIEW"
+        assert history[-1].previous_record_hash == history[-2].record_hash
     engine.dispose()
 
 
@@ -445,6 +589,204 @@ def test_worker_groups_cross_department_dispatch_without_fake_line_changes() -> 
         event_types = set(session.scalars(select(OrderEvent.event_type)))
         assert "ITEM_ADDED" not in event_types
         assert "ITEM_REMOVED" not in event_types
+    engine.dispose()
+
+
+def test_worker_persists_missing_pos_prices_by_source_kind_idempotently() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        pos_id = _device(session, "pos_1", "pos", 9100)
+        rch_id = _device(session, "rch_1", "rch", 23)
+        parser = ParserVersion(
+            name="synthetic-price-attribution",
+            version="1.0.0",
+            build_sha256=_sha("synthetic-price-attribution-parser"),
+            protocol="synthetic",
+        )
+        session.add(parser)
+        session.flush()
+        target_id = _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="price-target-kitchen",
+            document_type="KITCHEN_ORDER",
+            total="0.00",
+            when=NOW,
+            lines=(("Margherita", "0.00"),),
+            order_code="ORDER-PRICE",
+            table_code="LAB-PRICE",
+        )
+        _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="price-source-prebill",
+            document_type="PRE_BILL",
+            total="10.00",
+            when=NOW + timedelta(minutes=1),
+            lines=(("Margherita", "10.00"),),
+            order_code="ORDER-PRICE",
+            table_code="LAB-PRICE",
+        )
+        _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="price-source-management",
+            document_type="MANAGEMENT_DOCUMENT",
+            total="10.00",
+            when=NOW + timedelta(minutes=2),
+            lines=(("Margherita", "10.00"),),
+            order_code="ORDER-PRICE",
+            table_code="LAB-PRICE",
+        )
+        _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="price-source-fiscal",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="8.00",
+            when=NOW + timedelta(minutes=3),
+            lines=(("Margherita", "8.00"),),
+            order_code="ORDER-PRICE",
+            table_code="LAB-PRICE",
+        )
+        for offset, document_type in enumerate(("CONFORMING_COPY", "REPRINT"), start=4):
+            _document(
+                session,
+                device_id=rch_id,
+                parser_id=parser.id,
+                source=f"excluded-price-source-{document_type.lower()}",
+                document_type=document_type,
+                total="99.00",
+                when=NOW + timedelta(minutes=offset),
+                lines=(("Margherita", "99.00"),),
+                order_code="ORDER-PRICE",
+                table_code="LAB-PRICE",
+            )
+        session.flush()
+        target_version_id = session.scalar(
+            select(DocumentVersion.id).where(DocumentVersion.document_id == target_id)
+        )
+        session.execute(
+            update(DocumentLine)
+            .where(DocumentLine.document_version_id == target_version_id)
+            .values(unit_price=None, line_total=None)
+        )
+
+    worker = CorrelationWorker(factory)
+    first = worker.run_once()
+    second = worker.run_once()
+
+    assert first.price_attributions_inserted == 3
+    assert second.price_attributions_inserted == 0
+    with factory() as session:
+        attributions = session.scalars(
+            select(LinePriceAttribution).order_by(LinePriceAttribution.source_kind)
+        ).all()
+        assert {item.source_kind for item in attributions} == {
+            "PREBILL",
+            "MANAGEMENT",
+            "FISCAL",
+        }
+        assert {item.status for item in attributions} == {"RESOLVED"}
+        assert {item.match_basis for item in attributions} == {
+            "DESCRIPTION_NORMALIZED_EXACT"
+        }
+        assert {item.observed_unit_price for item in attributions} == {
+            Decimal("8.0000"),
+            Decimal("10.0000"),
+        }
+        attribution = attributions[0]
+        target_line = session.scalar(
+            select(DocumentLine).where(DocumentLine.id == attribution.target_line_id)
+        )
+        assert target_line is not None and target_line.unit_price is None
+    document = SqlAlchemyApiRepository(factory).get_document(target_id)
+    assert document is not None and len(document.lines) == 1
+    assert document.lines[0].unit_price is None
+    assert document.lines[0].derived_unit_price is None
+    assert document.lines[0].derived_price_source == "CONFLICTING_SOURCES"
+    assert len(document.lines[0].price_attributions) == 3
+    engine.dispose()
+
+
+def test_worker_does_not_price_pos_line_from_incomplete_monetary_source() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        pos_id = _device(session, "pos_1", "pos", 9100)
+        rch_id = _device(session, "rch_1", "rch", 23)
+        parser = ParserVersion(
+            name="synthetic-incomplete-price-source",
+            version="1.0.0",
+            build_sha256=_sha("synthetic-incomplete-price-source-parser"),
+            protocol="synthetic",
+        )
+        session.add(parser)
+        session.flush()
+        target_id = _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="incomplete-price-target",
+            document_type="KITCHEN_ORDER",
+            total="0.00",
+            when=NOW,
+            lines=(("Voce parziale", "0.00"),),
+            order_code="ORDER-INCOMPLETE-PRICE",
+            table_code="LAB-INCOMPLETE-PRICE",
+        )
+        source_id = _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="incomplete-price-source",
+            document_type="PRE_BILL",
+            total="10.00",
+            when=NOW + timedelta(minutes=1),
+            lines=(("Voce parziale", "10.00"),),
+            order_code="ORDER-INCOMPLETE-PRICE",
+            table_code="LAB-INCOMPLETE-PRICE",
+        )
+        session.flush()
+        target_version_id = session.scalar(
+            select(DocumentVersion.id).where(DocumentVersion.document_id == target_id)
+        )
+        source_version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == source_id)
+        )
+        assert target_version_id is not None and source_version is not None
+        session.execute(
+            update(DocumentLine)
+            .where(DocumentLine.document_version_id == target_version_id)
+            .values(unit_price=None, line_total=None)
+        )
+        source_version.complete = False
+        source_version.status = "PARTIAL"
+
+    report = CorrelationWorker(factory).run_once()
+
+    assert report.correlations_inserted == 1
+    assert report.price_attributions_inserted == 0
+    with factory() as session:
+        correlation = session.scalar(
+            select(DocumentCorrelation).where(DocumentCorrelation.status == "AUTOMATIC")
+        )
+        assert correlation is not None
+        assert session.scalar(
+            select(func.count())
+            .select_from(DocumentCorrelationMember)
+            .where(DocumentCorrelationMember.correlation_id == correlation.id)
+        ) == 2
+        assert session.scalar(select(func.count()).select_from(LinePriceAttribution)) == 0
+    document = SqlAlchemyApiRepository(factory).get_document(target_id)
+    assert document is not None and len(document.lines) == 1
+    assert document.lines[0].unit_price is None
+    assert document.lines[0].derived_unit_price is None
+    assert document.lines[0].derived_price_source is None
+    assert document.lines[0].price_attributions == []
     engine.dispose()
 
 
@@ -596,6 +938,86 @@ def test_database_workers_aggregate_legitimate_split_without_amount_drop() -> No
         descriptions = set(session.scalars(select(FraudAlert.description)))
         assert not any("Riduzione significativa" in item for item in descriptions)
         assert not any("Stesso riferimento con importi differenti" in item for item in descriptions)
+        event_types = set(session.scalars(select(OrderEvent.event_type)))
+        assert "ITEM_REMOVED" not in event_types
+        assert "PRICE_CHANGED" not in event_types
+    engine.dispose()
+
+
+def test_compat_amount_alert_persists_only_complete_fiscal_aggregate() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        pos_id = _device(session, "pos_1", "pos", 9100)
+        rch_id = _device(session, "rch_1", "rch", 23)
+        parser = ParserVersion(
+            name="test",
+            version="1.0.0",
+            build_sha256=_sha("parser-compat-partial"),
+            protocol="test",
+        )
+        session.add(parser)
+        session.flush()
+        prebill_id = _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="compat-prebill",
+            document_type="PRE_BILL",
+            total="100.00",
+            when=NOW,
+            lines=(("Conto", "100.00"),),
+        )
+        session.flush()
+        prebill_version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == prebill_id)
+        )
+        assert prebill_version is not None
+        prebill_version.gross_total = None
+        prebill_version.net_total = Decimal("100.00")
+        _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="compat-fiscal-complete",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="50.00",
+            when=NOW + timedelta(minutes=1),
+            lines=(("Conto", "50.00"),),
+        )
+        _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="compat-fiscal-partial",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="20.00",
+            when=NOW + timedelta(minutes=2),
+            lines=(("Tentativo", "20.00"),),
+            complete=False,
+        )
+
+    worker = FraudWorker(factory)
+    worker.run_once()
+    with factory.begin() as session:
+        primary = session.scalar(
+            select(FraudRule).where(FraudRule.code == "MODIFICA_POST_PRECONTO")
+        )
+        assert primary is not None
+        primary.enabled = False
+    CorrelationWorker(factory).run_once()
+    worker.run_once()
+
+    with factory() as session:
+        alert = session.scalar(
+            select(FraudAlert)
+            .join(FraudRuleVersion, FraudRuleVersion.id == FraudAlert.fraud_rule_version_id)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "PREBILL_FISCAL_AMOUNT_DROP")
+        )
+        assert alert is not None
+        assert alert.original_amount == Decimal("100.0000")
+        assert alert.final_amount == Decimal("50.0000")
+        assert alert.difference_amount == Decimal("50.0000")
     engine.dispose()
 
 
@@ -640,7 +1062,9 @@ def test_late_split_payment_supersedes_and_justifies_stale_amount_drop() -> None
     assert first.alerts_inserted >= 1
     with factory() as session:
         stale = session.scalar(
-            select(FraudAlert).where(FraudAlert.description.contains("Riduzione significativa"))
+            select(FraudAlert).where(
+                FraudAlert.description.contains("Riduzione del valore di vendita")
+            )
         )
         assert stale is not None and stale.status == "OPEN"
         stale_id = stale.id
@@ -687,7 +1111,7 @@ def test_late_split_payment_supersedes_and_justifies_stale_amount_drop() -> None
             session.scalar(
                 select(FraudAlert).where(
                     FraudAlert.status == "OPEN",
-                    FraudAlert.description.contains("Riduzione significativa"),
+                    FraudAlert.description.contains("Riduzione del valore di vendita"),
                 )
             )
             is None
@@ -697,6 +1121,180 @@ def test_late_split_payment_supersedes_and_justifies_stale_amount_drop() -> None
     )
     assert total == 1
     assert transactions[0].document_count == 3
+    engine.dispose()
+
+
+def test_same_membership_recorrelation_closes_obsolete_alert() -> None:
+    engine, factory = _database()
+    _seed_scenario(factory, split=False)
+    CorrelationWorker(factory).run_once()
+    FraudWorker(factory).run_once()
+    with factory.begin() as session:
+        old = session.scalar(
+            select(DocumentCorrelation).where(
+                DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED"))
+            )
+        )
+        alert = session.scalar(select(FraudAlert).where(FraudAlert.status == "OPEN"))
+        assert old is not None and alert is not None
+        old.status = "SUPERSEDED"
+        replacement = DocumentCorrelation(
+            transaction_id=old.transaction_id,
+            algorithm_version=ALGORITHM_VERSION,
+            input_fingerprint=_sha("same-members-new-parser-version"),
+            score=old.score,
+            status="AUTOMATIC",
+            matched_criteria=old.matched_criteria,
+            unmatched_criteria=old.unmatched_criteria,
+            explanation="Nuova interpretazione parser sugli stessi documenti.",
+        )
+        session.add(replacement)
+        session.flush()
+        members = session.scalars(
+            select(DocumentCorrelationMember).where(
+                DocumentCorrelationMember.correlation_id == old.id
+            )
+        ).all()
+        for member in members:
+            session.add(
+                DocumentCorrelationMember(
+                    correlation_id=replacement.id,
+                    document_id=member.document_id,
+                    role=member.role,
+                    contribution_score=member.contribution_score,
+                    criteria=member.criteria,
+                )
+            )
+        session.flush()
+        resolved = FraudWorker._resolve_superseded_alerts(session, NOW)
+        assert resolved == 1
+        alert_id = alert.id
+
+    with factory() as session:
+        alert = session.get(FraudAlert, alert_id)
+        assert alert is not None
+        assert alert.status == "JUSTIFIED"
+        assert alert.closed_at is not None
+        history = session.scalars(
+            select(FraudAlertHistory)
+            .where(FraudAlertHistory.fraud_alert_id == alert_id)
+            .order_by(FraudAlertHistory.sequence)
+        ).all()
+        assert history[-1].event_type == "ALERT_AUTO_SUPERSEDED"
+        assert history[-1].previous_record_hash == history[-2].record_hash
+    engine.dispose()
+
+
+def test_old_operator_self_amplification_alert_is_reclassified_idempotently() -> None:
+    engine, factory = _database()
+    FraudWorker(factory).run_once()
+    with factory.begin() as session:
+        version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "UNUSUAL_OPERATOR_PATTERN")
+        )
+        assert version is not None
+        version.implementation_version = "rpg-fraud-1.0.0"
+        alert = FraudAlert(
+            fraud_rule_version_id=version.id,
+            transaction_id=uuid4(),
+            finding_key=_sha("old-operator-alert"),
+            severity="MEDIUM",
+            score=75,
+            status="OPEN",
+            description="Vecchio pattern operatore auto-amplificato",
+            explanation="Fixture sintetica",
+            confidence=80,
+            opened_at=NOW,
+        )
+        session.add(alert)
+        session.flush()
+        alert_id = alert.id
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 1
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 0
+
+    with factory() as session:
+        alert = session.get(FraudAlert, alert_id)
+        assert alert is not None and alert.status == "FALSE_POSITIVE"
+        evidence = session.scalar(
+            select(FraudAlertEvidence).where(
+                FraudAlertEvidence.fraud_alert_id == alert_id,
+                FraudAlertEvidence.evidence_type == "ENGINE_FALSE_POSITIVE",
+            )
+        )
+        assert evidence is not None
+        history = session.scalar(
+            select(FraudAlertHistory).where(FraudAlertHistory.fraud_alert_id == alert_id)
+        )
+        assert history is not None
+        assert history.event_type == "ALERT_AUTO_FALSE_POSITIVE"
+    engine.dispose()
+
+
+def test_global_duplicate_outside_correlation_is_reclassified_without_deletion() -> None:
+    engine, factory = _database()
+    _seed_scenario(factory, split=False)
+    CorrelationWorker(factory).run_once()
+    FraudWorker(factory).run_once()
+    outside_ids = (uuid4(), uuid4())
+    with factory.begin() as session:
+        correlation = session.scalar(
+            select(DocumentCorrelation).where(
+                DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED"))
+            )
+        )
+        version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "DUPLICATE_DOCUMENT")
+        )
+        assert correlation is not None and version is not None
+        version.implementation_version = "rpg-fraud-1.0.0"
+        alert = FraudAlert(
+            fraud_rule_version_id=version.id,
+            correlation_id=correlation.id,
+            transaction_id=correlation.transaction_id,
+            finding_key=_sha("global-duplicate-outside-correlation"),
+            severity="HIGH",
+            score=90,
+            status="OPEN",
+            description="Duplicato globale assegnato a transazione estranea",
+            explanation="Fixture sintetica",
+            confidence=90,
+            opened_at=NOW,
+        )
+        session.add(alert)
+        session.flush()
+        session.add(
+            FraudAlertEvidence(
+                fraud_alert_id=alert.id,
+                sequence=1,
+                evidence_type="duplicate_document",
+                summary="Documenti esterni alla correlazione",
+                evidence={
+                    "kind": "duplicate_document",
+                    "document_ids": [str(item) for item in outside_ids],
+                },
+            )
+        )
+        session.flush()
+        alert_id = alert.id
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 1
+
+    with factory() as session:
+        alert = session.get(FraudAlert, alert_id)
+        assert alert is not None and alert.status == "FALSE_POSITIVE"
+        assert session.scalar(
+            select(func.count())
+            .select_from(FraudAlertEvidence)
+            .where(FraudAlertEvidence.fraud_alert_id == alert_id)
+        ) == 2
+        assert session.scalar(
+            select(FraudAlertHistory.event_type).where(
+                FraudAlertHistory.fraud_alert_id == alert_id
+            )
+        ) == "ALERT_AUTO_FALSE_POSITIVE"
     engine.dispose()
 
 
@@ -868,6 +1466,9 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
             select(DocumentVersion).where(DocumentVersion.document_id == document_id)
         )
         assert first is not None
+        # A nullable field in the selected immutable version is meaningful: it
+        # must not inherit the value later written to the mutable projection.
+        first.order_code = None
         session.add(
             DocumentVersion(
                 document_id=document_id,
@@ -897,6 +1498,16 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
                 record_hash=_sha("new-version-record"),
             )
         )
+        projected = session.get(Document, document_id)
+        assert projected is not None
+        projected.document_type = "ORDER_CHANGE"
+        projected.subtype = "ORDER_CHANGE_REPARSED"
+        projected.external_document_code = "DOC-rollback-v2"
+        projected.order_code = "ORDER-V2"
+        projected.table_code = "TABLE-V2"
+        projected.operator_code = "OP-V2"
+        projected.terminal_code = "TERM-V2"
+        projected.document_timestamp = NOW + timedelta(seconds=30)
     with factory() as session:
         loaded = load_latest_documents(session, document_ids={document_id})
         assert len(loaded) == 1
@@ -940,8 +1551,62 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         assert loaded[0].value.parser_version == "1.0.0"
         assert loaded[0].value.gross_total == Decimal("100.0000")
         assert loaded[0].value.type.value == "PRE_BILL"
+        assert loaded[0].value.order_code is None
         assert loaded[0].value.table_code == "25-B"
         assert loaded[0].value.operator_code == "OP-1"
+    engine.dispose()
+
+
+def test_wholly_legacy_version_uses_document_projection_row_wide() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        device_id = _device(session, "pos_1", "pos", 9100)
+        parser = ParserVersion(
+            name="legacy-import",
+            version="0",
+            build_sha256=_sha("legacy-import-build"),
+            protocol="escpos",
+        )
+        session.add(parser)
+        session.flush()
+        document_id = _document(
+            session,
+            device_id=device_id,
+            parser_id=parser.id,
+            source="legacy-row",
+            document_type="PRE_BILL",
+            total="12.00",
+            when=NOW,
+            lines=(("Legacy", "12.00"),),
+            order_code="LEGACY-ORDER",
+            table_code="LEGACY-TABLE",
+            operator_code="LEGACY-OPERATOR",
+        )
+        version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == document_id)
+        )
+        assert version is not None
+        for field in (
+            "document_type",
+            "subtype",
+            "external_document_code",
+            "order_code",
+            "table_code",
+            "operator_code",
+            "terminal_code",
+            "document_timestamp",
+        ):
+            setattr(version, field, None)
+
+    with factory() as session:
+        loaded = load_latest_documents(session, document_ids={document_id})
+        assert len(loaded) == 1
+        value = loaded[0].value
+        assert value.type.value == "PRE_BILL"
+        assert value.order_code == "LEGACY-ORDER"
+        assert value.table_code == "LEGACY-TABLE"
+        assert value.operator_code == "LEGACY-OPERATOR"
+        assert value.document_timestamp == NOW
     engine.dispose()
 
 
@@ -1006,6 +1671,7 @@ def test_candidate_blocking_uses_semantics_from_selected_parser_version() -> Non
             select(DocumentVersion).where(DocumentVersion.document_id == seed_id)
         )
         assert first is not None
+        first.order_code = None
         second = DocumentVersion(
             document_id=seed_id,
             parser_version_id=new.id,
@@ -1046,6 +1712,16 @@ def test_candidate_blocking_uses_semantics_from_selected_parser_version() -> Non
         projected.table_code = "TABLE-NEW"
         projected.operator_code = "OP-NEW"
         projected.terminal_code = "TERM-NEW"
+        shadow_only_candidate = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == new_candidate_id
+            )
+        )
+        assert shadow_only_candidate is not None
+        shadow_only_candidate.table_code = None
+        shadow_candidate_projection = session.get(Document, new_candidate_id)
+        assert shadow_candidate_projection is not None
+        shadow_candidate_projection.table_code = "TABLE-OLD"
         session.add(
             ActiveParserVersion(
                 parser_name="escpos",
@@ -1069,7 +1745,11 @@ def test_candidate_blocking_uses_semantics_from_selected_parser_version() -> Non
                 cursor_timestamp=NOW,
                 cursor_id=uuid4(),
                 processed_count=0,
-                metadata_json={"parser_activation_fingerprint": fingerprint},
+                metadata_json={
+                    "parser_activation_fingerprint": fingerprint,
+                    "correlation_algorithm_version": ALGORITHM_VERSION,
+                    "price_attribution_algorithm_version": PRICE_ATTRIBUTION_ALGORITHM,
+                },
             )
         )
 
@@ -1084,6 +1764,7 @@ def test_candidate_blocking_uses_semantics_from_selected_parser_version() -> Non
         assert next(item.value for item in loaded if item.value.id == seed_id).table_code == (
             "TABLE-OLD"
         )
+        assert next(item.value for item in loaded if item.value.id == seed_id).order_code is None
 
     with factory.begin() as session:
         session.delete(session.get(AnalysisWatermark, "correlation"))
@@ -1142,4 +1823,52 @@ def test_parser_activation_without_rewind_preserves_and_rekeys_watermark() -> No
         assert watermark.metadata_json["parser_activation_no_rewind"]["parser_name"] == (
             "rch_rt_xml7"
         )
+    engine.dispose()
+
+
+def test_correlation_algorithm_change_rewinds_control_plane_watermark() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        device_id = _device(session, "pos_1", "pos", 9100)
+        parser = ParserVersion(
+            name="synthetic-watermark",
+            version="1.0.0",
+            build_sha256=_sha("synthetic-watermark-parser"),
+            protocol="synthetic",
+        )
+        session.add(parser)
+        session.flush()
+        document_id = _document(
+            session,
+            device_id=device_id,
+            parser_id=parser.id,
+            source="algorithm-rewind",
+            document_type="KITCHEN_ORDER",
+            total="0.00",
+            when=NOW,
+            lines=(("Voce sintetica", "0.00"),),
+        )
+        session.add(
+            AnalysisWatermark(
+                service="correlation",
+                cursor_timestamp=NOW + timedelta(days=1),
+                cursor_id=uuid4(),
+                processed_count=10,
+                metadata_json={
+                    "parser_activation_fingerprint": hashlib.sha256(
+                        canonical_json([])
+                    ).hexdigest(),
+                    "correlation_algorithm_version": "rpg-correlation-obsolete",
+                    "price_attribution_algorithm_version": PRICE_ATTRIBUTION_ALGORITHM,
+                },
+            )
+        )
+
+    with factory.begin() as session:
+        loaded, seeds = _candidate_batch(session, limit=10, lookback_seconds=60)
+        assert seeds == {document_id}
+        assert {item.value.id for item in loaded} == {document_id}
+        watermark = session.get(AnalysisWatermark, "correlation")
+        assert watermark is not None
+        assert watermark.metadata_json["correlation_algorithm_version"] == ALGORITHM_VERSION
     engine.dispose()

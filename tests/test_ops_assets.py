@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -167,6 +168,87 @@ def test_no_start_stages_without_switching_current_release() -> None:
     assert '"${RPG_STATE_ROOT}/staged-release"' in install
     assert '"${RPG_STATE_ROOT}/staged-web-release"' in install
     assert "exit 0" in install[no_start:activate_app]
+
+
+def test_control_plane_update_never_restarts_or_changes_proxy_code() -> None:
+    install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
+    update = (SCRIPTS / "update.sh").read_text(encoding="utf-8")
+    library = (SCRIPTS / "lib.sh").read_text(encoding="utf-8")
+    assert "--control-plane-only" in install
+    assert "--control-plane-only" in update
+    assert "rpg_assert_data_plane_unchanged" in install
+    assert "src/retailprintguard/proxy" in library
+    assert "src/retailprintguard/common/config.py" in library
+    assert "src/retailprintguard/common/logging.py" in library
+    assert "requirements/production.lock" in library
+    assert "pyproject.toml" in library
+    assert 'scripts.get("retailprintguard-proxy")' in library
+    assert "src/retailprintguard/__init__.py" in library
+    assert "package initializer executable code changed" in library
+    assert "data-plane artifact changed" in library
+    assert "pos_proxy_pid_before" in install
+    assert "rch_proxy_pid_before" in install
+    proxy_restart = (
+        "systemctl restart retailprintguard-pos-proxy.service "
+        "retailprintguard-rch-proxy.service"
+    )
+    assert proxy_restart in install
+    assert 'if [[ "${control_plane_only}" != yes ]]' in install
+    assert install.index('if [[ "${control_plane_only}" != yes ]]') < install.index(proxy_restart)
+    assert install.index("rpg_assert_data_plane_unchanged") < install.index(
+        "Applying versioned database migrations"
+    )
+
+
+def test_control_plane_gate_rejects_a_changed_proxy_entrypoint(tmp_path: Path) -> None:
+    bash = Path("/bin/bash")
+    if not bash.exists():
+        pytest.skip("POSIX bash is not available on this host")
+    current = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    paths = (
+        "src/retailprintguard/proxy",
+        "src/retailprintguard/common/config.py",
+        "src/retailprintguard/common/logging.py",
+        "src/retailprintguard/__init__.py",
+        "requirements/production.lock",
+        "systemd/retailprintguard-pos-proxy.service",
+        "systemd/retailprintguard-rch-proxy.service",
+        "pyproject.toml",
+    )
+    for root in (current, candidate):
+        for relative in paths:
+            source = ROOT / relative
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+    pyproject = candidate / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'retailprintguard-proxy = "retailprintguard.proxy.main:cli"',
+            'retailprintguard-proxy = "retailprintguard.api.main:cli"',
+        ),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(  # noqa: S603
+        [
+            str(bash),
+            "-c",
+            'source "$1"; rpg_assert_data_plane_unchanged "$2" "$3"',
+            "bash",
+            str(SCRIPTS / "lib.sh"),
+            str(current),
+            str(candidate),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "data-plane package contract changed" in completed.stderr
 
 
 def test_rollback_switches_application_and_its_mapped_frontend() -> None:

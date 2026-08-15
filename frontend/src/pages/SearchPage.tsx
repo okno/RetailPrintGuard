@@ -5,9 +5,11 @@ import { FormEvent, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
+import { PeriodPicker } from '../components/PeriodPicker'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import type { Page, SearchHit } from '../types'
 import { formatDateTime } from '../format'
+import { apiPeriodParams } from '../period'
 
 function routeFor(hit: SearchHit) {
   const entityType = hit.entity_type.toUpperCase()
@@ -23,14 +25,22 @@ export function SearchPage() {
   const [text, setText] = useState(params.get('q') ?? '')
   const navigate = useNavigate()
   const queryText = params.get('q') ?? ''
+  const requestParams = apiPeriodParams(params)
+  requestParams.set('q', queryText)
+  requestParams.set('limit', '100')
   const query = useQuery({
-    queryKey: scopedQueryKey('search', queryText),
-    queryFn: () => api<Page<SearchHit>>(`/search?q=${encodeURIComponent(queryText)}&limit=100`),
+    queryKey: scopedQueryKey('search', requestParams.toString()),
+    queryFn: () => api<Page<SearchHit>>(`/search?${requestParams.toString()}`),
     enabled: queryText.length >= 2,
   })
   function submit(event: FormEvent) {
     event.preventDefault()
-    if (text.trim().length >= 2) setParams({ q: text.trim() })
+    if (text.trim().length >= 2) {
+      const next = new URLSearchParams(params)
+      next.set('q', text.trim())
+      next.set('offset', '0')
+      setParams(next)
+    }
   }
   return (
     <>
@@ -39,6 +49,9 @@ export function SearchPage() {
         <Box component="form" onSubmit={submit} sx={{ display: 'flex', gap: 1 }}>
           <TextField fullWidth autoFocus label="Cerca nelle evidenze" value={text} onChange={(event) => setText(event.target.value)} InputProps={{ startAdornment: <InputAdornment position="start"><SearchOutlined /></InputAdornment> }} />
           <Button type="submit" variant="contained" disabled={text.trim().length < 2}>Cerca</Button>
+        </Box>
+        <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' }, gap: 2, mt: 2 }}>
+          <PeriodPicker params={params} onChange={setParams} />
         </Box>
       </Card>
       <Card>

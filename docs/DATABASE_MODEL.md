@@ -12,7 +12,7 @@ dello schema installato.
 | trasporto | `proxy_sessions`, `stream_chunks`, `print_jobs`, `raw_payloads` | provenienza e byte originali |
 | interpretazione | `parser_versions`, `active_parser_versions`, `documents`, `document_versions`, `document_lines` | output parser append-only |
 | ordini | `orders`, `order_events`, `order_snapshots`, `payments` | evoluzione economica ricostruibile |
-| correlazione | `document_correlations`, `document_correlation_members` | score, criteri e membri |
+| correlazione | `document_correlations`, `document_correlation_members`, `line_price_attributions` | score, criteri, membri e prezzi POS derivati con provenienza |
 | antifrode | `fraud_rules`, `fraud_rule_versions`, `fraud_whitelists`, `fraud_alerts`, `fraud_alert_evidence`, `fraud_alert_history` | regole ed evidenze spiegabili |
 | accesso | `users`, `roles`, `user_roles`, `audit_log` | autenticazione, RBAC e audit |
 | sistema | `system_events`, `import_batches`, `import_items`, `analysis_watermarks`, `hash_chain_heads` | operazioni e idempotenza |
@@ -29,6 +29,13 @@ dello schema installato.
 - `source_key`, hash e vincoli univoci rendono gli import idempotenti;
 - payload incompleti restano importabili ma sono marcati e non promossi a prova
   completa.
+- i prezzi ricavati da preconto, documento gestionale o commerciale sono
+  inferenze append-only; puntano alla riga e versione sorgente e non modificano
+  la riga POS o il RAW. Versioni monetarie incomplete non sono fonti; valori
+  discordanti restano evidenze di conflitto e non producono un prezzo scelto.
+- la revisione tecnica di un job incompleto aggiorna una proiezione auditata
+  (`PENDING`, `VERIFIED_USABLE`, `EXCLUDED`); la riapertura resta esclusa dalle
+  analisi fino a una nuova verifica esplicita e non cancella job o payload.
 
 ## Catene tamper-evident
 

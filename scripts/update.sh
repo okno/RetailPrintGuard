@@ -13,6 +13,7 @@ if [[ -d "${SCRIPT_DIR}/../frontend/dist" ]]; then
     frontend_dir="$(cd -- "${SCRIPT_DIR}/../frontend/dist" && pwd -P)"
 fi
 no_start=no
+control_plane_only=no
 allow_unlocked=no
 while (( $# > 0 )); do
     case "$1" in
@@ -25,12 +26,18 @@ while (( $# > 0 )); do
             no_start=yes
             shift
             ;;
+        --control-plane-only)
+            control_plane_only=yes
+            shift
+            ;;
         --allow-unlocked)
             allow_unlocked=yes
             shift
             ;;
         --help|-h)
-            printf 'Usage: sudo %s [--frontend-dir DIR] [--no-start] [--allow-unlocked]\n' "$0"
+            printf '%s\n' \
+                "Usage: sudo $0 [--frontend-dir DIR] [--no-start]" \
+                '       [--control-plane-only] [--allow-unlocked]'
             exit 0
             ;;
         *) rpg_die "unknown argument: $1" ;;
@@ -42,5 +49,6 @@ rpg_require_root
 "${SCRIPT_DIR}/backup.sh"
 args=(--frontend-dir "${frontend_dir}")
 [[ "${no_start}" == yes ]] && args+=(--no-start)
+[[ "${control_plane_only}" == yes ]] && args+=(--control-plane-only)
 [[ "${allow_unlocked}" == yes ]] && args+=(--allow-unlocked)
 exec "${SCRIPT_DIR}/install.sh" "${args[@]}"

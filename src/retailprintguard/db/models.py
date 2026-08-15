@@ -127,6 +127,11 @@ class PrintJob(Base):
         UniqueConstraint("source_system", "source_instance", "source_scope", "source_job_id"),
         Index("ix_print_jobs_device_started", "device_id", "started_at"),
         Index("ix_print_jobs_import_status", "import_status", "captured_at"),
+        Index("ix_print_jobs_review_state", "review_state", "captured_at"),
+        CheckConstraint(
+            "review_state IN ('PENDING', 'VERIFIED_USABLE', 'EXCLUDED')",
+            name="review_state",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid4)
@@ -156,6 +161,13 @@ class PrintJob(Base):
     warnings: Mapped[list[Any]] = mapped_column(JSON, default=list)
     errors: Mapped[list[Any]] = mapped_column(JSON, default=list)
     imported_at: Mapped[Any | None] = mapped_column(UTCDateTime())
+    review_state: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    analysis_excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reviewed_at: Mapped[Any | None] = mapped_column(UTCDateTime())
+    reviewed_by_user_id: Mapped[UUID | None] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    review_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class RawPayload(Base):
@@ -534,6 +546,97 @@ class DocumentCorrelationMember(Base):
     role: Mapped[str] = mapped_column(String(48), nullable=False)
     contribution_score: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     criteria: Mapped[list[Any]] = mapped_column(JSON, default=list)
+
+
+class LinePriceAttribution(Base):
+    """Append-only price provenance for a POS line.
+
+    The referenced :class:`DocumentLine` is never modified.  A row records one
+    monetary source considered by one versioned algorithm inside one persisted
+    correlation.  Conflicting candidates are retained as ``AMBIGUOUS`` rows so
+    downstream consumers cannot mistake an arbitrary choice for an observed
+    fact.
+    """
+
+    __tablename__ = "line_price_attributions"
+    __table_args__ = (
+        UniqueConstraint("attribution_fingerprint", name="uq_line_price_attr_fingerprint"),
+        UniqueConstraint(
+            "correlation_id",
+            "target_line_id",
+            "source_line_id",
+            "algorithm_version",
+            name="uq_line_price_attr_identity",
+        ),
+        CheckConstraint(
+            "source_kind IN ('PREBILL', 'MANAGEMENT', 'FISCAL')",
+            name="line_price_attr_source_kind",
+        ),
+        CheckConstraint(
+            "status IN ('RESOLVED', 'AGREED', 'AMBIGUOUS')",
+            name="line_price_attr_status",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="line_price_attr_confidence",
+        ),
+        CheckConstraint(
+            "observed_unit_price IS NOT NULL OR observed_line_total IS NOT NULL",
+            name="line_price_attr_has_amount",
+        ),
+        Index(
+            "ix_line_price_attr_target_created",
+            "target_line_id",
+            "created_at",
+        ),
+        Index(
+            "ix_line_price_attr_correlation_status",
+            "correlation_id",
+            "status",
+        ),
+        Index(
+            "ix_line_price_attr_source_document",
+            "source_document_id",
+            "source_document_version_id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid4)
+    correlation_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("document_correlations.id", ondelete="RESTRICT"), nullable=False
+    )
+    target_document_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("documents.id", ondelete="RESTRICT"), nullable=False
+    )
+    target_document_version_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("document_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    target_line_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("document_lines.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_document_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("documents.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_document_version_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("document_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_line_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("document_lines.id", ondelete="RESTRICT"), nullable=False
+    )
+    observed_unit_price: Mapped[Decimal | None] = mapped_column(MONEY)
+    observed_line_total: Mapped[Decimal | None] = mapped_column(MONEY)
+    target_quantity: Mapped[Decimal | None] = mapped_column(MONEY)
+    source_quantity: Mapped[Decimal | None] = mapped_column(MONEY)
+    source_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    match_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    criteria: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    ambiguity_group: Mapped[str | None] = mapped_column(SHA256)
+    attribution_fingerprint: Mapped[str] = mapped_column(SHA256, nullable=False)
+    source_observed_at: Mapped[Any] = mapped_column(UTCDateTime(), nullable=False)
+    created_at: Mapped[Any] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
 
 class FraudRule(Base):
@@ -937,6 +1040,7 @@ __all__ = [
     "HashChainHead",
     "ImportBatch",
     "ImportItem",
+    "LinePriceAttribution",
     "Order",
     "OrderEvent",
     "OrderSnapshot",

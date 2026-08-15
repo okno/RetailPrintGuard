@@ -1,5 +1,6 @@
 import {
   AccountTreeOutlined,
+  AssignmentLateOutlined,
   DashboardOutlined,
   DevicesOutlined,
   DescriptionOutlined,
@@ -46,6 +47,7 @@ const navigation: Array<{ label: string; path: string; icon: ReactNode; roles?: 
   { label: 'Dispositivi', path: '/dispositivi', icon: <DevicesOutlined /> },
   { label: 'Sessioni TCP', path: '/sessioni', icon: <LanOutlined /> },
   { label: 'Diagnostica', path: '/diagnostica', icon: <MonitorHeartOutlined /> },
+  { label: 'Job incompleti', path: '/incompleti', icon: <AssignmentLateOutlined />, roles: reviewerRoles },
   { label: 'Importazioni', path: '/importazioni', icon: <FileUploadOutlined />, roles: reviewerRoles },
 ]
 

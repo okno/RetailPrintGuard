@@ -13,6 +13,7 @@ source "${SCRIPT_DIR}/lib.sh"
 config_source=""
 frontend_source="${SOURCE_ROOT}/frontend/dist"
 start_services=yes
+control_plane_only=no
 replace_config=no
 allow_unlocked=no
 
@@ -23,6 +24,7 @@ usage() {
         '  --replace-config       replace an existing installed config with --config' \
         '  --frontend-dir DIR     prebuilt Vite dist (default: frontend/dist)' \
         '  --no-start             install and enable nothing; do not start services' \
+        '  --control-plane-only   activate without restarting the two proxy services' \
         '  --allow-unlocked       development only: permit installation without requirements lock' \
         '  --help'
 }
@@ -47,6 +49,10 @@ while (( $# > 0 )); do
             start_services=no
             shift
             ;;
+        --control-plane-only)
+            control_plane_only=yes
+            shift
+            ;;
         --allow-unlocked)
             allow_unlocked=yes
             shift
@@ -58,6 +64,13 @@ while (( $# > 0 )); do
         *) rpg_die "unknown argument: $1" ;;
     esac
 done
+
+if [[ "${start_services}" == no && "${control_plane_only}" == yes ]]; then
+    rpg_die "--no-start and --control-plane-only are mutually exclusive"
+fi
+if [[ "${control_plane_only}" == yes && ! -L "${RPG_CURRENT_LINK}" ]]; then
+    rpg_die "--control-plane-only requires an existing active installation"
+fi
 
 rpg_require_root
 rpg_acquire_lock
@@ -81,6 +94,25 @@ fi
 [[ -d "${frontend_source}" && -f "${frontend_source}/index.html" ]] || \
     rpg_die "prebuilt frontend is missing; expected ${frontend_source}/index.html"
 frontend_source="$(readlink -f -- "${frontend_source}")"
+
+pos_proxy_pid_before=""
+rch_proxy_pid_before=""
+if [[ "${control_plane_only}" == yes ]]; then
+    active_release="$(readlink -f -- "${RPG_CURRENT_LINK}")"
+    # Fail before package installation, database configuration or Alembic DDL.
+    # The checked closure contains the relay, its direct shared modules, runtime
+    # dependency lock and both units.  The active processes are then verified
+    # again after the control-plane switch.
+    rpg_assert_data_plane_unchanged "${active_release}" "${SOURCE_ROOT}"
+    systemctl is-active --quiet retailprintguard-pos-proxy.service || \
+        rpg_die "POS proxy must be active for --control-plane-only"
+    systemctl is-active --quiet retailprintguard-rch-proxy.service || \
+        rpg_die "RCH proxy must be active for --control-plane-only"
+    pos_proxy_pid_before="$(systemctl show retailprintguard-pos-proxy.service -p MainPID --value)"
+    rch_proxy_pid_before="$(systemctl show retailprintguard-rch-proxy.service -p MainPID --value)"
+    [[ "${pos_proxy_pid_before}" =~ ^[1-9][0-9]*$ ]] || rpg_die "invalid POS proxy PID"
+    [[ "${rch_proxy_pid_before}" =~ ^[1-9][0-9]*$ ]] || rpg_die "invalid RCH proxy PID"
+fi
 
 rpg_note "Installing Debian dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -374,6 +406,7 @@ if [[ "${start_services}" == no ]]; then
     rpg_note "Services and current symlinks were left unchanged (--no-start)"
     exit 0
 fi
+
 rpg_atomic_symlink "${release_path}" "${RPG_CURRENT_LINK}"
 rpg_atomic_symlink "${web_release}" "${RPG_WEB_CURRENT}"
 
@@ -397,11 +430,21 @@ nginx -t
 systemctl enable retailprintguard.target
 systemctl enable --now retailprintguard-backup.timer
 systemctl enable nginx.service
-systemctl restart retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service
+if [[ "${control_plane_only}" != yes ]]; then
+    systemctl restart retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service
+fi
 systemctl restart retailprintguard-ingestion.service retailprintguard-parser.service \
     retailprintguard-correlation.service \
     retailprintguard-fraud.service retailprintguard-api.service
 systemctl reload nginx.service
+
+if [[ "${control_plane_only}" == yes ]]; then
+    [[ "$(systemctl show retailprintguard-pos-proxy.service -p MainPID --value)" == \
+        "${pos_proxy_pid_before}" ]] || rpg_die "POS proxy PID changed during control-plane update"
+    [[ "$(systemctl show retailprintguard-rch-proxy.service -p MainPID --value)" == \
+        "${rch_proxy_pid_before}" ]] || rpg_die "RCH proxy PID changed during control-plane update"
+    rpg_note "Proxy PIDs were preserved; no listener process was restarted"
+fi
 
 rpg_note "Installed release ${release_hash}"
 rpg_note "No address, route, DNS or firewall setting was changed."

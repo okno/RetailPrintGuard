@@ -1,5 +1,6 @@
-import { Box, Card, CardContent, Typography } from '@mui/material'
+import { Box, Card, CardActionArea, CardContent, Typography } from '@mui/material'
 import type { ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 
 export function StatCard({
   label,
@@ -7,27 +8,30 @@ export function StatCard({
   helper,
   icon,
   tone = '#173f5f',
+  to,
 }: {
   label: string
   value: string | number
   helper?: string
   icon: ReactNode
   tone?: string
+  to?: string
 }) {
+  const content = <CardContent sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
+    <Box>
+      <Typography variant="body2" color="text.secondary" fontWeight={650}>
+        {label}
+      </Typography>
+      <Typography variant="h4" sx={{ mt: 0.75, fontWeight: 760, letterSpacing: '-0.03em' }}>
+        {value}
+      </Typography>
+      {helper && <Typography variant="caption" color="text.secondary">{helper}</Typography>}
+    </Box>
+    <Box sx={{ color: tone, bgcolor: `${tone}12`, borderRadius: 2, p: 1.25, height: 44 }}>{icon}</Box>
+  </CardContent>
   return (
     <Card sx={{ height: '100%' }}>
-      <CardContent sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-        <Box>
-          <Typography variant="body2" color="text.secondary" fontWeight={650}>
-            {label}
-          </Typography>
-          <Typography variant="h4" sx={{ mt: 0.75, fontWeight: 760, letterSpacing: '-0.03em' }}>
-            {value}
-          </Typography>
-          {helper && <Typography variant="caption" color="text.secondary">{helper}</Typography>}
-        </Box>
-        <Box sx={{ color: tone, bgcolor: `${tone}12`, borderRadius: 2, p: 1.25, height: 44 }}>{icon}</Box>
-      </CardContent>
+      {to ? <CardActionArea component={Link} to={to} sx={{ height: '100%' }}>{content}</CardActionArea> : content}
     </Card>
   )
 }

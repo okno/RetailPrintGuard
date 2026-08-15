@@ -18,6 +18,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from retailprintguard import __version__
 from retailprintguard.api.auth import LoginThrottle, TokenService, constant_time_dummy_verify
 from retailprintguard.api.repository import ApiRepository, RawArtifact
+from retailprintguard.api.review_secret import ReviewSecretVerifier
 from retailprintguard.api.schemas import (
     AlertUpdate,
     AlertView,
@@ -28,6 +29,7 @@ from retailprintguard.api.schemas import (
     DocumentView,
     HealthView,
     ImportBatchView,
+    JobReviewRequest,
     JobView,
     LoginRequest,
     OrderView,
@@ -73,16 +75,46 @@ def _stream_bytes(payload: bytes, *, chunk_size: int = 64 * 1024) -> Any:
         yield bytes(view[offset : offset + chunk_size])
 
 
+def _utc_period(
+    period_from: datetime | None,
+    period_to: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    """Validate a half-open, timezone-aware interval and normalize it to UTC."""
+
+    for label, value in (("from", period_from), ("to", period_to)):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Il parametro {label} deve includere il fuso orario",
+            )
+    normalized_from = period_from.astimezone(UTC) if period_from is not None else None
+    normalized_to = period_to.astimezone(UTC) if period_to is not None else None
+    if (
+        normalized_from is not None
+        and normalized_to is not None
+        and normalized_to <= normalized_from
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Il parametro to deve essere successivo a from",
+        )
+    return normalized_from, normalized_to
+
+
 class ApiContext:
     def __init__(
         self,
         repository: ApiRepository,
         tokens: TokenService,
         throttle: LoginThrottle,
+        review_secret: ReviewSecretVerifier | None = None,
+        review_throttle: LoginThrottle | None = None,
     ) -> None:
         self.repository = repository
         self.tokens = tokens
         self.throttle = throttle
+        self.review_secret = review_secret or ReviewSecretVerifier(None)
+        self.review_throttle = review_throttle or LoginThrottle(limit=5, delay_seconds=2)
 
 
 def create_router(context: ApiContext) -> APIRouter:
@@ -219,8 +251,14 @@ def create_router(context: ApiContext) -> APIRouter:
         return user
 
     @router.get("/dashboard", response_model=DashboardView, tags=["dashboard"])
-    def dashboard(_: AnyUser, repo: Annotated[ApiRepository, Depends(repository)]) -> DashboardView:
-        return repo.dashboard()
+    def dashboard(
+        _: AnyUser,
+        repo: Annotated[ApiRepository, Depends(repository)],
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
+    ) -> DashboardView:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
+        return repo.dashboard(filters={"from": normalized_from, "to": normalized_to})
 
     @router.get("/devices", response_model=list[DeviceView], tags=["devices"])
     def devices(
@@ -260,13 +298,64 @@ def create_router(context: ApiContext) -> APIRouter:
         offset: Annotated[int, Query(ge=0)] = 0,
         device_id: str | None = None,
         job_status: str | None = Query(default=None, alias="status"),
+        incomplete: bool | None = None,
+        review_state: str | None = None,
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> Page[JobView]:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
         items, total = repo.list_jobs(
             limit=limit,
             offset=offset,
-            filters={"device_id": device_id, "status": job_status},
+            filters={
+                "device_id": device_id,
+                "status": job_status,
+                "incomplete": incomplete,
+                "review_state": review_state,
+                "from": normalized_from,
+                "to": normalized_to,
+            },
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
+
+    @router.post("/jobs/{job_id}/review", response_model=JobView, tags=["jobs"])
+    def review_job(
+        job_id: UUID,
+        body: JobReviewRequest,
+        request: Request,
+        user: Admin,
+        repo: Annotated[ApiRepository, Depends(repository)],
+    ) -> JobView:
+        if not context.review_secret.configured:
+            raise HTTPException(
+                status_code=503,
+                detail="Password di conferma revisione non configurata",
+            )
+        client_ip = request.client.host if request.client else "unknown"
+        throttle_identity = f"job-review:{user.username}"
+        retry_after = context.review_throttle.retry_after(client_ip, throttle_identity)
+        if retry_after > 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Troppi tentativi; riprovare più tardi",
+                headers={"Retry-After": str(max(1, int(retry_after)))},
+            )
+        if not context.review_secret.verify(body.confirmation_password):
+            context.review_throttle.failure(client_ip, throttle_identity)
+            raise HTTPException(status_code=403, detail="Password di conferma non valida")
+        context.review_throttle.success(client_ip, throttle_identity)
+        try:
+            result = repo.review_job(
+                job_id,
+                body,
+                user,
+                correlation_id=request.state.correlation_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        if result is None:
+            raise HTTPException(status_code=404, detail="Job non trovato")
+        return result
 
     @router.get("/sessions/{session_id}/raw", tags=["sessions"])
     def session_raw(
@@ -326,7 +415,10 @@ def create_router(context: ApiContext) -> APIRouter:
         exclude_type: str | None = None,
         device_id: str | None = None,
         order_code: str | None = None,
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> Page[DocumentView]:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
         items, total = repo.list_documents(
             limit=limit,
             offset=offset,
@@ -335,6 +427,8 @@ def create_router(context: ApiContext) -> APIRouter:
                 "exclude_type": exclude_type,
                 "device_id": device_id,
                 "order_code": order_code,
+                "from": normalized_from,
+                "to": normalized_to,
             },
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
@@ -486,7 +580,12 @@ def create_router(context: ApiContext) -> APIRouter:
         order_code: str | None = None,
         operator_code: str | None = None,
         minimum_difference: Decimal | None = None,
+        operational_economic_only: bool = False,
+        reduction_only: bool = False,
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> Page[TransactionView]:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
         items, total = repo.list_transactions(
             limit=limit,
             offset=offset,
@@ -495,6 +594,10 @@ def create_router(context: ApiContext) -> APIRouter:
                 "order_code": order_code,
                 "operator_code": operator_code,
                 "minimum_difference": minimum_difference,
+                "operational_economic_only": operational_economic_only,
+                "reduction_only": reduction_only,
+                "from": normalized_from,
+                "to": normalized_to,
             },
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
@@ -520,7 +623,11 @@ def create_router(context: ApiContext) -> APIRouter:
         alert_status: str | None = Query(default=None, alias="status"),
         device_id: str | None = None,
         operator_code: str | None = None,
+        view: Literal["operational", "archive", "all"] | None = None,
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> StreamingResponse:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
         items, _ = repo.list_alerts(
             limit=10_000,
             offset=0,
@@ -530,6 +637,9 @@ def create_router(context: ApiContext) -> APIRouter:
                 "status": alert_status,
                 "device_id": device_id,
                 "operator_code": operator_code,
+                "view": view,
+                "from": normalized_from,
+                "to": normalized_to,
             },
         )
         buffer = io.StringIO(newline="")
@@ -567,7 +677,11 @@ def create_router(context: ApiContext) -> APIRouter:
         alert_status: str | None = Query(default=None, alias="status"),
         device_id: str | None = None,
         operator_code: str | None = None,
+        view: Literal["operational", "archive", "all"] | None = None,
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> Page[AlertView]:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
         items, total = repo.list_alerts(
             limit=limit,
             offset=offset,
@@ -577,6 +691,9 @@ def create_router(context: ApiContext) -> APIRouter:
                 "status": alert_status,
                 "device_id": device_id,
                 "operator_code": operator_code,
+                "view": view,
+                "from": normalized_from,
+                "to": normalized_to,
             },
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
@@ -629,8 +746,16 @@ def create_router(context: ApiContext) -> APIRouter:
         q: Annotated[str, Query(min_length=2, max_length=200)],
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> Page[SearchHit]:
-        items, total = repo.search(query=q, limit=limit, offset=offset)
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
+        items, total = repo.search(
+            query=q,
+            limit=limit,
+            offset=offset,
+            filters={"from": normalized_from, "to": normalized_to},
+        )
         return Page(items=items, total=total, limit=limit, offset=offset)
 
     @router.get("/imports", response_model=Page[ImportBatchView], tags=["imports"])

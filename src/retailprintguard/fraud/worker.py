@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from retailprintguard.common.domain import AlertSeverity, OrderEventType
 from retailprintguard.common.domain import OrderEvent as DomainOrderEvent
-from retailprintguard.common.hashchain import ZERO_HASH, chained_hash
+from retailprintguard.common.hashchain import ZERO_HASH, canonical_json, chained_hash
 from retailprintguard.correlation.engine import ALGORITHM_VERSION, CorrelationEngine
 from retailprintguard.correlation.worker import (
     LoadedDocument,
@@ -48,7 +49,7 @@ from retailprintguard.fraud.engine import (
 )
 from retailprintguard.fraud.versioning import rule_configuration_fingerprint
 
-FRAUD_ENGINE_VERSION = "rpg-fraud-1.0.0"
+FRAUD_ENGINE_VERSION = "rpg-fraud-1.1.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,7 @@ class FraudRunReport:
     alerts_inserted: int
     evidence_inserted: int
     alerts_superseded: int
+    alerts_reclassified: int
 
 
 def _json_safe(value: Any) -> Any:
@@ -99,10 +101,15 @@ class FraudWorker:
         now = datetime.now(UTC)
         with self._factory.begin() as session:
             alerts_superseded = 0
+            alerts_reclassified = 0
             rule_rows = self._ensure_and_load_rules(session, now)
             rules = tuple(definition for definition, _ in rule_rows.values())
             engine = FraudEngine(rules)
             correlations = self._current_correlations(session, limit=max_transactions)
+            # Clean known legacy defects before computing operator statistics,
+            # otherwise the very alerts being retired would influence the new
+            # anomaly rate for one additional worker cycle.
+            alerts_reclassified = self._reclassify_known_false_positives(session, now)
             member_ids = {
                 document_id
                 for correlation in correlations
@@ -197,7 +204,25 @@ class FraudWorker:
                     FraudContext(
                         transaction=transaction,
                         order_events=order_events,
-                        comparison_documents=comparison_documents,
+                        comparison_documents=tuple(
+                            document
+                            for document in comparison_documents
+                            if (
+                                document.source_device_id,
+                                document.type,
+                                (document.document_timestamp or document.captured_at).date(),
+                            )
+                            in {
+                                (
+                                    member.source_device_id,
+                                    member.type,
+                                    (
+                                        member.document_timestamp or member.captured_at
+                                    ).date(),
+                                )
+                                for member in transaction.documents
+                            }
+                        ),
                         operator_stats=stats,
                         whitelist_entries=whitelists,
                         evaluated_at=now,
@@ -240,11 +265,142 @@ class FraudWorker:
                 alerts_inserted=alerts_inserted,
                 evidence_inserted=evidence_inserted,
                 alerts_superseded=alerts_superseded,
+                alerts_reclassified=alerts_reclassified,
             )
 
     @staticmethod
+    def _reclassify_known_false_positives(session: Session, now: datetime) -> int:
+        candidates = session.execute(
+            select(FraudAlert, FraudRule.code, FraudRuleVersion.implementation_version)
+            .join(
+                FraudRuleVersion,
+                FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
+            )
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(
+                FraudAlert.status == "OPEN",
+                FraudRule.code.in_(("DUPLICATE_DOCUMENT", "UNUSUAL_OPERATOR_PATTERN")),
+                FraudRuleVersion.implementation_version == "rpg-fraud-1.0.0",
+            )
+            .order_by(FraudAlert.opened_at, FraudAlert.id)
+            .with_for_update()
+        ).all()
+        reclassified = 0
+        for alert, rule_code, implementation_version in candidates:
+            reason: str | None = None
+            diagnostic: dict[str, Any] = {
+                "kind": "engine_false_positive_reclassification",
+                "rule_code": rule_code,
+                "previous_implementation_version": implementation_version,
+                "current_implementation_version": FRAUD_ENGINE_VERSION,
+            }
+            if rule_code == "UNUSUAL_OPERATOR_PATTERN":
+                reason = (
+                    "La versione precedente includeva alert non operativi e la stessa regola "
+                    "nel tasso operatore, producendo auto-amplificazione. Il risultato viene "
+                    "ricalcolato dalla versione corretta."
+                )
+                diagnostic["defect"] = "operator_rate_self_amplification"
+            elif alert.correlation_id is not None:
+                member_ids = set(
+                    session.scalars(
+                        select(DocumentCorrelationMember.document_id).where(
+                            DocumentCorrelationMember.correlation_id == alert.correlation_id
+                        )
+                    )
+                )
+                evidence_rows = session.scalars(
+                    select(FraudAlertEvidence).where(
+                        FraudAlertEvidence.fraud_alert_id == alert.id,
+                        FraudAlertEvidence.evidence_type == "duplicate_document",
+                    )
+                ).all()
+                involved_ids: set[UUID] = set()
+                for evidence in evidence_rows:
+                    for candidate_id in (evidence.evidence or {}).get("document_ids", []):
+                        try:
+                            involved_ids.add(UUID(str(candidate_id)))
+                        except (TypeError, ValueError):
+                            continue
+                if involved_ids and not (member_ids & involved_ids):
+                    reason = (
+                        "La precedente valutazione globale ha assegnato alla transazione un "
+                        "gruppo duplicato composto esclusivamente da documenti esterni."
+                    )
+                    diagnostic.update(
+                        {
+                            "defect": "global_finding_outside_transaction",
+                            "correlation_member_count": len(member_ids),
+                            "finding_document_count": len(involved_ids),
+                        }
+                    )
+            if reason is None:
+                continue
+
+            previous_status = alert.status
+            alert.status = "FALSE_POSITIVE"
+            alert.closed_at = now
+            alert.updated_at = now
+            alert.closure_reason = reason
+            evidence_sequence = (
+                session.scalar(
+                    select(func.max(FraudAlertEvidence.sequence)).where(
+                        FraudAlertEvidence.fraud_alert_id == alert.id
+                    )
+                )
+                or 0
+            ) + 1
+            session.add(
+                FraudAlertEvidence(
+                    fraud_alert_id=alert.id,
+                    sequence=evidence_sequence,
+                    evidence_type="ENGINE_FALSE_POSITIVE",
+                    summary="Riclassificazione automatica verificabile",
+                    evidence=diagnostic,
+                )
+            )
+            latest = session.scalar(
+                select(FraudAlertHistory)
+                .where(FraudAlertHistory.fraud_alert_id == alert.id)
+                .order_by(FraudAlertHistory.sequence.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            history_sequence = 1 if latest is None else latest.sequence + 1
+            previous_hash = ZERO_HASH if latest is None else latest.record_hash
+            payload = {
+                "alert_id": str(alert.id),
+                "sequence": history_sequence,
+                "actor_user_id": None,
+                "event_type": "ALERT_AUTO_FALSE_POSITIVE",
+                "previous_status": previous_status,
+                "new_status": "FALSE_POSITIVE",
+                "note": None,
+                "reason": reason,
+                "occurred_at": now.isoformat(),
+                "previous_hash": previous_hash,
+            }
+            session.add(
+                FraudAlertHistory(
+                    fraud_alert_id=alert.id,
+                    sequence=history_sequence,
+                    event_type="ALERT_AUTO_FALSE_POSITIVE",
+                    previous_status=previous_status,
+                    new_status="FALSE_POSITIVE",
+                    reason=reason,
+                    occurred_at=now,
+                    previous_record_hash=previous_hash,
+                    record_hash=chained_hash(payload, previous_hash),
+                )
+            )
+            reclassified += 1
+        if reclassified:
+            session.flush()
+        return reclassified
+
+    @staticmethod
     def _resolve_superseded_alerts(session: Session, now: datetime) -> int:
-        """Justify stale automatic alerts only after a superset correlation exists."""
+        """Justify stale alerts after a current replacement correlation exists."""
 
         alerts = session.scalars(
             select(FraudAlert)
@@ -275,6 +431,7 @@ class FraudWorker:
                 )
                 .where(
                     DocumentCorrelation.id != alert.correlation_id,
+                    DocumentCorrelation.algorithm_version == ALGORITHM_VERSION,
                     DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
                     DocumentCorrelationMember.document_id.in_(old_members),
                 )
@@ -289,35 +446,9 @@ class FraudWorker:
                         )
                     )
                 )
-                if old_members < candidate_members:
+                if old_members & candidate_members:
                     replacements.append(candidate)
             if not replacements:
-                continue
-
-            old_rule_code = session.scalar(
-                select(FraudRule.code)
-                .join(
-                    FraudRuleVersion,
-                    FraudRuleVersion.fraud_rule_id == FraudRule.id,
-                )
-                .where(FraudRuleVersion.id == alert.fraud_rule_version_id)
-            )
-            replacement_ids = [item.id for item in replacements]
-            replacement_has_same_finding = session.scalar(
-                select(FraudAlert.id)
-                .join(
-                    FraudRuleVersion,
-                    FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
-                )
-                .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
-                .where(
-                    FraudAlert.correlation_id.in_(replacement_ids),
-                    FraudAlert.status.in_(("OPEN", "UNDER_REVIEW", "CONFIRMED")),
-                    FraudRule.code == old_rule_code,
-                )
-                .limit(1)
-            )
-            if replacement_has_same_finding is not None:
                 continue
 
             previous_status = alert.status
@@ -325,8 +456,9 @@ class FraudWorker:
             alert.closed_at = now
             alert.updated_at = now
             alert.closure_reason = (
-                "Correlazione sostituita da un aggregato successivo contenente nuove "
-                "evidenze; l'alert originario non rappresenta più lo stato corrente."
+                "Correlazione sostituita da una valutazione corrente di algoritmo, parser "
+                "o insieme documentale; l'alert originario non rappresenta più lo stato "
+                "corrente."
             )
             evidence_sequence = (
                 session.scalar(
@@ -342,7 +474,7 @@ class FraudWorker:
                     fraud_alert_id=alert.id,
                     sequence=evidence_sequence,
                     evidence_type="CORRELATION_SUPERSEDED",
-                    summary="Alert giustificato dopo correlazione con evidenze tardive",
+                    summary="Alert giustificato dopo sostituzione della correlazione",
                     evidence={
                         "kind": "correlation_superseded",
                         "previous_correlation_id": str(alert.correlation_id),
@@ -594,7 +726,17 @@ class FraudWorker:
         anomalous = set(
             session.scalars(
                 select(FraudAlert.transaction_id)
-                .where(FraudAlert.transaction_id.in_(transaction_ids))
+                .join(
+                    FraudRuleVersion,
+                    FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
+                )
+                .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+                .where(
+                    FraudAlert.transaction_id.in_(transaction_ids),
+                    FraudAlert.status.in_(("OPEN", "UNDER_REVIEW", "CONFIRMED")),
+                    FraudAlert.is_canonical.is_(True),
+                    FraudRule.code != "UNUSUAL_OPERATOR_PATTERN",
+                )
                 .distinct()
             )
         )
@@ -614,15 +756,108 @@ class FraudWorker:
         if row is None:
             return False, 0
         _, rule_version = row
-        finding_key = finding_fingerprint(finding)
+        finding_key = hashlib.sha256(
+            canonical_json(
+                {
+                    "finding": finding_fingerprint(finding),
+                    "correlation_algorithm": correlation.algorithm_version,
+                    "correlation_input": correlation.input_fingerprint,
+                }
+            )
+        ).hexdigest()
         existing = session.scalar(
-            select(FraudAlert.id).where(
+            select(FraudAlert).where(
                 FraudAlert.fraud_rule_version_id == rule_version.id,
                 FraudAlert.transaction_id == finding.transaction_id,
                 FraudAlert.finding_key == finding_key,
             )
         )
         if existing is not None:
+            # A job re-inclusion only clears the analysis exclusion and rewinds the
+            # correlation worker.  Reopen a previously justified alert solely when
+            # this exact finding has just been reproduced by the current engines and
+            # its latest transition was the audited job exclusion.  Other historical
+            # or superseded findings remain closed.
+            latest = session.scalar(
+                select(FraudAlertHistory)
+                .where(FraudAlertHistory.fraud_alert_id == existing.id)
+                .order_by(FraudAlertHistory.sequence.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if (
+                suppression is None
+                and existing.status == "JUSTIFIED"
+                and latest is not None
+                and latest.event_type == "ALERT_JOB_EXCLUDED"
+            ):
+                now = datetime.now(UTC)
+                previous_status = existing.status
+                existing.status = "OPEN"
+                existing.closed_at = None
+                existing.updated_at = now
+                existing.closure_reason = None
+                exclusion_evidence = session.scalar(
+                    select(FraudAlertEvidence)
+                    .where(
+                        FraudAlertEvidence.fraud_alert_id == existing.id,
+                        FraudAlertEvidence.evidence_type
+                        == "JOB_EXCLUDED_FROM_ANALYSIS",
+                    )
+                    .order_by(FraudAlertEvidence.sequence.desc())
+                    .limit(1)
+                )
+                evidence_sequence = (
+                    session.scalar(
+                        select(func.max(FraudAlertEvidence.sequence)).where(
+                            FraudAlertEvidence.fraud_alert_id == existing.id
+                        )
+                    )
+                    or 0
+                ) + 1
+                session.add(
+                    FraudAlertEvidence(
+                        fraud_alert_id=existing.id,
+                        sequence=evidence_sequence,
+                        print_job_id=(
+                            None if exclusion_evidence is None else exclusion_evidence.print_job_id
+                        ),
+                        evidence_type="JOB_REINCLUDED_FINDING_CONFIRMED",
+                        summary="Finding nuovamente confermato dal ricalcolo dopo la riapertura",
+                        evidence={
+                            "kind": "job_reincluded_finding_confirmed",
+                            "finding_key": finding_key,
+                            "correlation_id": str(correlation.id),
+                        },
+                    )
+                )
+                history_sequence = latest.sequence + 1
+                history_payload = {
+                    "alert_id": str(existing.id),
+                    "sequence": history_sequence,
+                    "actor_user_id": None,
+                    "event_type": "ALERT_AUTO_REOPENED_AFTER_JOB_REVIEW",
+                    "previous_status": previous_status,
+                    "new_status": "OPEN",
+                    "note": None,
+                    "reason": "Finding confermato dal ricalcolo corrente",
+                    "occurred_at": now.isoformat(),
+                    "previous_hash": latest.record_hash,
+                }
+                session.add(
+                    FraudAlertHistory(
+                        fraud_alert_id=existing.id,
+                        sequence=history_sequence,
+                        event_type="ALERT_AUTO_REOPENED_AFTER_JOB_REVIEW",
+                        previous_status=previous_status,
+                        new_status="OPEN",
+                        reason="Finding confermato dal ricalcolo corrente",
+                        occurred_at=now,
+                        previous_record_hash=latest.record_hash,
+                        record_hash=chained_hash(history_payload, latest.record_hash),
+                    )
+                )
+                return False, 1
             return False, 0
         documents = [
             loaded_by_id[document_id].value
@@ -632,15 +867,27 @@ class FraudWorker:
         serialized_evidence = finding.model_dump(mode="json")["evidence"]
         prebills = [item for item in documents if item.type.value == "PRE_BILL"]
         fiscals = [
-            item for item in documents if item.type.value in {"COMMERCIAL_DOCUMENT", "REFUND"}
+            item
+            for item in documents
+            if item.type.value == "COMMERCIAL_DOCUMENT"
+            and item.complete
+            and (item.gross_total is not None or item.net_total is not None)
         ]
-        original_amount = prebills[-1].gross_total if prebills else None
+        original_amount = (
+            prebills[-1].gross_total
+            if prebills and prebills[-1].gross_total is not None
+            else prebills[-1].net_total
+            if prebills
+            else None
+        )
         final_amount = (
             sum(
                 (
-                    -(item.gross_total or Decimal("0"))
-                    if item.type.value == "REFUND"
-                    else (item.gross_total or Decimal("0"))
+                    item.gross_total
+                    if item.gross_total is not None
+                    else item.net_total
+                    if item.net_total is not None
+                    else Decimal("0")
                 )
                 for item in fiscals
             )

@@ -11,7 +11,12 @@ import pytest
 from sqlalchemy import func, select
 
 from retailprintguard.api.auth import PasswordService
-from retailprintguard.api.schemas import AlertUpdate, AuditEntry, RoleName
+from retailprintguard.api.schemas import (
+    AlertUpdate,
+    AuditEntry,
+    JobReviewRequest,
+    RoleName,
+)
 from retailprintguard.common.domain import DocumentType
 from retailprintguard.db import Base, create_db_engine, session_factory
 from retailprintguard.db.models import (
@@ -31,6 +36,8 @@ from retailprintguard.db.models import (
     FraudRuleVersion,
     ImportBatch,
     ImportItem,
+    Order,
+    OrderEvent,
     ParserVersion,
     PrintJob,
     ProxySession,
@@ -330,6 +337,84 @@ def _seed_api(factory):
     return ids
 
 
+def _add_correlated_document(
+    session,
+    ids,
+    *,
+    document_type: str,
+    total: str | None,
+    complete: bool,
+    minute: int = 1,
+    raw_metadata: dict[str, object] | None = None,
+    line_total: str | None = None,
+):
+    document_id = uuid4()
+    document = Document(
+        id=document_id,
+        device_id=ids["device"],
+        session_id=ids["session"],
+        job_id=ids["job"],
+        source_document_key=f"doc-{document_id}",
+        document_type=document_type,
+        subtype=document_type,
+        external_document_code=f"{document_type}-{document_id}",
+        order_code="ORD-80",
+        table_code="25-B",
+        document_timestamp=NOW + timedelta(minutes=minute),
+        captured_at=NOW + timedelta(minutes=minute, seconds=1),
+    )
+    session.add(document)
+    session.flush()
+    version = DocumentVersion(
+        document_id=document_id,
+        parser_version_id=ids["parser"],
+        raw_payload_id=ids["raw"],
+        version_sequence=1,
+        document_type=document_type,
+        subtype=document_type,
+        external_document_code=document.external_document_code,
+        order_code=document.order_code,
+        table_code=document.table_code,
+        document_timestamp=document.document_timestamp,
+        gross_total=None if total is None else Decimal(total),
+        status="COMPLETE" if complete else "PARTIAL",
+        normalized_text=document_type,
+        parse_confidence=100,
+        evidence_level="CONFIRMED",
+        source_manifest_sha256="a" * 64,
+        source_payload_sha256=hashlib.sha256(str(document_id).encode()).hexdigest(),
+        source_path=f"/spool/{document_id}.raw",
+        complete=complete,
+        raw_metadata=raw_metadata or {},
+        chain_scope=f"document:{document_id}",
+        chain_sequence=1,
+        previous_record_hash="0" * 64,
+        record_hash=hashlib.sha256(f"record:{document_id}".encode()).hexdigest(),
+    )
+    session.add(version)
+    session.flush()
+    if line_total is not None:
+        session.add(
+            DocumentLine(
+                document_version_id=version.id,
+                sequence=1,
+                description="Crudo e melone",
+                quantity=Decimal("1"),
+                unit_price=Decimal(line_total),
+                line_total=Decimal(line_total),
+            )
+        )
+    session.add(
+        DocumentCorrelationMember(
+            correlation_id=ids["correlation"],
+            document_id=document_id,
+            role=document_type,
+            contribution_score=95,
+        )
+    )
+    return document_id, version.id
+
+
 def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> None:
     engine, factory = _factory()
     ids = _seed_api(factory)
@@ -358,6 +443,18 @@ def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> Non
     assert repository.get_document_raw(ids["document"]).content == b"PRECONTO 100,00"
     hits, hit_count = repository.search(query="melone", limit=10, offset=0)
     assert hit_count == 1 and hits[0].entity_id == ids["document"]
+    transactions, transaction_count = repository.list_transactions(
+        limit=20,
+        offset=0,
+        filters={"from": NOW - timedelta(minutes=1), "to": NOW + timedelta(minutes=1)},
+    )
+    assert transaction_count == 1 and transactions[0].id == ids["transaction"]
+    _, future_transaction_count = repository.list_transactions(
+        limit=20,
+        offset=0,
+        filters={"from": NOW + timedelta(days=1)},
+    )
+    assert future_transaction_count == 0
     alerts, alert_count = repository.list_alerts(limit=20, offset=0, filters={})
     assert alert_count == 1 and [alert.id for alert in alerts] == [ids["alert"]]
     assert repository.get_alert(ids["duplicate_alert"]) is not None
@@ -400,6 +497,565 @@ def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> Non
         assert rule_versions[1].created_by_user_id == principal.id
         assert [row.sequence for row in audits] == [1, 2]
         assert audits[1].previous_record_hash == audits[0].record_hash
+    engine.dispose()
+
+
+def test_alert_filters_combine_device_with_active_and_legacy_operator_semantics() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    shadow_parser_id = uuid4()
+    with factory.begin() as session:
+        document = session.get(Document, ids["document"])
+        active_version = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == ids["document"],
+                DocumentVersion.version_sequence == 1,
+            )
+        )
+        assert document is not None and active_version is not None
+        # The mutable projection and a newer shadow parse must not affect the
+        # operator filter while parser version 1 remains active.
+        document.operator_code = "MUTABLE-SHADOW"
+        active_version.operator_code = "ACTIVE-42"
+        session.add(
+            ParserVersion(
+                id=shadow_parser_id,
+                name="synthetic",
+                version="2",
+                build_sha256="1" * 64,
+                protocol="test",
+            )
+        )
+        session.add(
+            ActiveParserVersion(
+                parser_name="synthetic",
+                parser_version_id=ids["parser"],
+                activation_reason="keep validated operator semantics active",
+            )
+        )
+        session.flush()
+        session.add(
+            DocumentVersion(
+                document_id=ids["document"],
+                parser_version_id=shadow_parser_id,
+                raw_payload_id=ids["raw"],
+                version_sequence=2,
+                document_type="PRE_BILL",
+                operator_code="SHADOW-99",
+                gross_total=Decimal("100.00"),
+                status="COMPLETE",
+                normalized_text="SHADOW OPERATOR",
+                parse_confidence=90,
+                evidence_level="INFERRED",
+                source_manifest_sha256="a" * 64,
+                source_payload_sha256="1" * 64,
+                source_path="/spool/job-one/client.raw",
+                complete=True,
+                chain_scope=f"document:{ids['job']}:operator-shadow",
+                chain_sequence=1,
+                previous_record_hash="0" * 64,
+                record_hash="1" * 64,
+            )
+        )
+        legacy_document_id, legacy_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="KITCHEN_ORDER",
+            total=None,
+            complete=True,
+            minute=2,
+        )
+        legacy_document = session.get(Document, legacy_document_id)
+        legacy_version = session.get(DocumentVersion, legacy_version_id)
+        assert legacy_document is not None and legacy_version is not None
+        legacy_document.operator_code = "LEGACY-7"
+        for field in (
+            "document_type",
+            "subtype",
+            "external_document_code",
+            "order_code",
+            "table_code",
+            "operator_code",
+            "terminal_code",
+            "document_timestamp",
+        ):
+            setattr(legacy_version, field, None)
+
+    repository = SqlAlchemyApiRepository(factory)
+    active_alerts, active_count = repository.list_alerts(
+        limit=10,
+        offset=0,
+        filters={"device_id": "pos_1", "operator_code": "ACTIVE-42"},
+    )
+    legacy_alerts, legacy_count = repository.list_alerts(
+        limit=10,
+        offset=0,
+        filters={"device_id": "pos_1", "operator_code": "LEGACY-7"},
+    )
+    for leaked_operator in ("SHADOW-99", "MUTABLE-SHADOW"):
+        leaked, leaked_count = repository.list_alerts(
+            limit=10,
+            offset=0,
+            filters={"device_id": "pos_1", "operator_code": leaked_operator},
+        )
+        assert leaked_count == 0 and leaked == []
+    assert active_count == 1 and [alert.id for alert in active_alerts] == [ids["alert"]]
+    assert legacy_count == 1 and [alert.id for alert in legacy_alerts] == [ids["alert"]]
+    engine.dispose()
+
+
+def test_incomplete_job_review_is_audited_and_preserves_evidence() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        job = session.get(PrintJob, ids["job"])
+        assert job is not None
+        job.capture_complete = False
+        job.status = "PARTIAL"
+    repository = SqlAlchemyApiRepository(factory)
+    principal = repository.authenticate("auditor", "correct-password")
+    assert principal is not None
+
+    reviewed = repository.review_job(
+        ids["job"],
+        JobReviewRequest(
+            action="VERIFY_USABLE",
+            reason="Documento semanticamente completo nonostante il tail tecnico.",
+            confirmation_password="not-persisted-password",
+        ),
+        principal,
+        correlation_id="review-request-1",
+    )
+    assert reviewed is not None
+    assert reviewed.review_state == "VERIFIED_USABLE"
+    assert reviewed.analysis_excluded is False
+    assert repository.diagnostics().incomplete_jobs == 0
+
+    excluded = repository.review_job(
+        ids["job"],
+        JobReviewRequest(
+            action="EXCLUDE_FROM_ANALYSIS",
+            reason="Evidenza tecnicamente incompleta esclusa dalla sola analisi.",
+            confirmation_password="not-persisted-password",
+        ),
+        principal,
+        correlation_id="review-request-2",
+    )
+    assert excluded is not None and excluded.analysis_excluded is True
+
+    reopened = repository.review_job(
+        ids["job"],
+        JobReviewRequest(
+            action="REOPEN_REVIEW",
+            reason=(
+                "Il job deve essere rivalutato dagli engine correnti "
+                "senza riesumare lo storico."
+            ),
+            confirmation_password="not-persisted-password",
+        ),
+        principal,
+        correlation_id="review-request-3",
+    )
+    assert reopened is not None
+    assert reopened.review_state == "PENDING"
+    assert reopened.analysis_excluded is True
+    with factory() as session:
+        job = session.get(PrintJob, ids["job"])
+        assert job is not None and job.manifest_sha256 == "a" * 64
+        raw_count = session.scalar(
+            select(func.count()).select_from(RawPayload).where(RawPayload.job_id == ids["job"])
+        )
+        alert = session.get(FraudAlert, ids["alert"])
+        assert alert is not None and alert.status == "JUSTIFIED"
+        assert alert.closure_reason is not None and "esclusa" in alert.closure_reason
+        correlation = session.get(DocumentCorrelation, ids["correlation"])
+        assert correlation is not None and correlation.status == "SUPERSEDED"
+        audit_actions = session.scalars(
+            select(AuditLog.event_type).order_by(AuditLog.sequence)
+        ).all()
+    assert raw_count == 1
+    assert audit_actions == [
+        "JOB_REVIEW_VERIFY_USABLE",
+        "JOB_REVIEW_EXCLUDE_FROM_ANALYSIS",
+        "JOB_REVIEW_REOPEN_REVIEW",
+    ]
+    engine.dispose()
+
+
+def test_get_transaction_prefers_current_correlation_then_latest_historical_fallback() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    historical_correlation_id = uuid4()
+    with factory.begin() as session:
+        current = session.get(DocumentCorrelation, ids["correlation"])
+        assert current is not None
+        current.status = "AUTOMATIC"
+        current.score = 88
+        current.created_at = NOW
+        session.add(
+            DocumentCorrelation(
+                id=historical_correlation_id,
+                transaction_id=ids["transaction"],
+                algorithm_version="test-history",
+                input_fingerprint="2" * 64,
+                score=1,
+                status="SUPERSEDED",
+                explanation="Newer historical projection must not shadow current state",
+                created_at=NOW + timedelta(minutes=1),
+            )
+        )
+        session.flush()
+        session.add(
+            DocumentCorrelationMember(
+                correlation_id=historical_correlation_id,
+                document_id=ids["document"],
+                role="PRE_BILL",
+                contribution_score=1,
+            )
+        )
+
+    repository = SqlAlchemyApiRepository(factory)
+    current_view = repository.get_transaction(ids["transaction"])
+    assert current_view is not None
+    assert current_view.correlation_confidence == 88
+    assert current_view.document_count == 1
+
+    with factory.begin() as session:
+        current = session.get(DocumentCorrelation, ids["correlation"])
+        assert current is not None
+        current.status = "SUPERSEDED"
+    historical_view = repository.get_transaction(ids["transaction"])
+    assert historical_view is not None
+    assert historical_view.correlation_confidence == 1
+    assert historical_view.document_count == 1
+    engine.dispose()
+
+
+def test_archived_alerts_do_not_keep_transaction_or_dashboard_operational() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    repository = SqlAlchemyApiRepository(factory)
+    before = repository.get_transaction(ids["transaction"])
+    assert before is not None and before.status == "ALERT" and before.alert_count == 1
+    with factory.begin() as session:
+        alert = session.get(FraudAlert, ids["alert"])
+        assert alert is not None
+        alert.status = "FALSE_POSITIVE"
+        alert.closed_at = NOW + timedelta(minutes=1)
+        correlation = session.get(DocumentCorrelation, ids["correlation"])
+        assert correlation is not None
+        correlation.status = "SUPERSEDED"
+    after = repository.get_transaction(ids["transaction"])
+    assert after is not None and after.status == "CORRELATED" and after.alert_count == 0
+    dashboard = repository.dashboard()
+    assert dashboard.operational_alerts == 0
+    assert dashboard.operational_economic_difference == Decimal("0.0000")
+    assert dashboard.false_positive_alerts == 1
+    operational, operational_count = repository.list_alerts(
+        limit=10, offset=0, filters={"view": "operational"}
+    )
+    archived, archived_count = repository.list_alerts(
+        limit=10,
+        offset=0,
+        filters={
+            "view": "archive",
+            "from": NOW - timedelta(minutes=1),
+            "to": NOW + timedelta(minutes=1),
+        },
+    )
+    contradictory, contradictory_count = repository.list_alerts(
+        limit=10,
+        offset=0,
+        filters={"view": "operational", "status": "FALSE_POSITIVE"},
+    )
+    all_alerts, all_count = repository.list_alerts(
+        limit=10, offset=0, filters={"view": "all"}
+    )
+    assert operational_count == 0 and operational == []
+    assert archived_count == 1 and archived[0].id == ids["alert"]
+    assert contradictory_count == 0 and contradictory == []
+    assert all_count == 1 and all_alerts[0].id == ids["alert"]
+    engine.dispose()
+
+
+def test_dashboard_economic_cards_use_sale_occurrence_primary_rule_and_one_episode() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    primary_rule_id, primary_version_id = uuid4(), uuid4()
+    with factory.begin() as session:
+        legacy_alert = session.get(FraudAlert, ids["alert"])
+        assert legacy_alert is not None
+        legacy_alert.opened_at = NOW + timedelta(days=10)
+        session.add(
+            FraudRule(
+                id=primary_rule_id,
+                code="MODIFICA_POST_PRECONTO",
+                name="Riduzione operativa",
+                description="Riduzione economica primaria",
+            )
+        )
+        session.flush()
+        session.add(
+            FraudRuleVersion(
+                id=primary_version_id,
+                fraud_rule_id=primary_rule_id,
+                version=1,
+                implementation_version="test-primary",
+                configuration_fingerprint="1" * 64,
+                severity="HIGH",
+                weight=Decimal("1"),
+                effective_from=NOW,
+            )
+        )
+        session.flush()
+        session.add(
+            FraudAlert(
+                fraud_rule_version_id=primary_version_id,
+                correlation_id=ids["correlation"],
+                transaction_id=ids["transaction"],
+                finding_key="2" * 64,
+                severity="HIGH",
+                score=90,
+                status="OPEN",
+                description="Riduzione primaria",
+                explanation="100 -> 60",
+                difference_amount=Decimal("40.00"),
+                confidence=95,
+                opened_at=NOW + timedelta(days=11),
+            )
+        )
+
+    repository = SqlAlchemyApiRepository(factory)
+    dashboard = repository.dashboard(
+        filters={"from": NOW - timedelta(minutes=1), "to": NOW + timedelta(minutes=2)}
+    )
+    assert dashboard.economic_reduction_episodes == 1
+    assert dashboard.operational_economic_difference == Decimal("40.0000")
+    assert dashboard.operational_alerts == 2
+    drilldown_alerts, drilldown_count = repository.list_alerts(
+        limit=10,
+        offset=0,
+        filters={
+            "view": "operational",
+            "from": NOW - timedelta(minutes=1),
+            "to": NOW + timedelta(minutes=2),
+        },
+    )
+    assert drilldown_count == 2 and len(drilldown_alerts) == 2
+    outside_sale_period = repository.dashboard(
+        filters={"from": NOW + timedelta(days=9), "to": NOW + timedelta(days=12)}
+    )
+    assert outside_sale_period.economic_reduction_episodes == 0
+    assert outside_sale_period.operational_alerts == 0
+    outside_drilldown, outside_drilldown_count = repository.list_alerts(
+        limit=10,
+        offset=0,
+        filters={
+            "view": "operational",
+            "from": NOW + timedelta(days=9),
+            "to": NOW + timedelta(days=12),
+        },
+    )
+    assert outside_drilldown_count == 0 and outside_drilldown == []
+    engine.dispose()
+
+
+def test_dashboard_does_not_treat_non_economic_alert_difference_as_revenue_loss() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        rule = session.get(FraudRule, ids["rule"])
+        assert rule is not None
+        rule.code = "DUPLICATE_DOCUMENT"
+
+    dashboard = SqlAlchemyApiRepository(factory).dashboard()
+    assert dashboard.operational_alerts == 1
+    assert dashboard.economic_reduction_episodes == 0
+    assert dashboard.operational_economic_difference == Decimal("0.0000")
+    engine.dispose()
+
+
+def test_transaction_reduction_drilldown_requires_closure_and_operational_economic_alert() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    repository = SqlAlchemyApiRepository(factory)
+
+    open_transaction = repository.get_transaction(ids["transaction"])
+    assert open_transaction is not None
+    assert open_transaction.fiscal_total is None
+    assert open_transaction.difference is None
+    assert open_transaction.diff["settlement_basis"] == "NONE"
+    filtered, count = repository.list_transactions(
+        limit=10,
+        offset=0,
+        filters={
+            "operational_economic_only": True,
+            "reduction_only": True,
+            "minimum_difference": Decimal("0.01"),
+        },
+    )
+    assert count == 0 and filtered == []
+
+    with factory.begin() as session:
+        _, fiscal_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="COMMERCIAL_DOCUMENT",
+            total="50.00",
+            complete=True,
+            line_total="50.00",
+        )
+    filtered, count = repository.list_transactions(
+        limit=10,
+        offset=0,
+        filters={
+            "operational_economic_only": True,
+            "reduction_only": True,
+            "minimum_difference": Decimal("0.01"),
+        },
+    )
+    assert count == 1
+    assert filtered[0].id == ids["transaction"]
+    assert filtered[0].difference == Decimal("50.0000")
+
+    with factory.begin() as session:
+        fiscal_version = session.get(DocumentVersion, fiscal_version_id)
+        assert fiscal_version is not None
+        fiscal_version.gross_total = Decimal("120.00")
+    filtered, count = repository.list_transactions(
+        limit=10,
+        offset=0,
+        filters={
+            "operational_economic_only": True,
+            "reduction_only": True,
+            "minimum_difference": Decimal("0.01"),
+        },
+    )
+    assert count == 0 and filtered == []
+
+    with factory.begin() as session:
+        alert = session.get(FraudAlert, ids["alert"])
+        assert alert is not None
+        alert.status = "FALSE_POSITIVE"
+    filtered, count = repository.list_transactions(
+        limit=10,
+        offset=0,
+        filters={"operational_economic_only": True, "reduction_only": True},
+    )
+    assert count == 0 and filtered == []
+    engine.dispose()
+
+
+def test_transaction_prefers_room_close_over_incomplete_fiscal_and_uses_room_lines() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        _add_correlated_document(
+            session,
+            ids,
+            document_type="COMMERCIAL_DOCUMENT",
+            total="25.00",
+            complete=False,
+            minute=1,
+            line_total="25.00",
+        )
+        _add_correlated_document(
+            session,
+            ids,
+            document_type="MANAGEMENT_DOCUMENT",
+            total="50.00",
+            complete=True,
+            minute=2,
+            raw_metadata={"settlement_kind": "ROOM_CHARGE", "economic_close": True},
+            line_total="50.00",
+        )
+
+    transaction = SqlAlchemyApiRepository(factory).get_transaction(ids["transaction"])
+    assert transaction is not None
+    assert transaction.fiscal_total == Decimal("50.0000")
+    assert transaction.difference == Decimal("50.0000")
+    assert transaction.diff["fiscal_total"] is None
+    assert transaction.diff["settlement_basis"] == "ECONOMIC_MANAGEMENT_CLOSE"
+    assert transaction.diff["lines"]["removed"] == []
+    assert len(transaction.diff["lines"]["price_changed"]) == 1
+    engine.dispose()
+
+
+def test_transaction_order_is_selected_from_member_event_not_reused_global_code() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    linked_order_id, newer_order_id = uuid4(), uuid4()
+    with factory.begin() as session:
+        session.add_all(
+            [
+                Order(
+                    id=linked_order_id,
+                    source_device_id=ids["device"],
+                    business_date=NOW.date(),
+                    order_code="ORD-80",
+                    status="OPEN",
+                    opened_at=NOW,
+                ),
+                Order(
+                    id=newer_order_id,
+                    source_device_id=ids["device"],
+                    business_date=(NOW + timedelta(days=1)).date(),
+                    order_code="ORD-80",
+                    status="OPEN",
+                    opened_at=NOW + timedelta(days=1),
+                ),
+            ]
+        )
+        session.flush()
+        session.add(
+            OrderEvent(
+                order_id=linked_order_id,
+                source_document_id=ids["document"],
+                sequence=1,
+                event_type="PRE_BILL_PRINTED",
+                occurred_at=NOW,
+                details={},
+                previous_record_hash="0" * 64,
+                record_hash="3" * 64,
+            )
+        )
+
+    transaction = SqlAlchemyApiRepository(factory).get_transaction(ids["transaction"])
+    assert transaction is not None and transaction.order_id == linked_order_id
+    engine.dispose()
+
+
+def test_partial_version_semantics_do_not_mix_with_legacy_projection() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        version = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == ids["document"]
+            )
+        )
+        assert version is not None
+        # A row with any immutable semantic value is not a pre-migration row.
+        # Its remaining NULL values must stay NULL instead of being filled from
+        # the mutable Document projection.
+        version.external_document_code = "VERSION-ONLY"
+
+    repository = SqlAlchemyApiRepository(factory)
+    documents, document_count = repository.list_documents(
+        limit=20,
+        offset=0,
+        filters={"type": "PRE_BILL"},
+    )
+    assert document_count == 0
+    assert documents == []
+    leaked, leaked_count = repository.search(
+        query="PB-0001",
+        limit=20,
+        offset=0,
+    )
+    assert leaked_count == 0
+    assert leaked == []
+    assert repository.dashboard().pre_bills == 0
     engine.dispose()
 
 
@@ -519,6 +1175,20 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
     )
     assert leaked_total == 0
     assert leaked == []
+    search_leak, search_leak_total = repository.search(
+        query="SHADOW-NEW",
+        limit=20,
+        offset=0,
+    )
+    assert search_leak_total == 0
+    assert search_leak == []
+    transaction_leak, transaction_leak_total = repository.list_transactions(
+        limit=20,
+        offset=0,
+        filters={"order_code": "SHADOW-NEW"},
+    )
+    assert transaction_leak_total == 0
+    assert transaction_leak == []
 
     primary, primary_total = repository.list_documents(
         limit=20,

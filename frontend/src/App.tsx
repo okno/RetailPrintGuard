@@ -14,6 +14,7 @@ const DevicesPage = lazy(() => import('./pages/DevicesPage').then((module) => ({
 const DocumentDetailPage = lazy(() => import('./pages/DocumentDetailPage').then((module) => ({ default: module.DocumentDetailPage })))
 const DocumentsPage = lazy(() => import('./pages/DocumentsPage').then((module) => ({ default: module.DocumentsPage })))
 const ImportsPage = lazy(() => import('./pages/ImportsPage').then((module) => ({ default: module.ImportsPage })))
+const IncompleteJobsPage = lazy(() => import('./pages/IncompleteJobsPage').then((module) => ({ default: module.IncompleteJobsPage })))
 const RulesPage = lazy(() => import('./pages/RulesPage').then((module) => ({ default: module.RulesPage })))
 const SearchPage = lazy(() => import('./pages/SearchPage').then((module) => ({ default: module.SearchPage })))
 const SessionsPage = lazy(() => import('./pages/SessionsPage').then((module) => ({ default: module.SessionsPage })))
@@ -54,6 +55,7 @@ export default function App() {
         <Route path="/dispositivi" element={<DevicesPage />} />
         <Route path="/sessioni" element={<SessionsPage />} />
         <Route path="/diagnostica" element={<DiagnosticsPage />} />
+        <Route path="/incompleti" element={<IncompleteJobsPage />} />
         <Route path="/importazioni" element={<ImportsPage />} />
         <Route path="/login" element={<Navigate to="/" replace />} />
         <Route path="*" element={<Alert severity="warning" action={<Button href="/">Dashboard</Button>}>Pagina non trovata.</Alert>} />

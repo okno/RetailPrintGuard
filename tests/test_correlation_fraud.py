@@ -160,27 +160,99 @@ def test_scenario_a_100_to_50_creates_diff_and_explainable_high_alerts() -> None
         )
     )
     by_code = {finding.rule_code: finding for finding in findings}
-    expected = {
+    assert set(by_code) == {"MODIFICA_POST_PRECONTO"}
+    amount_alert = by_code["MODIFICA_POST_PRECONTO"]
+    assert amount_alert.severity.value == "HIGH"
+    assert amount_alert.score >= 80
+    assert amount_alert.evidence[0]["difference_amount"] == "50.00"
+    assert {item["change_type"] for item in amount_alert.evidence[1:]} >= {
+        "REMOVED",
+        "PRICE_CHANGED",
+    }
+
+    first = finding_chain_record(amount_alert, sequence=1, previous_hash=None)
+    assert verify_chain([first])
+
+
+def test_incomplete_commercial_attempt_is_not_an_economic_closure() -> None:
+    prebill = _document(
+        "incomplete-prebill",
+        DocumentType.PRE_BILL,
+        "100.00",
+        (_line(1, "A", "100.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-INCOMPLETE",
+    )
+    incomplete_fiscal = _document(
+        "incomplete-commercial",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "50.00",
+        (_line(1, "A", "50.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-INCOMPLETE",
+    ).model_copy(update={"complete": False, "status": "PARTIAL"})
+    transaction = CorrelationEngine().correlate((prebill, incomplete_fiscal))[0]
+
+    codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(minutes=2))
+        )
+    }
+    assert not codes & {
+        "MODIFICA_POST_PRECONTO",
         "PREBILL_FISCAL_AMOUNT_DROP",
         "ITEM_REMOVED_AFTER_PREBILL",
         "PRICE_REDUCED_AFTER_PREBILL",
         "EXTREME_PRICE_CHANGE",
         "SAME_REFERENCE_DIFFERENT_AMOUNT",
-        "LATE_ORDER_MODIFICATION",
     }
-    assert expected <= set(by_code)
-    amount_alert = by_code["PREBILL_FISCAL_AMOUNT_DROP"]
-    assert amount_alert.severity.value == "HIGH"
-    assert amount_alert.score >= 80
-    assert amount_alert.evidence[0]["difference_amount"] == "50.00"
 
-    first = finding_chain_record(amount_alert, sequence=1, previous_hash=None)
-    second = finding_chain_record(
-        by_code["ITEM_REMOVED_AFTER_PREBILL"],
-        sequence=2,
-        previous_hash=first["record_hash"],
+
+def test_total_line_mismatch_accepts_observed_global_discount_and_adjustment() -> None:
+    base = _document(
+        "discounted-document",
+        DocumentType.ORDER,
+        "90.00",
+        (_line(1, "A", "100.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="ORDER-DISCOUNTED",
     )
-    assert verify_chain([first, second])
+    discounted = base.model_copy(update={"discount_total": Decimal("10.00")})
+    adjusted = base.model_copy(
+        update={
+            "id": _id("adjusted-document"),
+            "source_job_id": "job-adjusted-document",
+            "external_document_code": "ORDER-ADJUSTED",
+            "discount_total": None,
+            "raw_metadata": {"adjustment_total": "-10.00"},
+        }
+    )
+    unknown_adjustment = base.model_copy(
+        update={
+            "id": _id("unknown-adjustment-document"),
+            "source_job_id": "job-unknown-adjustment-document",
+            "external_document_code": "ORDER-UNKNOWN-ADJUSTMENT",
+            "discount_total": None,
+            "raw_metadata": {"adjustments": [{"kind": "service"}]},
+        }
+    )
+
+    for document in (discounted, adjusted, unknown_adjustment):
+        transaction = CorrelationEngine().correlate((document,))[0]
+        codes = {
+            finding.rule_code
+            for finding in FraudEngine().evaluate(
+                FraudContext(
+                    transaction=transaction,
+                    evaluated_at=BASE_TIME + timedelta(minutes=1),
+                )
+            )
+        }
+        assert "TOTAL_LINE_MISMATCH" not in codes
 
 
 def test_scenario_b_split_100_into_two_50_has_no_amount_drop_false_positive() -> None:
@@ -320,6 +392,7 @@ def test_synthetic_post_prebill_change_35_to_non_fiscal_close_5_is_quantified() 
         )
     }
     assert "MODIFICA_POST_PRECONTO" in codes
+    assert "ORDER_WITHOUT_FISCAL_CLOSE" not in codes
 
 
 def test_all_sixteen_required_rules_are_versioned_and_registered() -> None:
@@ -368,7 +441,7 @@ def test_whitelist_suppresses_only_the_matching_rule_and_keeps_evidence() -> Non
     )
     transaction = CorrelationEngine().correlate((prebill, fiscal))[0]
     entry = WhitelistEntry(
-        rule_code="PREBILL_FISCAL_AMOUNT_DROP",
+        rule_code="MODIFICA_POST_PRECONTO",
         scope=WhitelistScope.TRANSACTION,
         scope_value=str(transaction.transaction_id),
         reason="Conto separato verificato dall'auditor",
@@ -382,13 +455,10 @@ def test_whitelist_suppresses_only_the_matching_rule_and_keeps_evidence() -> Non
             evaluated_at=BASE_TIME + timedelta(hours=1),
         )
     )
-    assert "PREBILL_FISCAL_AMOUNT_DROP" not in {
-        finding.rule_code for finding in evaluation.findings
-    }
+    assert not evaluation.findings
     assert len(evaluation.suppressed) == 1
-    assert evaluation.suppressed[0].finding.rule_code == "PREBILL_FISCAL_AMOUNT_DROP"
+    assert evaluation.suppressed[0].finding.rule_code == "MODIFICA_POST_PRECONTO"
     assert evaluation.suppressed[0].reason == entry.reason
-    assert "PRICE_REDUCED_AFTER_PREBILL" in {finding.rule_code for finding in evaluation.findings}
 
 
 def test_device_response_is_correlated_by_exact_duplex_job_without_business_codes() -> None:
@@ -431,6 +501,254 @@ def test_device_response_is_correlated_by_exact_duplex_job_without_business_code
     correlation = transactions[0].correlation
     assert correlation is not None
     assert "response_job_context" in correlation.matched_criteria
+
+
+def test_persistent_rch_session_cannot_link_response_from_another_job() -> None:
+    request = _document(
+        "response-other-request",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "5.00",
+        (_line(1, "COFFEE", "5.00"),),
+        minute=0,
+        device="rch_1",
+        external_code="DC-0100",
+    )
+    response = _document(
+        "response-other-job",
+        DocumentType.DEVICE_RESPONSE,
+        "0.00",
+        (),
+        minute=0,
+        device="rch_1",
+        external_code="RSP-0101",
+    ).model_copy(
+        update={
+            "source_session_id": request.source_session_id,
+            "external_document_code": None,
+            "order_code": None,
+            "table_code": None,
+            "operator_code": None,
+            "raw_metadata": {},
+        }
+    )
+
+    transactions = CorrelationEngine().correlate((request, response))
+
+    assert len(transactions) == 2
+    assert all(item.correlation is None for item in transactions)
+
+
+def test_conflicting_order_codes_are_a_hard_correlation_gate() -> None:
+    prebill = _document(
+        "conflict-prebill",
+        DocumentType.PRE_BILL,
+        "50.00",
+        (_line(1, "A", "50.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-CONFLICT",
+    )
+    fiscal = _document(
+        "conflict-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "50.00",
+        (_line(1, "A", "50.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-CONFLICT",
+    ).model_copy(update={"order_code": "OTHER-ORDER"})
+
+    transactions = CorrelationEngine().correlate((prebill, fiscal))
+
+    assert len(transactions) == 2
+    score = CorrelationEngine().score_candidate_pair(prebill, fiscal)
+    assert score.score == 0
+    assert score.criteria[0].name == "identity_compatibility"
+
+
+def test_conforming_copy_attaches_to_only_one_parent_and_cannot_bridge_sales() -> None:
+    first = _document(
+        "copy-first-sale",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=0,
+        device="rch_1",
+        external_code="DC-COPY-1",
+    ).model_copy(update={"order_code": "SALE-1"})
+    second = _document(
+        "copy-second-sale",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-COPY-2",
+    ).model_copy(update={"order_code": "SALE-2"})
+    copy = _document(
+        "copy-child",
+        DocumentType.CONFORMING_COPY,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=2,
+        device="rch_1",
+        external_code="COPY-1",
+    ).model_copy(update={"order_code": None})
+
+    transactions = CorrelationEngine().correlate((first, second, copy))
+
+    assert sorted(len(item.documents) for item in transactions) == [1, 2]
+    assert sum(
+        DocumentType.CONFORMING_COPY in {document.type for document in item.documents}
+        for item in transactions
+    ) == 1
+
+
+def test_refund_is_a_post_close_adjustment_not_a_sale_reduction() -> None:
+    prebill = _document(
+        "refund-prebill",
+        DocumentType.PRE_BILL,
+        "100.00",
+        (_line(1, "A", "100.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-REFUND",
+    )
+    fiscal = _document(
+        "refund-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "100.00",
+        (_line(1, "A", "100.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-REFUND",
+    )
+    refund = _document(
+        "refund-adjustment",
+        DocumentType.REFUND,
+        "50.00",
+        (_line(1, "A", "50.00"),),
+        minute=5,
+        device="rch_1",
+        external_code="RF-REFUND",
+    )
+
+    transaction = CorrelationEngine().correlate((prebill, fiscal, refund))[0]
+
+    assert len(transaction.documents) == 3
+    assert transaction.fiscal_total == Decimal("100.00")
+    assert transaction.observed_final_total == Decimal("100.00")
+    assert transaction.difference_amount == Decimal("0.00")
+    codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+        )
+    }
+    assert "MODIFICA_POST_PRECONTO" not in codes
+
+
+def test_reused_order_code_after_close_starts_a_new_episode() -> None:
+    prebill = _document(
+        "reuse-prebill",
+        DocumentType.PRE_BILL,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-REUSE",
+    )
+    fiscal = _document(
+        "reuse-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-REUSE",
+    )
+    next_sale = _document(
+        "reuse-next-sale",
+        DocumentType.KITCHEN_ORDER,
+        "0.00",
+        (_line(1, "B", "8.00"),),
+        minute=5,
+        device="pos_2",
+        external_code="KO-REUSE",
+    ).model_copy(update={"gross_total": None, "net_total": None})
+
+    transactions = CorrelationEngine().correlate((prebill, fiscal, next_sale))
+
+    assert sorted(len(item.documents) for item in transactions) == [1, 2]
+    closed = next(
+        item
+        for item in transactions
+        if DocumentType.COMMERCIAL_DOCUMENT in {document.type for document in item.documents}
+    )
+    assert {document.type for document in closed.documents} == {
+        DocumentType.PRE_BILL,
+        DocumentType.COMMERCIAL_DOCUMENT,
+    }
+
+
+def test_global_duplicate_finding_is_emitted_once_and_never_on_unrelated_transaction() -> None:
+    duplicate_one = _document(
+        "duplicate-one",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "10.00",
+        (_line(1, "A", "10.00"),),
+        minute=0,
+        device="rch_1",
+        external_code="DC-DUPLICATE",
+    ).model_copy(update={"order_code": None, "table_code": None, "raw_metadata": {}})
+    duplicate_two = _document(
+        "duplicate-two",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "10.00",
+        (_line(1, "A", "10.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-DUPLICATE",
+    ).model_copy(update={"order_code": None, "table_code": None, "raw_metadata": {}})
+    unrelated = _document(
+        "duplicate-unrelated",
+        DocumentType.PRE_BILL,
+        "7.00",
+        (_line(1, "B", "7.00"),),
+        minute=2,
+        device="pos_1",
+        external_code="PB-UNRELATED",
+    ).model_copy(update={"order_code": None, "table_code": None, "raw_metadata": {}})
+    engine = FraudEngine()
+    transactions = {
+        document.id: CorrelationEngine().correlate((document,))[0]
+        for document in (duplicate_one, duplicate_two, unrelated)
+    }
+
+    duplicate_alert_count = 0
+    for document in (duplicate_one, duplicate_two):
+        findings = engine.evaluate(
+            FraudContext(
+                transaction=transactions[document.id],
+                comparison_documents=(duplicate_one, duplicate_two, unrelated),
+                evaluated_at=BASE_TIME + timedelta(hours=1),
+            )
+        )
+        duplicate_alert_count += sum(
+            finding.rule_code == "DUPLICATE_DOCUMENT" for finding in findings
+        )
+    unrelated_codes = {
+        finding.rule_code
+        for finding in engine.evaluate(
+            FraudContext(
+                transaction=transactions[unrelated.id],
+                comparison_documents=(duplicate_one, duplicate_two, unrelated),
+                evaluated_at=BASE_TIME + timedelta(hours=1),
+            )
+        )
+    }
+    assert duplicate_alert_count == 1
+    assert "DUPLICATE_DOCUMENT" not in unrelated_codes
 
 
 def _pos_evidence(
@@ -521,6 +839,17 @@ def test_cross_department_pos_dispatch_uses_narrow_explainable_table_window() ->
     not_cross_department = CorrelationEngine().correlate((bar, same_device))
     assert len(not_cross_department) == 2
 
+    chained_later = _pos_evidence(
+        "dispatch-transitive-chain",
+        DocumentType.KITCHEN_ORDER,
+        device="pos_1",
+        table="LAB-20",
+        second=50,
+        lines=(_line(1, "DESSERT", "6.00"),),
+    )
+    bounded = CorrelationEngine().correlate((bar, kitchen, pizzeria, chained_later))
+    assert sorted(len(item.documents) for item in bounded) == [1, 3]
+
 
 def test_same_table_change_sequence_applies_signed_quantity_as_delta() -> None:
     initial_line = DocumentLine(
@@ -599,3 +928,126 @@ def test_same_table_change_sequence_applies_signed_quantity_as_delta() -> None:
         unlinked = CorrelationEngine().correlate((kitchen, incompatible))
         assert len(unlinked) == 2
         assert all(item.correlation is None for item in unlinked)
+
+    codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(
+                transaction=transaction,
+                evaluated_at=BASE_TIME + timedelta(hours=3),
+            )
+        )
+    }
+    assert "NEGATIVE_OR_ZERO_VALUE_ITEM" not in codes
+    assert "TOTAL_LINE_MISMATCH" not in codes
+    assert "ORDER_WITHOUT_FISCAL_CLOSE" not in codes
+
+
+def test_cancellation_document_and_void_event_are_counted_once() -> None:
+    prebill = _document(
+        "void-prebill",
+        DocumentType.PRE_BILL,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-VOID",
+    )
+    first = _document(
+        "void-first",
+        DocumentType.CANCELLATION,
+        "0.00",
+        (),
+        minute=1,
+        device="rch_1",
+        external_code="VOID-1",
+    )
+    second = _document(
+        "void-second",
+        DocumentType.CANCELLATION,
+        "0.00",
+        (),
+        minute=2,
+        device="rch_1",
+        external_code="VOID-2",
+    )
+    transaction = CorrelationEngine().correlate((prebill, first, second))[0]
+    events = tuple(
+        OrderEvent(
+            id=_id(f"event-{document.id}"),
+            order_id=_id("void-order"),
+            type=OrderEventType.ORDER_VOIDED,
+            occurred_at=document.document_timestamp,
+            source_document_id=document.id,
+        )
+        for document in (first, second)
+    )
+    codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(
+                transaction=transaction,
+                order_events=events,
+                evaluated_at=BASE_TIME + timedelta(hours=1),
+            )
+        )
+    }
+    assert "EXCESSIVE_VOID_OR_CANCELLATION" not in codes
+
+
+def test_late_modification_requires_an_event_after_fiscal_close() -> None:
+    prebill = _document(
+        "late-prebill",
+        DocumentType.PRE_BILL,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-LATE",
+    )
+    fiscal = _document(
+        "late-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "20.00",
+        (_line(1, "A", "20.00"),),
+        minute=10,
+        device="rch_1",
+        external_code="DC-LATE",
+    )
+    transaction = CorrelationEngine().correlate((prebill, fiscal))[0]
+    before = OrderEvent(
+        id=_id("late-before"),
+        order_id=_id("late-order"),
+        type=OrderEventType.PRICE_CHANGED,
+        occurred_at=BASE_TIME + timedelta(minutes=9),
+        source_document_id=prebill.id,
+    )
+    after = before.model_copy(
+        update={
+            "id": _id("late-after"),
+            "occurred_at": BASE_TIME + timedelta(minutes=11),
+        }
+    )
+
+    before_codes = {
+        item.rule_code
+        for item in FraudEngine().evaluate(
+            FraudContext(
+                transaction=transaction,
+                order_events=(before,),
+                evaluated_at=BASE_TIME + timedelta(hours=1),
+            )
+        )
+    }
+    after_codes = {
+        item.rule_code
+        for item in FraudEngine().evaluate(
+            FraudContext(
+                transaction=transaction,
+                order_events=(after,),
+                evaluated_at=BASE_TIME + timedelta(hours=1),
+            )
+        )
+    }
+    assert "LATE_ORDER_MODIFICATION" not in before_codes
+    assert "LATE_ORDER_MODIFICATION" in after_codes

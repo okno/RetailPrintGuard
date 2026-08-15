@@ -117,12 +117,23 @@ Percorsi di installazione:
 - `/etc/retailprintguard/database.password`: root `0600`;
 - `/etc/retailprintguard/database.env`: root/gruppo DB `0640`;
 - `/etc/retailprintguard/jwt.secret`: root/gruppo API `0640`;
+- `/etc/retailprintguard/review.env`: root/gruppo API `0640`, contenente solo
+  l'hash Argon2id della password di conferma per gli incompleti;
 - chiave HMAC printproxy: file regolare non symlink, almeno 32 byte.
 
 La stringa DB nell'env contiene la password. Non eseguire `systemctl show
 --property=Environment` in output condivisi e non usare `set -x` negli script.
 La rotazione richiede aggiornamento atomico del file e riavvio dei soli servizi
 control plane.
+
+La password di revisione non deve essere scritta in YAML o come argomento della
+shell. `retailprintguard-configure-review` la acquisisce con doppio prompt,
+scrive atomicamente il solo hash e rifiuta path alternativi/symlink. L'API
+fallisce chiuso se il file non è presente o il valore non è un hash Argon2id.
+Nome ambiente e percorso sono fissi nel processo API; non sono opzioni del file
+di configurazione e non vengono esposti ai proxy.
+La conferma non sostituisce il ruolo `ADMIN`: entrambe le verifiche sono
+obbligatorie e i tentativi errati sono sottoposti a throttle.
 
 ## Rete
 

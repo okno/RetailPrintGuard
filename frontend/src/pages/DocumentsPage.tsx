@@ -18,6 +18,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
+import { PeriodPicker } from '../components/PeriodPicker'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
 import {
@@ -98,6 +99,7 @@ export function DocumentsPage() {
           value={params.get('order_code') ?? ''}
           onChange={(event) => filter('order_code', event.target.value)}
         />
+        <PeriodPicker params={params} onChange={setParams} />
       </Box>
     </Card>
     {!selectedType && <Alert severity="info" sx={{ mb: 2 }}>

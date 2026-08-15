@@ -6,6 +6,33 @@
 > risultati finali saranno consolidati in
 > [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
+## Release 0.4.0 — episodi di vendita e riduzione falsi positivi
+
+**Stato:** gate software offline completato il 15 agosto 2026. Nessun payload,
+foto, identificatore operativo o segreto è incluso nelle fixture pubbliche.
+
+| Controllo | Risultato |
+|---|---|
+| suite Python completa | `186 passed`, `25 skipped`, `0 failed`; una warning Starlette/httpx nota |
+| Ruff e compileall su `src`, `tests`, `migrations` | PASS |
+| migrazioni | PASS nel full gate: upgrade/downgrade, DDL offline MariaDB e nuove revisioni prezzi/revisione |
+| frontend ESLint e TypeScript | PASS |
+| frontend Vitest completo | `18 passed`, `0 failed` |
+| wheel Python | PASS, `retailprintguard-0.4.0`, 10 entry point |
+| PDF sintetico | PASS test e QA visuale 80 mm, inclusi prezzi derivati/conflitti |
+| `bash -n` | PASS sui 23 script tramite Git Bash |
+| ShellCheck | NON ESEGUITO: binario e distribuzione WSL assenti sul runner corrente |
+| build Vite | da eseguire obbligatoriamente su Linux prima dello staging; runtime Windows fermo senza errore in trasformazione |
+| privacy scan | PASS su 231 candidati |
+| diff data-plane rispetto a `v0.3.1` | vuoto per proxy, moduli condivisi verificati, lock e unità POS/RCH |
+
+Le regressioni coprono episodi separati, split fiscali, rimborsi, addebiti
+camera, chiusure incomplete, sconti globali, prezzi discordanti, rollback parser,
+filtri alert combinati, correlazioni superseded e l'intero ciclo di revisione
+append-only degli incompleti. I 25 skip dipendono da funzionalità POSIX non
+disponibili nel runner Windows (24) e da symlink di directory (1), non da
+failure applicativi.
+
 ## Release 0.3.1 — visualizzazione documenti e diagnostica
 
 **Stato:** gate software offline completato il 14 agosto 2026. La verifica

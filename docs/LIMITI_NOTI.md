@@ -47,8 +47,10 @@ Stato verificato sul worktree del 13 agosto 2026.
   completa.
 - Il documento singolo è esportabile in RAW/TXT/JSON/PDF e gli alert in CSV;
   non esiste ancora un fascicolo ZIP multi-documento firmato.
-- Mancano ordinamento generico server-side, filtri temporali completi e
-  persistenza avanzata filtri.
+- Mancano ordinamento generico server-side, filtri temporali uniformi su tutte
+  le liste e persistenza avanzata dei filtri. Dashboard, documenti, ricerca,
+  transazioni, job, alert ed export usano comunque intervalli timezone-aware
+  `[from, to)`.
 - Nessun SSE/WebSocket: lo stato device viene aggiornato a polling.
 - La build frontend passa, ma Vite segnala il chunk principale minificato di
   circa 540 kB; misurare il caricamento sui client reali e valutare ulteriore
@@ -63,9 +65,21 @@ Stato verificato sul worktree del 13 agosto 2026.
 - Health API indica database/spool, ma non è una metrica Prometheus né un
   readiness endpoint con codice HTTP distinto.
 - Correlazione limita il numero di documenti e antifrode il numero di
-  transazioni; non espongono ancora selezione per batch storico/periodo o una
-  policy automatica completa di supersessione/chiusura degli alert quando input
-  o regole cambiano.
+  transazioni; non espongono ancora selezione per batch storico/periodo. La
+  supersessione giustifica gli alert sostituiti e riclassifica alcuni difetti
+  legacy deterministici, ma non può decidere automaticamente ogni falso
+  positivo operativo.
+- L'attribuzione del prezzo alle comande richiede codice esatto oppure
+  descrizione normalizzata esatta e quantità compatibile. Sinonimi, modificatori
+  testuali o candidati monetari discordanti restano senza prezzo risolto o
+  `AMBIGUOUS`; non vengono scelti euristicamente. Documenti monetari incompleti
+  sono esclusi dalle fonti di attribuzione.
+- `EXCLUDE_FROM_ANALYSIS` non è una cancellazione e non soddisfa eventuali
+  obblighi di erasure/retention: RAW, manifest, documenti, audit e storia
+  restano conservati.
+- Il PDF comanda è una vista derivata bounded. La leggibilità su carta termica,
+  font del browser e stampanti reali richiede collaudo visuale del sito; non
+  dimostra il flusso byte o la consegna fisica.
 
 ## Limiti delle evidenze legacy
 
@@ -89,6 +103,10 @@ Stato verificato sul worktree del 13 agosto 2026.
 - Un indirizzo listener configurato ma non gestito persistentemente dalla rete
   può scomparire al reboot.
 - Il time sync errato degrada correlazione e valore probatorio dei timestamp.
+- Un account SSH privo di accesso al journal può ottenere un risultato vuoto
+  durante l'analisi dei log. Serve un export redatto prodotto da un account
+  autorizzato; “zero righe” non prova assenza di eventi. La disponibilità di
+  SSH non implica privilegi root o presenza di `sudo`.
 
 ## Cosa è verificato in software
 

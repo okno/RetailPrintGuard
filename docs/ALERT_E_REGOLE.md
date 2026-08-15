@@ -20,7 +20,7 @@ flowchart LR
 
 ## Correlazione spiegabile
 
-La versione correttiva corrente è `rpg-correlation-1.2.0`. Il punteggio usa criteri
+La versione correttiva corrente è `rpg-correlation-1.3.0`. Il punteggio usa criteri
 disponibili senza penalizzare automaticamente un campo assente. Tra i pesi
 massimi:
 
@@ -35,7 +35,7 @@ massimi:
 | importo | 8 |
 | sequenza documento | 8 |
 | operatore | 5 |
-| stessa sessione | 5 |
+| stessa sessione | 0, sola provenienza tecnica |
 | terminale | 4 |
 | data operativa | 3 |
 | dispositivo | 2 |
@@ -53,11 +53,22 @@ Per le comande POS sono disponibili due criteri compositi e prudenti:
 
 I ticket dei reparti sono viste parziali simultanee, non snapshot successivi:
 confrontarli tra loro non genera quindi falsi articoli aggiunti o rimossi.
+Il limite di 30 secondi vale per l'intero gruppo, non per sole coppie adiacenti:
+un ticket intermedio non può concatenare dispatch distinti. Codici ordine,
+tavoli o riferimenti forti incompatibili bloccano il collegamento. Una nuova
+comanda successiva a una chiusura fiscale/economica apre un nuovo episodio.
+
+Copie conformi, ristampe, risposte RCH e rimborsi sono membri ausiliari: possono
+arricchire la timeline appropriata ma non fanno da ponte tra due episodi. La
+descrizione completa e gli esempi sono in
+[Episodi di vendita](ANTIFRODE_EPISODI_VENDITA.md).
 
 Il motore calcola `ADDED`, `REMOVED`, `QUANTITY_CHANGED`, `PRICE_CHANGED`,
 `DISCOUNT_CHANGED` e `UNCHANGED`. Per i conti separati, il totale fiscale è la
-somma dei Documenti Commerciali/rimborsi correlati. Il confronto avviene sul
-totale aggregato, non sul primo documento arrivato.
+somma dei Documenti Commerciali completi correlati. I rimborsi sono
+aggiustamenti successivi e non riducono retroattivamente la vendita originale.
+Il confronto avviene sul totale e sulle righe aggregate, non sul primo
+documento arrivato.
 
 Il worker `retailprintguard-correlate` legge l'ultima versione di ciascun
 documento entro il limite, salva fingerprint di input, membri e criteri, crea o
@@ -67,10 +78,9 @@ correlazione precedente interamente contenuta in un nuovo gruppo viene marcata
 `SUPERSEDED`; i documenti sorgente restano invariati.
 
 Le risposte RCH prive di codice ordine/documento possono entrare nella stessa
-timeline tramite l'esatto `source_job_id`; il fallback è limitato a stessa
-sessione, stesso device e finestra temporale. Il primo è un legame tecnico
-forte, il secondo resta un criterio temporale spiegabile e non una prova di
-fiscalizzazione.
+timeline soltanto tramite l'esatto `source_job_id`. Non esiste fallback basato
+sulla sola sessione: una connessione RCH persistente può contenere vendite
+distinte e non costituisce identità commerciale.
 
 ## Regole predefinite
 
@@ -104,6 +114,37 @@ documento correnti e salva alert, evidenze RAW/documentali e prima voce della
 storia nella stessa transazione. Il `finding_key` rende idempotente una seconda
 valutazione identica. Una whitelist valida produce un alert `JUSTIFIED` con
 motivazione e storia: non elimina il finding.
+
+Quando `MODIFICA_POST_PRECONTO` descrive una riduzione economica, rimozioni e
+riduzioni prezzo dello stesso episodio sono incluse come evidenza nello stesso
+finding e non generano incidenti operativi aggiuntivi. La dashboard somma la
+differenza massima una sola volta per transazione.
+
+## Stati operativi e bonifica storica
+
+Dashboard, stato transazione e vista operativa considerano gli alert canonici
+in `OPEN`, `UNDER_REVIEW` o `CONFIRMED`. `FALSE_POSITIVE`, `JUSTIFIED`, `CLOSED`
+e gli alert di correlazioni `SUPERSEDED` restano disponibili nella vista
+archivio per audit.
+
+La webapp apre la lista sulla vista operativa; archivio e vista completa devono
+essere selezionati esplicitamente. Il drill-down dalle card economiche conserva
+il periodo della dashboard e aggiunge tre vincoli: regola economica attiva,
+chiusura osservata e differenza positiva. Un alert tecnico con un campo importo
+non viene quindi contato come perdita di vendita.
+
+Il worker riclassifica in modo idempotente alcuni alert prodotti dalla versione
+precedente quando l'evidenza dimostra un difetto noto:
+
+- `UNUSUAL_OPERATOR_PATTERN` calcolato con auto-amplificazione del proprio
+  tasso diventa `FALSE_POSITIVE`;
+- `DUPLICATE_DOCUMENT` assegnato a una transazione che non contiene alcuno dei
+  documenti duplicati diventa `FALSE_POSITIVE`;
+- un alert collegato a una correlazione sostituita da quella corrente diventa
+  `JUSTIFIED`.
+
+Ogni passaggio aggiunge motivazione, evidenza diagnostica e voce hash-chained in
+`fraud_alert_history`; nessun alert viene eliminato.
 
 ## Scenari guida
 
@@ -160,6 +201,6 @@ stretto e una motivazione verificabile.
 - i gap numerici possono derivare da perdita sorgente, cambio serie o apparati
   non osservati;
 - documenti tardivi richiedono rielaborazione;
-- il worker persistente salva finding, evidenze e prima voce di storia in una
-  transazione idempotente, ma il ricalcolo storico e la gestione automatica
-  degli alert superseded richiedono ancora una policy operativa esplicita.
+- la riclassificazione automatica copre soltanto i difetti legacy riconoscibili
+  in modo deterministico; ogni altro falso positivo richiede revisione umana e
+  motivazione esplicita.

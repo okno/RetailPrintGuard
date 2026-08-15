@@ -23,6 +23,13 @@ export interface Dashboard {
   open_alerts: number
   critical_alerts: number
   economic_difference: string
+  /** New antifraud summary fields are optional during rolling upgrades. */
+  operational_alerts?: number
+  economic_reduction_episodes?: number
+  operational_economic_difference?: string
+  incomplete_jobs?: number
+  false_positive_alerts?: number
+  justified_alerts?: number
   devices_online: number
   devices_offline: number
   spool_bytes: number
@@ -88,6 +95,7 @@ export interface Diagnostics {
 }
 
 export interface DocumentLine {
+  id?: string
   sequence: number
   course_code?: string
   item_code?: string
@@ -103,6 +111,19 @@ export interface DocumentLine {
   removed: boolean
   cancelled: boolean
   raw_text?: string
+  derived_unit_price?: string
+  derived_price_source?: string
+  price_attributions?: Array<{
+    id: string
+    source_kind: string
+    observed_unit_price?: string
+    observed_line_total?: string
+    confidence: string
+    status: string
+    match_basis: string
+    source_document_id: string
+    source_observed_at: string
+  }>
 }
 
 export interface DocumentRecord {
@@ -114,6 +135,7 @@ export interface DocumentRecord {
   external_code?: string
   order_code?: string
   table_code?: string
+  covers?: number
   operator_code?: string
   terminal_code?: string
   document_timestamp?: string
@@ -134,6 +156,27 @@ export interface DocumentRecord {
   lines: DocumentLine[]
   payments: Array<Record<string, unknown>>
   correlations: Array<Record<string, unknown>>
+}
+
+export interface JobRecord {
+  id: string
+  device_id: string
+  session_id?: string
+  external_job_id: string
+  captured_at: string
+  status: string
+  request_bytes: number
+  response_bytes: number
+  manifest_sha256: string
+  spool_path: string
+  imported_at?: string
+  parser_status?: string
+  warnings: string[]
+  review_state?: 'PENDING' | 'VERIFIED_USABLE' | 'EXCLUDED'
+  analysis_excluded?: boolean
+  reviewed_at?: string
+  reviewed_by?: string
+  review_reason?: string
 }
 
 export interface Transaction {

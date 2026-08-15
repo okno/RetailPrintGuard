@@ -61,6 +61,10 @@ from retailprintguard.db.models import (
     ProxySession,
     SystemEvent,
 )
+from retailprintguard.pricing.service import (
+    PRICE_ATTRIBUTION_ALGORITHM,
+    persist_transaction_price_attributions,
+)
 
 _SOURCE_TYPES = {
     DocumentType.ORDER,
@@ -69,7 +73,17 @@ _SOURCE_TYPES = {
     DocumentType.PRE_BILL,
     DocumentType.MANAGEMENT_DOCUMENT,
 }
-_FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT, DocumentType.REFUND}
+_FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT}
+_VERSION_SEMANTIC_FIELDS = (
+    "document_type",
+    "subtype",
+    "external_document_code",
+    "order_code",
+    "table_code",
+    "operator_code",
+    "terminal_code",
+    "document_timestamp",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +104,7 @@ class CorrelationRunReport:
     orders_created: int
     events_inserted: int
     snapshots_inserted: int
+    price_attributions_inserted: int
 
 
 def _document_time(document: NormalizedDocument) -> datetime:
@@ -115,10 +130,22 @@ def _versioned_semantic(
     legacy_projection: Document,
     attribute: str,
 ) -> Any:
-    """Read immutable version data, falling back only for pre-migration rows."""
+    """Read one semantic row without mixing it with a newer projection."""
 
-    version_value = getattr(version, attribute)
-    return version_value if version_value is not None else getattr(legacy_projection, attribute)
+    if all(getattr(version, name) is None for name in _VERSION_SEMANTIC_FIELDS):
+        return getattr(legacy_projection, attribute)
+    return getattr(version, attribute)
+
+
+def _legacy_version_semantics() -> Any:
+    """Match only versions that predate the immutable semantic columns."""
+
+    return and_(
+        *(
+            getattr(DocumentVersion, name).is_(None)
+            for name in _VERSION_SEMANTIC_FIELDS
+        )
+    )
 
 
 def activate_parser_version(
@@ -197,6 +224,10 @@ def activate_parser_version(
                 metadata["parser_activation_fingerprint"] = hashlib.sha256(
                     canonical_json(active_rows)
                 ).hexdigest()
+                metadata["correlation_algorithm_version"] = ALGORITHM_VERSION
+                metadata["price_attribution_algorithm_version"] = (
+                    PRICE_ATTRIBUTION_ALGORITHM
+                )
                 metadata["parser_activation_no_rewind"] = {
                     "parser_name": parser_name,
                     "parser_version_id": str(selected.id),
@@ -307,6 +338,14 @@ def _latest_version_id() -> Any:
 
 
 def _document_query(document_ids: set[UUID] | None = None) -> Select[Any]:
+    technically_complete = and_(
+        PrintJob.capture_complete.is_(True),
+        PrintJob.timeline_complete.is_(True),
+        PrintJob.status.not_in(("FAILED", "INCOMPLETE", "MALFORMED")),
+        PrintJob.import_status.not_in(
+            ("FAILED", "QUARANTINED", "PARSE_RETRY", "PARSE_FAILED")
+        ),
+    )
     statement = (
         select(Document, DocumentVersion, Device, ProxySession, PrintJob, ParserVersion)
         .join(DocumentVersion, DocumentVersion.document_id == Document.id)
@@ -314,7 +353,11 @@ def _document_query(document_ids: set[UUID] | None = None) -> Select[Any]:
         .join(ProxySession, ProxySession.id == Document.session_id)
         .join(PrintJob, PrintJob.id == Document.job_id)
         .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
-        .where(DocumentVersion.id == _latest_version_id())
+        .where(
+            DocumentVersion.id == _latest_version_id(),
+            PrintJob.analysis_excluded.is_(False),
+            or_(technically_complete, PrintJob.review_state == "VERIFIED_USABLE"),
+        )
         .order_by(Document.captured_at.desc(), Document.id.desc())
     )
     if document_ids is not None:
@@ -472,9 +515,19 @@ def _candidate_batch(
         and (watermark.metadata_json or {}).get("parser_activation_fingerprint")
         != activation_fingerprint
     )
+    algorithm_changed = (
+        watermark is not None
+        and (watermark.metadata_json or {}).get("correlation_algorithm_version")
+        != ALGORITHM_VERSION
+    )
+    pricing_changed = (
+        watermark is not None
+        and (watermark.metadata_json or {}).get("price_attribution_algorithm_version")
+        != PRICE_ATTRIBUTION_ALGORITHM
+    )
     cursor = (
         None
-        if watermark is None or activation_changed
+        if watermark is None or activation_changed or algorithm_changed or pricing_changed
         else watermark.cursor_timestamp - timedelta(seconds=lookback_seconds)
     )
     seed_statement = _document_query().order_by(None)
@@ -518,9 +571,6 @@ def _candidate_batch(
         if item.value.external_document_code
     }
     table_codes = {item.value.table_code for item in loaded_seeds if item.value.table_code}
-    session_ids = {
-        item.value.source_session_id for item in loaded_seeds if item.value.source_session_id
-    }
     source_job_ids = {item.value.source_job_id for item in loaded_seeds if item.value.source_job_id}
     strong_blocks = []
     if order_codes:
@@ -528,7 +578,7 @@ def _candidate_batch(
             or_(
                 DocumentVersion.order_code.in_(order_codes),
                 and_(
-                    DocumentVersion.order_code.is_(None),
+                    _legacy_version_semantics(),
                     Document.order_code.in_(order_codes),
                 ),
             )
@@ -538,7 +588,7 @@ def _candidate_batch(
             or_(
                 DocumentVersion.external_document_code.in_(external_codes),
                 and_(
-                    DocumentVersion.external_document_code.is_(None),
+                    _legacy_version_semantics(),
                     Document.external_document_code.in_(external_codes),
                 ),
             )
@@ -548,13 +598,11 @@ def _candidate_batch(
             or_(
                 DocumentVersion.table_code.in_(table_codes),
                 and_(
-                    DocumentVersion.table_code.is_(None),
+                    _legacy_version_semantics(),
                     Document.table_code.in_(table_codes),
                 ),
             )
         )
-    if session_ids:
-        strong_blocks.append(ProxySession.source_session_id.in_(session_ids))
     if source_job_ids:
         strong_blocks.append(PrintJob.source_job_id.in_(source_job_ids))
     candidate_statement = _document_query().where(
@@ -576,10 +624,15 @@ def _candidate_batch(
                 metadata_json={
                     "lookback_seconds": lookback_seconds,
                     "parser_activation_fingerprint": activation_fingerprint,
+                    "correlation_algorithm_version": ALGORITHM_VERSION,
+                    "price_attribution_algorithm_version": PRICE_ATTRIBUTION_ALGORITHM,
                 },
             )
         )
-    elif activation_changed or (latest_version.parsed_at, str(latest_version.id)) > (
+    elif activation_changed or algorithm_changed or pricing_changed or (
+        latest_version.parsed_at,
+        str(latest_version.id),
+    ) > (
         watermark.cursor_timestamp,
         str(watermark.cursor_id),
     ):
@@ -589,6 +642,8 @@ def _candidate_batch(
         watermark.metadata_json = {
             "lookback_seconds": lookback_seconds,
             "parser_activation_fingerprint": activation_fingerprint,
+            "correlation_algorithm_version": ALGORITHM_VERSION,
+            "price_attribution_algorithm_version": PRICE_ATTRIBUTION_ALGORITHM,
         }
     return loaded, seed_ids
 
@@ -606,7 +661,6 @@ def _candidate_pairs(
             ("order", document.order_code),
             ("external", document.external_document_code),
             ("table", document.table_code),
-            ("session", document.source_session_id),
             ("job", document.source_job_id),
         ):
             if value:
@@ -702,11 +756,21 @@ class CorrelationWorker:
             orders_created = 0
             events_inserted = 0
             snapshots_inserted = 0
+            price_attributions_inserted = 0
             for transaction in transactions:
                 if not ({document.id for document in transaction.documents} & seed_ids):
                     continue
                 correlation, inserted = self._persist_correlation(session, transaction, by_id)
                 correlations_inserted += int(inserted)
+                price_attributions_inserted += persist_transaction_price_attributions(
+                    session,
+                    correlation_id=correlation.id,
+                    documents=transaction.documents,
+                    version_ids={
+                        document.id: by_id[document.id].version_id
+                        for document in transaction.documents
+                    },
+                )
                 order, created = self._upsert_order(session, transaction, by_id)
                 orders_created += int(created)
                 inserted_events, inserted_snapshots = self._append_order_evidence(
@@ -727,6 +791,7 @@ class CorrelationWorker:
                 orders_created=orders_created,
                 events_inserted=events_inserted,
                 snapshots_inserted=snapshots_inserted,
+                price_attributions_inserted=price_attributions_inserted,
             )
 
     def _persist_correlation(
@@ -736,6 +801,7 @@ class CorrelationWorker:
         loaded_by_id: dict[UUID, LoadedDocument],
     ) -> tuple[DocumentCorrelation, bool]:
         fingerprint = correlation_input_fingerprint(transaction.documents, loaded_by_id)
+        document_ids = {document.id for document in transaction.documents}
         existing = session.scalar(
             select(DocumentCorrelation).where(
                 DocumentCorrelation.transaction_id == transaction.transaction_id,
@@ -744,9 +810,32 @@ class CorrelationWorker:
             )
         )
         if existing is not None:
+            # The exact result may have been superseded because one of its jobs was
+            # temporarily excluded.  It is safe to reactivate only now, after the
+            # current engine has independently reproduced the same immutable input
+            # fingerprint.  Supersede every other active overlap before returning so
+            # a stale episode cannot remain current alongside it.
+            previous = session.scalars(
+                select(DocumentCorrelation)
+                .join(
+                    DocumentCorrelationMember,
+                    DocumentCorrelationMember.correlation_id == DocumentCorrelation.id,
+                )
+                .where(
+                    DocumentCorrelationMember.document_id.in_(document_ids),
+                    DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
+                    DocumentCorrelation.id != existing.id,
+                )
+                .distinct()
+            ).all()
+            for old in previous:
+                old.status = "SUPERSEDED"
+            if existing.status == "SUPERSEDED":
+                existing.status = (
+                    "UNCORRELATED" if transaction.correlation is None else "AUTOMATIC"
+                )
             return existing, False
 
-        document_ids = {document.id for document in transaction.documents}
         previous = session.scalars(
             select(DocumentCorrelation)
             .join(
@@ -754,7 +843,6 @@ class CorrelationWorker:
                 DocumentCorrelationMember.correlation_id == DocumentCorrelation.id,
             )
             .where(
-                DocumentCorrelation.algorithm_version == ALGORITHM_VERSION,
                 DocumentCorrelationMember.document_id.in_(document_ids),
                 DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
             )
@@ -768,7 +856,7 @@ class CorrelationWorker:
                     )
                 )
             )
-            if old_members <= document_ids:
+            if old_members & document_ids:
                 old.status = "SUPERSEDED"
 
         result = transaction.correlation
@@ -861,8 +949,19 @@ class CorrelationWorker:
                 order.order_code = order_code
 
         fiscals = [document for document in documents if document.type in _FISCAL_TYPES]
+        room_closures = [
+            document
+            for document in documents
+            if document.type is DocumentType.MANAGEMENT_DOCUMENT
+            and (
+                bool(document.raw_metadata.get("economic_close"))
+                or document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+            )
+        ]
         cancellation = any(document.type is DocumentType.CANCELLATION for document in documents)
-        order.status = "CLOSED" if fiscals else "VOIDED" if cancellation else "OPEN"
+        order.status = (
+            "CLOSED" if fiscals or room_closures else "VOIDED" if cancellation else "OPEN"
+        )
         order.table_code = next(
             (document.table_code for document in documents if document.table_code), None
         )
@@ -875,6 +974,8 @@ class CorrelationWorker:
         order.gross_total = (
             transaction.fiscal_total
             if fiscals
+            else transaction.observed_final_total
+            if room_closures
             else transaction.prebill_total
             or next(
                 (
@@ -888,7 +989,10 @@ class CorrelationWorker:
         latest = max(documents, key=lambda item: (_document_time(item), str(item.id)))
         order.net_total = latest.net_total
         order.discount_total = latest.discount_total
-        order.closed_at = max((_document_time(item) for item in fiscals), default=None)
+        order.closed_at = max(
+            (_document_time(item) for item in (*fiscals, *room_closures)),
+            default=None,
+        )
         version_ids = [loaded_by_id[document.id].version_id for document in documents]
         for payment in session.scalars(
             select(Payment).where(Payment.document_version_id.in_(version_ids))
@@ -923,8 +1027,13 @@ class CorrelationWorker:
                 tuple[DomainLine, ...],
             ]
         ] = []
-        if sources:
-            first = min(sources, key=lambda item: (_document_time(item), str(item.id)))
+        opening_sources = [
+            document
+            for document in sources
+            if document.type is not DocumentType.ORDER_CHANGE
+        ]
+        if opening_sources:
+            first = min(opening_sources, key=lambda item: (_document_time(item), str(item.id)))
             desired.append(
                 (
                     _document_time(first),
@@ -1013,12 +1122,31 @@ class CorrelationWorker:
             ),
             None,
         )
-        fiscal = next(
-            (document for document in documents if document.type in _FISCAL_TYPES),
-            None,
-        )
-        if prebill is not None and fiscal is not None:
-            comparisons.append((prebill.lines, fiscal.lines, fiscal))
+        sale_fiscals = [
+            document
+            for document in documents
+            if document.type in _FISCAL_TYPES and document.complete
+        ]
+        room_closures = [
+            document
+            for document in documents
+            if document.type is DocumentType.MANAGEMENT_DOCUMENT
+            and (
+                bool(document.raw_metadata.get("economic_close"))
+                or document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+            )
+        ]
+        final_closures = sale_fiscals or room_closures
+        if prebill is not None and final_closures:
+            # A split bill is one settlement outcome.  Comparing the prebill
+            # with only its first 50 EUR receipt manufactures removals for all
+            # lines paid by the second guest.
+            final_lines = tuple(line for document in final_closures for line in document.lines)
+            final_document = max(
+                final_closures,
+                key=lambda item: (_document_time(item), str(item.id)),
+            )
+            comparisons.append((prebill.lines, final_lines, final_document))
         seen_changes: set[str] = set()
         for before_lines, after_lines, after in comparisons:
             for change in compare_document_lines(before_lines, after_lines):
@@ -1040,9 +1168,9 @@ class CorrelationWorker:
                         after_lines,
                     )
                 )
-        if any(document.type in _FISCAL_TYPES for document in documents):
+        if final_closures:
             final = max(
-                (document for document in documents if document.type in _FISCAL_TYPES),
+                final_closures,
                 key=lambda item: (_document_time(item), str(item.id)),
             )
             desired.append(
@@ -1051,7 +1179,15 @@ class CorrelationWorker:
                     OrderEventType.ORDER_CLOSED,
                     final,
                     loaded_by_id[final.id].version_id,
-                    {"fiscal_total": str(transaction.fiscal_total)},
+                    {
+                        "fiscal_total": str(transaction.fiscal_total),
+                        "observed_final_total": str(transaction.observed_final_total),
+                        "settlement_kind": (
+                            "ROOM_CHARGE"
+                            if final in room_closures
+                            else "COMMERCIAL_DOCUMENT"
+                        ),
+                    },
                     final.lines,
                 )
             )

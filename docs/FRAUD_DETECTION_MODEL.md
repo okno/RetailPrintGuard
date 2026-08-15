@@ -28,7 +28,9 @@ flowchart LR
 
 Il catalogo predefinito comprende le sedici regole richieste dal capitolato e
 la regola composita `MODIFICA_POST_PRECONTO`. L'elenco e le soglie correnti sono
-in [ALERT_E_REGOLE.md](ALERT_E_REGOLE.md).
+in [ALERT_E_REGOLE.md](ALERT_E_REGOLE.md). Confini dell'episodio, componenti
+ausiliari, conti divisi e attribuzione dei prezzi sono descritti in
+[Episodi di vendita](ANTIFRODE_EPISODI_VENDITA.md).
 
 `MODIFICA_POST_PRECONTO` apre un finding quando, dopo un preconto, esiste una
 chiusura fiscale completa oppure un esito economico gestionale validato e sono
@@ -46,6 +48,13 @@ positivo. Più Documenti Commerciali completi correlati vengono aggregati: un
 preconto da 100,00 € chiuso con due documenti da 50,00 € non produce un alert di
 riduzione.
 
+Un rimborso è un aggiustamento post-chiusura e non abbassa il totale della
+vendita originaria. Un Documento Gestionale è una chiusura economica soltanto
+quando la semantica osservata lo marca esplicitamente, inclusi gli addebiti
+camera classificati. Quando la regola composita scatta, rimozioni e riduzioni di
+prezzo confluiscono come evidenze nel singolo incidente economico: non vengono
+sommate più volte in dashboard.
+
 ## Score e severità
 
 Lo score 0–100 combina severità base, ampiezza economica, qualità della
@@ -55,6 +64,11 @@ frode. Un alert con confidenza bassa deve mostrare quali criteri mancano.
 Stati operativi: `OPEN`, `UNDER_REVIEW`, `CONFIRMED`, `FALSE_POSITIVE`,
 `JUSTIFIED`, `CLOSED`. Note, assegnazione, motivazione di chiusura e passaggi di
 stato sono storicizzati.
+
+Solo `OPEN`, `UNDER_REVIEW` e `CONFIRMED` concorrono alle metriche operative e
+allo stato corrente della transazione. Gli altri stati e gli alert superseded
+restano nell'archivio. La riclassificazione automatica dei falsi positivi noti
+aggiunge evidenze e storia hash-chained; non elimina né riscrive il finding.
 
 ## Whitelist
 

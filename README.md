@@ -10,7 +10,7 @@ le direzioni e non importa parser, API o database. La cattura usa una coda
 limitata e uno spool locale; un guasto del control plane non deve trasformarsi
 in una dipendenza sincrona della stampa.
 
-> Stato: release `0.3.1`. I test software sintetici coprono relay,
+> Stato: release `0.4.0`. I test software sintetici coprono relay,
 > spool, configurazione, import, correlazione, regole, modelli e API. Il collaudo
 > su hardware reale, il confronto PCAP direct-vs-proxy e l'installazione sul
 > target Debian 12 non sono ancora attestati da questo repository. Consultare
@@ -28,7 +28,8 @@ in una dipendenza sincrona della stampa.
   dal relay; per i banner POS può usare OCR raster bounded nel solo control
   plane, conservando sempre RAW, offset e confidenza;
 - `retailprintguard-correlate`: worker DB per correlazione deterministica, diff
-  delle righe, ordini/eventi/snapshot e aggregazione dei documenti fiscali;
+  delle righe, episodi di vendita, ordini/eventi/snapshot, aggregazione delle
+  chiusure fiscali e prezzi POS derivati con provenienza;
 - `retailprintguard-fraud`: worker DB per regole spiegabili e versionate, evidenze,
   storia alert e whitelist documentate;
 - `retailprintguard-api`: API FastAPI versionate, autenticazione e RBAC;
@@ -117,6 +118,7 @@ RetailPrintGuard/
 - [API e RBAC](docs/API.md)
 - [Web application](docs/WEB_APPLICATION.md)
 - [Correlazione, alert e regole](docs/ALERT_E_REGOLE.md)
+- [Episodi di vendita e riduzione dei falsi positivi](docs/ANTIFRODE_EPISODI_VENDITA.md)
 - [Modello antifrode](docs/FRAUD_DETECTION_MODEL.md)
 - [Importazione storica](docs/IMPORT_STORICO.md)
 - [Migrazione dai proxy standalone](docs/MIGRAZIONE_DA_LEGACY.md)

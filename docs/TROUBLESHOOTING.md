@@ -161,6 +161,34 @@ può non avere `raw_payload_id`; il repository tenta il primo raw
 client→dispositivo del job. Verificare import completo e hash senza cambiare
 l'associazione manualmente.
 
+## Revisione incompleto restituisce 503 o 403
+
+- 503: l'hash di conferma non è configurato o non è stato caricato. Eseguire da
+  root `retailprintguard-configure-review` e riavviare soltanto
+  `retailprintguard-api.service`;
+- 403: la password di conferma è errata; non copiarla in comandi/log e attendere
+  il throttle prima di riprovare;
+- 409: il job non soddisfa i criteri tecnici di incompletezza;
+- 429: troppi tentativi nello stesso intervallo.
+
+Non modificare manualmente `review.env` e non cancellare il job per aggirare la
+revisione. `EXCLUDED` significa fuori dall'analisi, non eliminato.
+
+## Filtro periodo restituisce 422
+
+Verificare che `from` e `to` siano timestamp ISO 8601 con offset esplicito e che
+`to` sia strettamente successivo a `from`. L'intervallo è `[from, to)`: il
+secondo estremo non è incluso.
+
+## Journal vuoto con servizi attivi
+
+Un account non privilegiato può non avere accesso al journal di sistema. Prima
+di concludere che non esistano eventi, verificare l'autorizzazione con il
+responsabile del server oppure richiedere un export bounded/redatto prodotto da
+root. Non aggiungere autonomamente utenti a gruppi amministrativi. Se `sudo`
+non è disponibile o autorizzato, registrare il limite e fermarsi: l'accesso SSH
+non autorizza escalation alternativa.
+
 ## Orari incoerenti
 
 Il database conserva UTC; la UI usa locale italiano. Verificare NTP, timezone

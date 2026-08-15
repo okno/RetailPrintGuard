@@ -29,13 +29,21 @@ from retailprintguard.correlation.engine import (
 
 ZERO = Decimal("0.0000")
 CENT = Decimal("0.0100")
-FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT, DocumentType.REFUND}
+FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT}
 SOURCE_TYPES = {
     DocumentType.ORDER,
     DocumentType.ORDER_CHANGE,
     DocumentType.KITCHEN_ORDER,
     DocumentType.PRE_BILL,
     DocumentType.MANAGEMENT_DOCUMENT,
+}
+OPENING_TYPES = {DocumentType.ORDER, DocumentType.PRE_BILL}
+_SECONDARY_ECONOMIC_RULES = {
+    "PREBILL_FISCAL_AMOUNT_DROP",
+    "ITEM_REMOVED_AFTER_PREBILL",
+    "PRICE_REDUCED_AFTER_PREBILL",
+    "EXTREME_PRICE_CHANGE",
+    "SAME_REFERENCE_DIFFERENT_AMOUNT",
 }
 
 
@@ -205,10 +213,59 @@ def _document_total(document: NormalizedDocument) -> Decimal | None:
     return document.gross_total if document.gross_total is not None else document.net_total
 
 
+def _valid_fiscal_document(document: NormalizedDocument) -> bool:
+    return (
+        document.type in FISCAL_TYPES
+        and document.complete
+        and _document_total(document) is not None
+    )
+
+
 def _decimal(value: Any, default: str = "0") -> Decimal:
     if value is None:
         return Decimal(default)
     return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _line_total_candidates(
+    document: NormalizedDocument, line_sum: Decimal
+) -> tuple[Decimal, ...] | None:
+    """Return defensible totals without guessing unknown global adjustments."""
+
+    candidates = {line_sum}
+    discount = document.discount_total
+    if discount is not None:
+        candidates.add(line_sum - discount)
+
+    adjustments: list[Decimal] = []
+    metadata = document.raw_metadata
+    for key in ("adjustment_total", "surcharge_total", "rounding_adjustment"):
+        if key not in metadata:
+            continue
+        try:
+            if metadata[key] is None:
+                return None
+            adjustments.append(_decimal(metadata[key]))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+    if "adjustments" in metadata:
+        raw_adjustments = metadata["adjustments"]
+        if not isinstance(raw_adjustments, (list, tuple)):
+            return None
+        try:
+            for item in raw_adjustments:
+                value = item.get("amount") if isinstance(item, dict) else item
+                if value is None:
+                    return None
+                adjustments.append(_decimal(value))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+    if adjustments:
+        adjustment_total = sum(adjustments, ZERO)
+        candidates.add(line_sum + adjustment_total)
+        if discount is not None:
+            candidates.add(line_sum - discount + adjustment_total)
+    return tuple(sorted(candidates))
 
 
 def _amount_evidence(context: FraudContext) -> dict[str, Any]:
@@ -356,6 +413,14 @@ class FraudEngine:
                     opened_at=context.evaluated_at,
                 )
             )
+        # One sale-value reduction is one operational incident.  Detailed
+        # removals and price changes are already embedded as evidence in the
+        # primary finding; opening another alert for every symptom inflated
+        # both the dashboard loss and the operator anomaly rate.
+        if any(item.rule_code == "MODIFICA_POST_PRECONTO" for item in findings):
+            findings = [
+                item for item in findings if item.rule_code not in _SECONDARY_ECONOMIC_RULES
+            ]
         return tuple(findings)
 
     def _post_prebill_change(
@@ -377,9 +442,16 @@ class FraudEngine:
             document
             for document in tx.documents
             if (
-                document.type in FISCAL_TYPES
-                or bool(document.raw_metadata.get("economic_close"))
+                _valid_fiscal_document(document)
                 or document.type is DocumentType.CANCELLATION
+                or (
+                    document.type is DocumentType.MANAGEMENT_DOCUMENT
+                    and _document_total(document) is not None
+                    and (
+                        bool(document.raw_metadata.get("economic_close"))
+                        or document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+                    )
+                )
             )
         ]
         if not closures:
@@ -420,7 +492,7 @@ class FraudEngine:
             "difference_amount": str(difference),
             "difference_percent": str(percent),
             "fiscal_conclusive": any(
-                document.type in FISCAL_TYPES and document.complete for document in closures
+                _valid_fiscal_document(document) for document in closures
             ),
             "cancelled_or_partial": any(
                 document.type is DocumentType.CANCELLATION or not document.complete
@@ -433,7 +505,7 @@ class FraudEngine:
         }
         score = min(100, 70 + int(percent * Decimal("0.3")))
         return _FindingData(
-            description="Modifica economica rilevante dopo il preconto",
+            description="Riduzione del valore di vendita dopo il preconto",
             explanation=(
                 f"Il preconto era {tx.prebill_total} EUR; l'esito economico osservato "
                 f"e' {tx.observed_final_total} EUR, con differenza {difference} EUR "
@@ -450,7 +522,7 @@ class FraudEngine:
         self, context: FraudContext, rule: RuleDefinition
     ) -> _FindingData | None:
         tx = context.transaction
-        has_fiscal = any(document.type in FISCAL_TYPES for document in tx.documents)
+        has_fiscal = any(_valid_fiscal_document(document) for document in tx.documents)
         if tx.prebill_total is None or tx.prebill_total <= ZERO or not has_fiscal:
             return None
         difference = tx.difference_amount or ZERO
@@ -597,7 +669,7 @@ class FraudEngine:
         if (
             not shared_references
             or context.transaction.prebill_total is None
-            or not any(document.type in FISCAL_TYPES for document in documents)
+            or not any(_valid_fiscal_document(document) for document in documents)
             or difference < _decimal(rule.parameters.get("minimum_amount"), "1")
         ):
             return None
@@ -624,8 +696,20 @@ class FraudEngine:
         self, context: FraudContext, rule: RuleDefinition
     ) -> _FindingData | None:
         documents = context.transaction.documents
-        sources = [document for document in documents if document.type in SOURCE_TYPES]
-        if not sources or any(document.type in FISCAL_TYPES for document in documents):
+        sources = [document for document in documents if document.type in OPENING_TYPES]
+        economic_close = any(
+            _valid_fiscal_document(document)
+            or (
+                document.type is DocumentType.MANAGEMENT_DOCUMENT
+                and _document_total(document) is not None
+                and (
+                    bool(document.raw_metadata.get("economic_close"))
+                    or document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+                )
+            )
+            for document in documents
+        )
+        if not sources or economic_close:
             return None
         latest = max(_document_time(document) for document in sources)
         limit = timedelta(minutes=int(rule.parameters.get("close_minutes", 120)))
@@ -681,16 +765,33 @@ class FraudEngine:
         )
 
     def _excessive_void(self, context: FraudContext, rule: RuleDefinition) -> _FindingData | None:
-        relevant = {
-            OrderEventType.ITEM_REMOVED,
-            OrderEventType.ORDER_VOIDED,
-        }
-        events = [event for event in context.order_events if event.type in relevant]
-        explicit = sum(
-            document.type in {DocumentType.CANCELLATION, DocumentType.REFUND}
+        cancellation_ids = {
+            document.id
             for document in context.transaction.documents
+            if document.type in {DocumentType.CANCELLATION, DocumentType.REFUND}
+        }
+        removal_events = [
+            event
+            for event in context.order_events
+            if event.type is OrderEventType.ITEM_REMOVED
+            and event.source_document_id not in cancellation_ids
+        ]
+        void_events = [
+            event
+            for event in context.order_events
+            if event.type is OrderEventType.ORDER_VOIDED
+        ]
+        represented_cancellations = {
+            event.source_document_id
+            for event in void_events
+            if event.source_document_id is not None
+        }
+        count = (
+            len(removal_events)
+            + len(represented_cancellations)
+            + sum(event.source_document_id is None for event in void_events)
+            + len(cancellation_ids - represented_cancellations)
         )
-        count = len(events) + explicit
         threshold = int(rule.parameters.get("minimum_count", 3))
         if count < threshold:
             return None
@@ -702,7 +803,12 @@ class FraudEngine:
                     "kind": "void_frequency",
                     "count": count,
                     "threshold": threshold,
-                    "event_ids": [str(event.id) for event in events],
+                    "event_ids": [
+                        str(event.id) for event in (*removal_events, *void_events)
+                    ],
+                    "cancellation_document_ids": sorted(
+                        str(document_id) for document_id in cancellation_ids
+                    ),
                 },
             ),
             score=min(100, 60 + count * 8),
@@ -737,6 +843,7 @@ class FraudEngine:
 
     def _sequence_gap(self, context: FraudContext, rule: RuleDefinition) -> _FindingData | None:
         del rule
+        transaction_ids = {document.id for document in context.transaction.documents}
         grouped: dict[tuple[str, str, str, str], list[tuple[int, NormalizedDocument]]] = {}
         candidates = (*context.comparison_documents, *context.transaction.documents)
         seen: set[Any] = set()
@@ -758,7 +865,8 @@ class FraudEngine:
         for (device_id, document_type, business_date, prefix), values in grouped.items():
             ordered = sorted(values, key=lambda item: item[0])
             for (before, before_doc), (after, after_doc) in zip(ordered, ordered[1:], strict=False):
-                if after - before > 1:
+                pair_ids = {before_doc.id, after_doc.id}
+                if after - before > 1 and pair_ids & transaction_ids:
                     involved.update((before_doc.id, after_doc.id))
                     gaps.append(
                         {
@@ -774,6 +882,11 @@ class FraudEngine:
                     )
         if not gaps:
             return None
+        if min(involved, key=str) not in transaction_ids:
+            # A cross-transaction series anomaly is emitted once, anchored to
+            # the deterministic first involved document, never copied onto
+            # every transaction in the comparison window.
+            return None
         return _FindingData(
             description="Discontinuità nella sequenza dei documenti",
             explanation=f"Rilevate {len(gaps)} discontinuità numeriche nella stessa serie.",
@@ -787,6 +900,7 @@ class FraudEngine:
         self, context: FraudContext, rule: RuleDefinition
     ) -> _FindingData | None:
         del rule
+        transaction_ids = {document.id for document in context.transaction.documents}
         candidates = (*context.comparison_documents, *context.transaction.documents)
         groups: dict[tuple[str, str, str, str], list[NormalizedDocument]] = {}
         seen: set[Any] = set()
@@ -811,10 +925,13 @@ class FraudEngine:
             if len({document.source_job_id for document in documents}) > 1
             and len(documents) > 1
             and documents[0].type not in {DocumentType.REPRINT, DocumentType.CONFORMING_COPY}
+            and {document.id for document in documents} & transaction_ids
         ]
         if not duplicate_groups:
             return None
         involved = tuple(document.id for documents in duplicate_groups for document in documents)
+        if min(involved, key=str) not in transaction_ids:
+            return None
         return _FindingData(
             description="Identificativo o contenuto documento duplicato",
             explanation=f"Rilevati {len(duplicate_groups)} gruppi duplicati su job distinti.",
@@ -839,11 +956,16 @@ class FraudEngine:
         fiscal_times = [
             _document_time(document)
             for document in context.transaction.documents
-            if document.type in FISCAL_TYPES
+            if _valid_fiscal_document(document)
         ]
         if not fiscal_times:
             return None
         fiscal_time = min(fiscal_times)
+        fiscal_document_ids = {
+            document.id
+            for document in context.transaction.documents
+            if _valid_fiscal_document(document)
+        }
         window = timedelta(minutes=int(rule.parameters.get("window_minutes", 5)))
         modification_types = {
             OrderEventType.ITEM_ADDED,
@@ -856,15 +978,17 @@ class FraudEngine:
         events = [
             event
             for event in context.order_events
-            if event.type in modification_types and abs(event.occurred_at - fiscal_time) <= window
+            if event.type in modification_types
+            and fiscal_time < event.occurred_at <= fiscal_time + window
+            and event.source_document_id not in fiscal_document_ids
         ]
         if not events:
             return None
         return _FindingData(
             description="Modifica tardiva dell'ordine",
             explanation=(
-                f"Rilevate {len(events)} modifiche entro {int(window.total_seconds() / 60)} "
-                "minuti dalla chiusura fiscale."
+                f"Rilevate {len(events)} modifiche dopo la chiusura ed entro "
+                f"{int(window.total_seconds() / 60)} minuti."
             ),
             evidence=tuple(
                 {
@@ -888,7 +1012,12 @@ class FraudEngine:
         evidence: list[dict[str, Any]] = []
         involved: set[Any] = set()
         for document in context.transaction.documents:
-            if document.type in {DocumentType.CANCELLATION, DocumentType.REFUND}:
+            if document.type not in {
+                DocumentType.ORDER,
+                DocumentType.PRE_BILL,
+                DocumentType.MANAGEMENT_DOCUMENT,
+                DocumentType.COMMERCIAL_DOCUMENT,
+            }:
                 continue
             for line in document.lines:
                 effective_unit_price = (
@@ -929,6 +1058,16 @@ class FraudEngine:
         mismatches: list[dict[str, Any]] = []
         involved: list[Any] = []
         for document in context.transaction.documents:
+            if document.type in {
+                DocumentType.ORDER_CHANGE,
+                DocumentType.KITCHEN_ORDER,
+                DocumentType.CANCELLATION,
+                DocumentType.REFUND,
+                DocumentType.CONFORMING_COPY,
+                DocumentType.REPRINT,
+                DocumentType.DEVICE_RESPONSE,
+            }:
+                continue
             total = _document_total(document)
             if (
                 total is None
@@ -938,7 +1077,10 @@ class FraudEngine:
             ):
                 continue
             line_sum = sum((line.line_total or ZERO) for line in document.lines)
-            difference = abs(total - line_sum)
+            expected_totals = _line_total_candidates(document, line_sum)
+            if expected_totals is None:
+                continue
+            difference = min(abs(total - expected) for expected in expected_totals)
             if difference > tolerance:
                 involved.append(document.id)
                 mismatches.append(
@@ -947,6 +1089,12 @@ class FraudEngine:
                         "document_id": str(document.id),
                         "declared_total": str(total),
                         "line_sum": str(line_sum),
+                        "discount_total": (
+                            None
+                            if document.discount_total is None
+                            else str(document.discount_total)
+                        ),
+                        "reconstructible_totals": [str(value) for value in expected_totals],
                         "difference": str(difference),
                     }
                 )

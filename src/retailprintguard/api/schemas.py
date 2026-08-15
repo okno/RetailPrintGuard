@@ -83,6 +83,12 @@ class DashboardView(BaseModel):
     parse_errors: int = 0
     alert_trend: list[dict[str, Any]] = Field(default_factory=list)
     anomaly_concentration: list[dict[str, Any]] = Field(default_factory=list)
+    operational_alerts: int = 0
+    economic_reduction_episodes: int = 0
+    operational_economic_difference: Decimal = Decimal("0")
+    incomplete_jobs: int = 0
+    false_positive_alerts: int = 0
+    justified_alerts: int = 0
 
 
 class SessionView(BaseModel):
@@ -112,6 +118,33 @@ class JobView(BaseModel):
     imported_at: datetime | None = None
     parser_status: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    review_state: str = "PENDING"
+    analysis_excluded: bool = False
+    reviewed_at: datetime | None = None
+    reviewed_by: UUID | None = None
+    review_reason: str | None = None
+
+
+class JobReviewRequest(BaseModel):
+    action: str
+    reason: str = Field(min_length=10, max_length=2000)
+    confirmation_password: str = Field(min_length=14, max_length=1024)
+
+    @field_validator("action")
+    @classmethod
+    def valid_action(cls, value: str) -> str:
+        allowed = {"VERIFY_USABLE", "EXCLUDE_FROM_ANALYSIS", "REOPEN_REVIEW"}
+        if value not in allowed:
+            raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 10:
+            raise ValueError("reason must contain at least 10 non-whitespace characters")
+        return normalized
 
 
 class SystemEventView(BaseModel):
@@ -137,7 +170,25 @@ class DiagnosticsView(BaseModel):
     recent_events: list[SystemEventView] = Field(default_factory=list)
 
 
+class LinePriceAttributionView(BaseModel):
+    id: UUID
+    correlation_id: UUID
+    source_document_id: UUID
+    source_document_version_id: UUID
+    source_line_id: UUID
+    source_kind: str
+    observed_unit_price: Decimal | None = None
+    observed_line_total: Decimal | None = None
+    confidence: Decimal
+    status: str
+    match_basis: str
+    algorithm_version: str
+    criteria: dict[str, Any] = Field(default_factory=dict)
+    source_observed_at: datetime
+
+
 class DocumentLineView(BaseModel):
+    id: UUID | None = None
     sequence: int
     course_code: str | None = None
     item_code: str | None = None
@@ -153,6 +204,9 @@ class DocumentLineView(BaseModel):
     removed: bool = False
     cancelled: bool = False
     raw_text: str | None = None
+    derived_unit_price: Decimal | None = None
+    derived_price_source: str | None = None
+    price_attributions: list[LinePriceAttributionView] = Field(default_factory=list)
 
 
 class DocumentView(BaseModel):
@@ -166,6 +220,7 @@ class DocumentView(BaseModel):
     table_code: str | None = None
     operator_code: str | None = None
     terminal_code: str | None = None
+    covers: int | None = None
     document_timestamp: datetime | None = None
     captured_at: datetime
     gross_total: Decimal | None = None

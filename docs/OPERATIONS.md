@@ -83,7 +83,7 @@ sudo /opt/retailprintguard/current/scripts/logs.sh --follow
 
 | Percorso | Contenuto |
 |---|---|
-| `/etc/retailprintguard` | configurazione e secret protetti; non copiarli nei ticket |
+| `/etc/retailprintguard` | configurazione e secret protetti, incluso `review.env`; non copiarli nei ticket |
 | `/opt/retailprintguard/releases` | release applicative immutabili |
 | `/opt/retailprintguard/current` | symlink alla release attiva |
 | `/var/www/retailprintguard/releases` | build frontend versionate |
@@ -142,6 +142,17 @@ journalctl -u retailprintguard-rch-proxy.service --since '-30 minutes' --no-page
 journalctl -u retailprintguard-ingestion.service --since '-30 minutes' --no-pager
 journalctl -u retailprintguard-parser.service --since '-30 minutes' --no-pager
 ```
+
+La lettura del journal può essere limitata a `root` e ai membri dei gruppi
+amministrativi (`systemd-journal`/`adm`, secondo il sito). Un account SSH non
+privilegiato può quindi ricevere zero righe pur con servizi attivi: non
+interpretare l'output vuoto come assenza di eventi. Per un'analisi giornaliera
+usare un account autorizzato o un export redatto prodotto da root, registrando
+nel ticket intervallo, unità consultate e limite di accesso. Non ampliare
+permessi o copiare journal completi senza approvazione del responsabile dati.
+L'accesso SSH non implica accesso root e `sudo` può non essere installato o
+autorizzato: in quel caso fermarsi e richiedere l'export all'operatore root, non
+tentare escalation o riutilizzo di credenziali fuori dal workflow approvato.
 
 Report bounded senza payload:
 
@@ -232,6 +243,46 @@ L'operatore non deve chiudere automaticamente alert sulla sola descrizione.
 Seguire [ALERT_E_REGOLE.md](ALERT_E_REGOLE.md), verificare confidenza,
 correlazione, diff e RAW, poi registrare nota/motivazione. Le whitelist non
 cancellano il finding.
+
+## Revisione dei job incompleti
+
+La revisione è una decisione sul control plane, non una cancellazione. Gli stati
+sono:
+
+- `PENDING`: richiede verifica;
+- `VERIFIED_USABLE`: acquisizione tecnicamente incompleta ma giudicata
+  utilizzabile dopo esame delle evidenze;
+- `EXCLUDED`: esclusa dalle successive correlazioni/regole, con RAW e
+  interpretazioni preservati.
+
+`REOPEN_REVIEW` imposta `PENDING` ma conserva `analysis_excluded=true`: riaprire
+non equivale a fidarsi nuovamente dell'evidenza. Soltanto `VERIFY_USABLE`
+reimposta `analysis_excluded=false` e consente il ricalcolo con quel job.
+
+Prima del primo utilizzo, configurare la password dedicata da terminale root:
+
+```bash
+sudo /opt/retailprintguard/current/.venv/bin/retailprintguard-configure-review
+sudo systemctl restart retailprintguard-api.service
+```
+
+La CLI chiede due volte una password di 14–1.024 caratteri, scrive
+atomicamente `/etc/retailprintguard/review.env` con proprietario root, gruppo
+API e mode `0640`, e conserva soltanto un hash Argon2id. Non inserire la password
+o il nome ambiente in YAML, né la password in argomenti della shell, variabili
+esportate, log o ticket. Il nome ambiente è fisso nel solo servizio API e viene
+caricato da `review.env`.
+
+In UI, un `ADMIN` deve esaminare warning, direzioni/dimensioni e RAW prima di
+scegliere “verifica utilizzabile”, “escludi dall'analisi” o “riapri”. Ogni
+azione richiede motivazione e nuova conferma della password, è protetta da
+throttle e produce audit hash-chained. L'esclusione giustifica gli alert
+derivati collegati e forza il ricalcolo; non elimina file, manifest, job o
+documenti. La riapertura resta esclusa finché non viene approvata con
+“verifica utilizzabile”.
+
+Se la password viene ruotata, ripetere la CLI e riavviare soltanto l'API. I
+proxy e gli altri worker non leggono `review.env`.
 
 ## Metriche minime da esportare
 

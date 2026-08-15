@@ -42,6 +42,7 @@ erDiagram
     DEVICES ||--o{ DEVICE_STATUS : reports
     DEVICES ||--o{ PROXY_SESSIONS : owns
     PROXY_SESSIONS ||--o{ PRINT_JOBS : contains
+    USERS ||--o{ PRINT_JOBS : reviews
     PRINT_JOBS ||--o{ RAW_PAYLOADS : preserves
     PROXY_SESSIONS ||--o{ STREAM_CHUNKS : orders
     PRINT_JOBS ||--o{ DOCUMENTS : produces
@@ -54,6 +55,8 @@ erDiagram
     ORDERS ||--o{ PAYMENTS : receives
     DOCUMENT_CORRELATIONS ||--o{ DOCUMENT_CORRELATION_MEMBERS : groups
     DOCUMENTS ||--o{ DOCUMENT_CORRELATION_MEMBERS : participates
+    DOCUMENT_CORRELATIONS ||--o{ LINE_PRICE_ATTRIBUTIONS : derives
+    DOCUMENT_LINES ||--o{ LINE_PRICE_ATTRIBUTIONS : target_and_source
     FRAUD_RULES ||--o{ FRAUD_RULE_VERSIONS : versions
     FRAUD_RULE_VERSIONS ||--o{ FRAUD_ALERTS : raises
     FRAUD_ALERTS ||--o{ FRAUD_ALERT_EVIDENCE : proves
@@ -72,10 +75,18 @@ erDiagram
 | `devices` | inventario logico e endpoint configurati |
 | `device_status` | osservazioni temporali di stato e ultimo errore |
 | `proxy_sessions` | sessioni TCP, endpoint, apertura/chiusura e completezza |
-| `print_jobs` | job pubblicati e stato import/parser; `source_key` univoca |
+| `print_jobs` | job pubblicati, stato import/parser e proiezione auditata della revisione tecnica; `source_key` univoca |
 | `raw_payloads` | artefatti originali, dimensione/hash, storage e catena |
 | `stream_chunks` | direzione, sequenza, offset, timing e forwarding |
 | `system_events` | eventi tecnici correlati a servizio/device/sessione/job |
+
+La revisione di un job incompleto usa `review_state`, `analysis_excluded`,
+`reviewed_at`, `reviewed_by_user_id` e `review_reason`. Gli stati ammessi sono
+`PENDING`, `VERIFIED_USABLE` ed `EXCLUDED`. Sono campi di proiezione: l'azione
+produce anche una voce in `audit_log`, non elimina `raw_payloads` e può essere
+riaperta. Una riapertura torna `PENDING` ma conserva
+`analysis_excluded=true`; soltanto `VERIFIED_USABLE` riammette il job. I worker
+derivati ignorano i job con `analysis_excluded=true`.
 
 ### Parsing e documenti
 
@@ -110,6 +121,17 @@ operativa come descritto in [Aggiornamento parser](AGGIORNAMENTO_PARSER.md).
 | `order_snapshots` | stato versionato ricostruibile |
 | `document_correlations` | transazione, algoritmo, score e spiegazione |
 | `document_correlation_members` | relazione molti-a-molti documento/correlazione |
+| `line_price_attributions` | prezzi derivati per righe POS con provenienza a riga/versione sorgente, confidenza e ambiguità |
+
+`line_price_attributions` non aggiorna mai `document_lines`: registra una nuova
+interpretazione append-only per versione algoritmo. Le fonti `PREBILL`,
+`MANAGEMENT` e `FISCAL` restano distinte e devono provenire da versioni
+documento complete. Più candidati concordi vengono
+conservati come `AGREED`; prezzi incompatibili restano tutti consultabili con
+stato `AMBIGUOUS`, senza selezioni arbitrarie. Se fonti complete discordano, la
+proiezione API usa `derived_price_source=CONFLICTING_SOURCES` e non pubblica un
+`derived_unit_price`, pur mantenendo i candidati consultabili. Copie conformi,
+ristampe e risposte dispositivo non sono fonti monetarie.
 
 ### Antifrode
 

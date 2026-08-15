@@ -93,6 +93,73 @@ rpg_current_release() {
     fi
 }
 
+rpg_assert_data_plane_unchanged() {
+    local current_release="$1"
+    local candidate_release="$2"
+    local relative
+    for relative in \
+        src/retailprintguard/proxy \
+        src/retailprintguard/common/config.py \
+        src/retailprintguard/common/logging.py \
+        requirements/production.lock \
+        systemd/retailprintguard-pos-proxy.service \
+        systemd/retailprintguard-rch-proxy.service; do
+        [[ -e "${current_release}/${relative}" && -e "${candidate_release}/${relative}" ]] || \
+            rpg_die "missing data-plane artifact required for comparison: ${relative}"
+        diff -qr -- "${current_release}/${relative}" "${candidate_release}/${relative}" \
+            >/dev/null || rpg_die \
+            "data-plane artifact changed; refusing --control-plane-only: ${relative}"
+    done
+    python3 - "${current_release}" "${candidate_release}" <<'PY' || \
+        rpg_die "data-plane package contract changed; refusing --control-plane-only"
+import ast
+import sys
+import tomllib
+from pathlib import Path
+
+current = Path(sys.argv[1])
+candidate = Path(sys.argv[2])
+
+
+def packaging_contract(root: Path) -> tuple[object, ...]:
+    with (root / "pyproject.toml").open("rb") as stream:
+        config = tomllib.load(stream)
+    project = config.get("project", {})
+    scripts = project.get("scripts", {})
+    return (
+        project.get("requires-python"),
+        project.get("dependencies"),
+        scripts.get("retailprintguard-proxy"),
+        config.get("tool", {}).get("setuptools"),
+    )
+
+
+def package_init_contract(root: Path) -> str:
+    source = (root / "src/retailprintguard/__init__.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    tree.body = [
+        node
+        for node in tree.body
+        if not (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == "__version__"
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+        )
+    ]
+    return ast.dump(tree, include_attributes=False)
+
+
+if packaging_contract(current) != packaging_contract(candidate):
+    raise SystemExit("proxy entry point or runtime packaging changed")
+if package_init_contract(current) != package_init_contract(candidate):
+    raise SystemExit("package initializer executable code changed")
+PY
+}
+
 rpg_stop_control_plane() {
     local service
     for service in retailprintguard-api.service retailprintguard-fraud.service \

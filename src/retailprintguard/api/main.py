@@ -15,6 +15,7 @@ from retailprintguard import __version__
 from retailprintguard.api.auth import LoginThrottle, TokenService
 from retailprintguard.api.middleware import CorrelationAndSecurityMiddleware
 from retailprintguard.api.repository import ApiRepository, EmptyRepository
+from retailprintguard.api.review_secret import DEFAULT_ENV_NAME, ReviewSecretVerifier
 from retailprintguard.api.routes import ApiContext, create_router
 from retailprintguard.common.config import Settings, load_settings
 from retailprintguard.common.logging import configure_structured_logging
@@ -25,15 +26,20 @@ def create_app(
     repository: ApiRepository | None = None,
     jwt_secret: bytes | None = None,
     settings: Settings | None = None,
+    review_password_hash: str | None = None,
 ) -> FastAPI:
     if jwt_secret is None:
         jwt_secret = b"test-only-secret-not-for-production-00000000000000000000"
     token_minutes = settings.api.access_token_minutes if settings else 30
     failed_limit = settings.api.failed_login_limit if settings else 5
     failed_delay = settings.api.failed_login_delay_seconds if settings else 2
+    if review_password_hash is None and settings is not None:
+        review_password_hash = os.environ.get(DEFAULT_ENV_NAME)
     context = ApiContext(
         repository or EmptyRepository(),
         TokenService(jwt_secret, lifetime_minutes=token_minutes),
+        LoginThrottle(limit=failed_limit, delay_seconds=failed_delay),
+        ReviewSecretVerifier(review_password_hash),
         LoginThrottle(limit=failed_limit, delay_seconds=failed_delay),
     )
     app = FastAPI(

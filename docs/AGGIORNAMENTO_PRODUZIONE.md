@@ -93,7 +93,55 @@ Questo produce un nuovo backup, attiva insieme applicazione e frontend,
 installa/verifica le integrazioni e riavvia i servizi. Non esiste un comando
 separato che attivi implicitamente i file staged.
 
-## 4. Attivazione e ripresa
+### Attivazione del solo control plane senza interrompere i proxy
+
+Per una release che modifica soltanto correlazione, antifrode, pricing, API,
+frontend o documentazione, usare:
+
+```bash
+cd /percorso/clone-approvato
+
+POS_PID_BEFORE="$(systemctl show retailprintguard-pos-proxy.service \
+  -p MainPID --value)"
+RCH_PID_BEFORE="$(systemctl show retailprintguard-rch-proxy.service \
+  -p MainPID --value)"
+
+sudo ./scripts/update.sh --control-plane-only
+
+test "$(systemctl show retailprintguard-pos-proxy.service \
+  -p MainPID --value)" = "${POS_PID_BEFORE}"
+test "$(systemctl show retailprintguard-rch-proxy.service \
+  -p MainPID --value)" = "${RCH_PID_BEFORE}"
+```
+
+L'opzione richiede un'installazione già attiva e i due proxy `active`. Il gate
+viene eseguito **prima** di installare pacchetti, configurare MariaDB o applicare
+DDL Alembic. Confronta l'intera closure eseguibile del data plane tra sorgente
+candidata e release corrente:
+
+- `src/retailprintguard/proxy`;
+- i moduli condivisi `common/config.py` e `common/logging.py` importati dal
+  relay;
+- `requirements/production.lock`;
+- le unità systemd POS e RCH;
+- contratto packaging/runtime Python, entry point proxy e codice eseguibile del
+  package initializer, ignorando soltanto il valore dichiarativo di versione.
+
+Se uno di questi elementi differisce, l'aggiornamento viene rifiutato prima di
+qualsiasi mutazione del database. Il gate cattura inoltre entrambi i `MainPID`
+e li verifica di nuovo a fine procedura.
+
+Il comando crea il backup, applica le migrazioni, attiva applicazione/frontend,
+installa le unità approvate, riavvia soltanto ingestion, parser, correlazione,
+antifrode e API e ricarica nginx. Non invia `stop`, `start` o `restart` ai due
+proxy. `--control-plane-only` e `--no-start` sono volutamente incompatibili.
+
+Il processo proxy già in memoria continua a usare il codice con cui è stato
+avviato; lo switch del symlink non ne ricarica il processo. Usare questa modalità
+soltanto quando il gate della closure data plane passa e le migrazioni sono
+backward-compatible con i processi ancora attivi.
+
+## 4. Attivazione ordinaria e ripresa
 
 `update.sh` senza `--no-start` riavvia anche entrambi i proxy. Eseguirlo soltanto
 in finestra autorizzata e senza sessioni di stampa attive. Non ripetere subito i
@@ -133,10 +181,17 @@ esplicita.
 sudo /opt/retailprintguard/current/scripts/status.sh --json
 sudo /opt/retailprintguard/current/scripts/diagnose.sh \
   > /root/retailprintguard-post-update.txt
+systemctl --failed --no-pager
+systemctl show retailprintguard-pos-proxy.service \
+  retailprintguard-rch-proxy.service -p Id -p ActiveState -p MainPID --no-pager
+ss -Hltpn
 ```
 
-Confrontare contatori, backlog, ultimi errori e release. Conservare il report e
-il suo SHA-256 nel ticket di change.
+Confrontare contatori, backlog, ultimi errori e release. In modalità
+`--control-plane-only`, confrontare anche i PID con i valori acquisiti prima
+dell'update e verificare i quattro listener autorizzati senza aprire
+connessioni applicative verso le stampanti. Conservare il report e il suo
+SHA-256 nel ticket di change.
 
 ## Rollback applicazione e frontend
 
@@ -150,6 +205,13 @@ Lo script seleziona atomically sia la release applicativa sia il frontend
 registrato per quella release e riavvia i servizi abilitati. Se uno switch o il
 restart fallisce tenta di ripristinare entrambi i link. Non esegue downgrade del
 database.
+
+`rollback.sh` non è un rollback “control-plane-only”: può riavviare i proxy.
+Quando è obbligatorio preservarne i PID, eseguire invece dalla sorgente della
+release precedente approvata `scripts/update.sh --control-plane-only`, purché il
+gate data plane e la compatibilità dello schema siano stati verificati. Se ciò
+non è possibile, fermarsi e pianificare una finestra ordinaria; non aggirare il
+controllo modificando script o unità installate.
 
 ## Rollback dati/schema
 

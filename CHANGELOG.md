@@ -3,6 +3,56 @@
 Tutte le modifiche rilevanti sono documentate in questo file. Il progetto segue
 la struttura di Keep a Changelog.
 
+## [Unreleased]
+
+## [0.4.0] — 2026-08-15
+
+### Added
+
+- correlazione degli episodi di vendita `rpg-correlation-1.3.0`, con confini
+  dopo la chiusura economica, conflitti espliciti di identità, diametro bounded
+  dei dispatch POS e componenti ausiliari non colleganti;
+- attribuzioni append-only dei prezzi mancanti sulle comande POS, con fonte a
+  riga/versione completa, algoritmo, confidenza e conflitti visibili senza
+  selezione arbitraria;
+- filtri temporali timezone-aware e half-open su dashboard, transazioni,
+  documenti, ricerca, job, alert ed export; dashboard web sugli ultimi sette
+  giorni per default;
+- pagina di revisione dei job tecnicamente incompleti, download RAW autorizzato
+  e azioni `VERIFY_USABLE`, `EXCLUDE_FROM_ANALYSIS` e `REOPEN_REVIEW`;
+- metriche dashboard distinte per alert operativi, episodi con riduzione,
+  differenza economica non duplicata, incompleti pendenti e alert archiviati;
+- provisioning interattivo `retailprintguard-configure-review`, che conserva
+  soltanto un hash Argon2id in un file ambiente protetto.
+
+### Changed
+
+- un'unica anomalia economica `MODIFICA_POST_PRECONTO` raccoglie importi e diff
+  di righe senza moltiplicare alert o perdita stimata; conti divisi completi,
+  rimborsi separati, addebiti camera e delta di comanda sono trattati secondo la
+  loro semantica osservata;
+- alert legacy riconducibili a difetti noti vengono riclassificati in modo
+  append-only e hash-chained; gli alert superseded o non operativi restano
+  nell'archivio ma non alterano lo stato corrente della transazione;
+- il PDF delle comande usa un layout termico compatto con tavolo, coperti,
+  portate, quantità leggibili, prezzi osservati/derivati e provenienza, evitando
+  la duplicazione del testo normalizzato;
+- `update.sh --control-plane-only` rifiuta release con artefatti data plane
+  o closure runtime differenti prima di qualsiasi DDL, riavvia soltanto
+  worker/API, ricarica nginx e verifica che i PID dei due proxy siano rimasti
+  invariati;
+- alert operativi come vista web predefinita, archivio esplicito e drill-down
+  economico limitato a episodi chiusi con riduzione attiva.
+
+### Security
+
+- la revisione ad alto impatto degli incompleti richiede ruolo `ADMIN`, nuova
+  autenticazione con segreto dedicato e motivazione; l'esclusione riguarda solo
+  l'analisi e non elimina RAW, manifest, documenti o audit; una revisione
+  riaperta resta esclusa fino a `VERIFY_USABLE`;
+- il segreto di conferma non è ammesso in chiaro in YAML, repository, argomenti
+  della shell o log.
+
 ## [0.3.1] — 2026-08-14
 
 ### Fixed

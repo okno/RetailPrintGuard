@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retailprintguard"
-version = "0.3.1"
+version = "0.4.0"
 description = "Resilient print evidence ingestion, correlation and fraud analysis platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,6 +34,7 @@ dev = [
 
 [project.scripts]
 retailprintguard-api = "retailprintguard.api.main:cli"
+retailprintguard-configure-review = "retailprintguard.api.review_secret:cli"
 retailprintguard-admin = "retailprintguard.admin.main:cli"
 retailprintguard-ingestion = "retailprintguard.ingestion.main:cli"
 retailprintguard-parser = "retailprintguard.parser.main:cli"

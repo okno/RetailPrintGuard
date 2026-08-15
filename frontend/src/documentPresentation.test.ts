@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   ALL_EVIDENCE_FILTER,
+  confidencePercent,
   documentApiSearchParams,
   presentedDocuments,
 } from './documentPresentation'
@@ -30,5 +31,11 @@ describe('primary document presentation', () => {
       { id: 'job-two', type: 'COMMERCIAL_DOCUMENT', sha256: 'same' },
     ]
     expect(presentedDocuments(documents, '')).toEqual(documents)
+  })
+
+  it('renders fractional and percentage confidence on the same scale', () => {
+    expect(confidencePercent(0.96)).toBe(96)
+    expect(confidencePercent(96)).toBe(96)
+    expect(confidencePercent(undefined)).toBeUndefined()
   })
 })

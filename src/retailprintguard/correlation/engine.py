@@ -22,7 +22,7 @@ from retailprintguard.common.domain import (
     PaymentRecord,
 )
 
-ALGORITHM_VERSION = "rpg-correlation-1.2.0"
+ALGORITHM_VERSION = "rpg-correlation-1.3.0"
 ZERO = Decimal("0.0000")
 HUNDRED = Decimal("100")
 _CROSS_DEPARTMENT_WINDOW_SECONDS = 30
@@ -35,26 +35,24 @@ _SOURCE_TYPES = {
     DocumentType.PRE_BILL,
     DocumentType.MANAGEMENT_DOCUMENT,
 }
-_FISCAL_TYPES = {
-    DocumentType.COMMERCIAL_DOCUMENT,
-    DocumentType.REFUND,
-}
-_ECONOMIC_CLOSE_TYPES = {
-    *_FISCAL_TYPES,
-    DocumentType.MANAGEMENT_DOCUMENT,
-}
+_FISCAL_TYPES = {DocumentType.COMMERCIAL_DOCUMENT}
+_ADJUSTMENT_TYPES = {DocumentType.REFUND}
 _FOLLOWUP_TYPES = {
     *_FISCAL_TYPES,
-    DocumentType.CONFORMING_COPY,
+    *_ADJUSTMENT_TYPES,
     DocumentType.PAYMENT,
-    DocumentType.REPRINT,
     DocumentType.CANCELLATION,
-    DocumentType.DEVICE_RESPONSE,
 }
 _FISCAL_SIBLING_TYPES = {
     DocumentType.COMMERCIAL_DOCUMENT,
     DocumentType.REFUND,
     DocumentType.PAYMENT,
+}
+_AUXILIARY_TYPES = {
+    DocumentType.CONFORMING_COPY,
+    DocumentType.REPRINT,
+    DocumentType.DEVICE_RESPONSE,
+    DocumentType.REFUND,
 }
 
 
@@ -326,12 +324,8 @@ def _metadata_references(document: NormalizedDocument) -> set[str]:
         "order_reference",
         "document_reference",
         "transaction_reference",
-        "work_session",
     }
     references: set[str] = set()
-    for value in (document.order_code, document.external_document_code):
-        if value is not None and (normalised := _normalise(value)) is not None:
-            references.add(normalised)
     for key in keys:
         value = document.raw_metadata.get(key)
         if value is not None and (normalised := _normalise(str(value))) is not None:
@@ -369,15 +363,95 @@ def _authoritative_payments(
 
 def _compatible(left: NormalizedDocument, right: NormalizedDocument) -> bool:
     types = {left.type, right.type}
+    if DocumentType.DEVICE_RESPONSE in types:
+        # Responses are linked exclusively by the exact duplex job in
+        # ``_device_response_pair``.  A long-lived TCP session is not a sale
+        # identity and must never make a response bridge two receipts.
+        return False
+    if types & {DocumentType.CONFORMING_COPY, DocumentType.REPRINT}:
+        # Copies are non-economic children.  They may be attached to one
+        # commercial document, but cannot connect an order/prebill episode.
+        return bool(types & _FISCAL_TYPES)
     if types <= _FISCAL_TYPES:
         return False
     if left.type in _SOURCE_TYPES and right.type in _SOURCE_TYPES:
         return True
-    if (left.type in _SOURCE_TYPES and right.type in _FOLLOWUP_TYPES) or (
+    return (left.type in _SOURCE_TYPES and right.type in _FOLLOWUP_TYPES) or (
         right.type in _SOURCE_TYPES and left.type in _FOLLOWUP_TYPES
+    )
+
+
+def _strong_reference(document: NormalizedDocument) -> str | None:
+    for key in ("order_reference", "transaction_reference"):
+        if (value := document.raw_metadata.get(key)) is not None and (
+            normalised := _normalise(str(value))
+        ) is not None:
+            return normalised
+    return None
+
+
+def _identity_conflict(left: NormalizedDocument, right: NormalizedDocument) -> str | None:
+    """Reject explicit contradictory sale identities before weighted scoring."""
+
+    left_order, right_order = _normalise(left.order_code), _normalise(right.order_code)
+    if left_order is not None and right_order is not None and left_order != right_order:
+        return "order_code in conflitto"
+    left_table, right_table = _normalise(left.table_code), _normalise(right.table_code)
+    if left_table is not None and right_table is not None and left_table != right_table:
+        return "table_code in conflitto"
+    left_reference, right_reference = _strong_reference(left), _strong_reference(right)
+    if (
+        left_reference is not None
+        and right_reference is not None
+        and left_reference != right_reference
     ):
-        return True
-    return DocumentType.CONFORMING_COPY in types and bool(types & _FISCAL_TYPES)
+        return "riferimento ordine in conflitto"
+    return None
+
+
+def _episode_boundary_conflict(
+    left: NormalizedDocument, right: NormalizedDocument
+) -> str | None:
+    earlier, later = sorted(
+        (left, right), key=lambda item: (_document_time(item), str(item.id))
+    )
+    earlier_is_close = earlier.type is DocumentType.COMMERCIAL_DOCUMENT or (
+        earlier.type is DocumentType.MANAGEMENT_DOCUMENT
+        and (
+            bool(earlier.raw_metadata.get("economic_close"))
+            or earlier.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+        )
+    )
+    later_starts_episode = later.type in {
+        DocumentType.ORDER,
+        DocumentType.KITCHEN_ORDER,
+        DocumentType.PRE_BILL,
+    }
+    if (
+        earlier_is_close
+        and later_starts_episode
+        and _document_time(later) > _document_time(earlier)
+    ):
+        return "nuovo episodio osservato dopo una chiusura economica"
+    return None
+
+
+def _rejected_pair(
+    left: NormalizedDocument, right: NormalizedDocument, reason: str
+) -> _PairScore:
+    return _PairScore(
+        left_id=left.id,
+        right_id=right.id,
+        score=0,
+        criteria=(
+            _Criterion(
+                name="identity_compatibility",
+                weight=100,
+                matched=False,
+                detail=reason,
+            ),
+        ),
+    )
 
 
 class CorrelationEngine:
@@ -408,7 +482,10 @@ class CorrelationEngine:
         exact("table_code", 12, left.table_code, right.table_code)
         exact("operator_code", 5, left.operator_code, right.operator_code)
         exact("terminal_code", 4, left.terminal_code, right.terminal_code)
-        exact("source_session", 5, left.source_session_id, right.source_session_id)
+        # The transport session is useful provenance but deliberately carries
+        # no business-identity weight: RCH connections can remain open across
+        # many independent sales.
+        exact("source_session", 0, left.source_session_id, right.source_session_id)
 
         references = _metadata_references(left) & _metadata_references(right)
         criteria.append(
@@ -636,13 +713,7 @@ class CorrelationEngine:
         order_match = _normalise(left.order_code) is not None and _normalise(
             left.order_code
         ) == _normalise(right.order_code)
-        table_match = _normalise(left.table_code) is not None and _normalise(
-            left.table_code
-        ) == _normalise(right.table_code)
-        session_match = _normalise(left.source_session_id) is not None and _normalise(
-            left.source_session_id
-        ) == _normalise(right.source_session_id)
-        if not (references or order_match or (table_match and session_match)):
+        if not (references or order_match):
             return None
         criteria = (
             _Criterion(
@@ -668,37 +739,26 @@ class CorrelationEngine:
     def _device_response_pair(
         self, left: NormalizedDocument, right: NormalizedDocument
     ) -> _PairScore | None:
-        """Link an RCH response only to its observed request/session context."""
+        """Link an RCH response only to its exact observed duplex job."""
 
         if DocumentType.DEVICE_RESPONSE not in {left.type, right.type}:
             return None
         delta_seconds = abs((_document_time(right) - _document_time(left)).total_seconds())
         if delta_seconds > self.time_window_seconds:
-            return None
+            return _rejected_pair(left, right, "risposta RCH fuori dalla finestra del job")
         same_job = bool(left.source_job_id) and left.source_job_id == right.source_job_id
-        same_session = (
-            bool(left.source_session_id)
-            and left.source_session_id == right.source_session_id
-            and left.source_device_id == right.source_device_id
-        )
-        if not (same_job or same_session):
-            return None
+        if not same_job:
+            return _rejected_pair(
+                left,
+                right,
+                "risposta RCH osservata in un job differente",
+            )
         criteria = (
             _Criterion(
                 name="response_job_context",
                 weight=80,
                 matched=same_job,
                 detail="stesso job duplex" if same_job else "job differente",
-            ),
-            _Criterion(
-                name="response_session_context",
-                weight=65,
-                matched=same_session,
-                detail=(
-                    "stessa sessione e dispositivo"
-                    if same_session
-                    else "sessione o dispositivo differente"
-                ),
             ),
             _Criterion(
                 name="time_proximity",
@@ -719,9 +779,15 @@ class CorrelationEngine:
     ) -> _PairScore:
         """Score one already-blocked pair, including protocol-specific links."""
 
+        response_pair = self._device_response_pair(left, right)
+        if response_pair is not None:
+            return response_pair
+        if (boundary := _episode_boundary_conflict(left, right)) is not None:
+            return _rejected_pair(left, right, boundary)
+        if (conflict := _identity_conflict(left, right)) is not None:
+            return _rejected_pair(left, right, conflict)
         return (
-            self._device_response_pair(left, right)
-            or self._fiscal_siblings(left, right)
+            self._fiscal_siblings(left, right)
             or self._same_table_change_pair(left, right)
             or self._cross_department_dispatch_pair(left, right)
             or self.score_pair(left, right)
@@ -769,6 +835,7 @@ class CorrelationEngine:
             return ()
         by_id = {document.id: document for document in ordered}
         parent = {document.id: document.id for document in ordered}
+        component_members = {document.id: {document.id} for document in ordered}
         edges: dict[frozenset[UUID], _PairScore] = {}
 
         def find(value: UUID) -> UUID:
@@ -777,11 +844,30 @@ class CorrelationEngine:
                 value = parent[value]
             return value
 
-        def union(left_id: UUID, right_id: UUID) -> None:
+        def union(left_id: UUID, right_id: UUID) -> bool:
             left_root, right_root = find(left_id), find(right_id)
-            if left_root != right_root:
-                first, second = sorted((left_root, right_root), key=str)
-                parent[second] = first
+            if left_root == right_root:
+                return True
+            proposed_ids = component_members[left_root] | component_members[right_root]
+            proposed = [by_id[item] for item in proposed_ids]
+            for index, first_document in enumerate(proposed):
+                for second_document in proposed[index + 1 :]:
+                    if _identity_conflict(first_document, second_document) is not None:
+                        return False
+                    if _episode_boundary_conflict(first_document, second_document) is not None:
+                        return False
+            if proposed and all(item.type is DocumentType.KITCHEN_ORDER for item in proposed):
+                # Prevent single-link chaining (0s -> 25s -> 50s) from turning
+                # two dispatches into one episode merely because adjacent
+                # tickets fit the pairwise window.
+                times = [_document_time(item) for item in proposed]
+                if (max(times) - min(times)).total_seconds() > _CROSS_DEPARTMENT_WINDOW_SECONDS:
+                    return False
+            first, second = sorted((left_root, right_root), key=str)
+            parent[second] = first
+            component_members[first] = proposed_ids
+            component_members.pop(second, None)
+            return True
 
         unique_pairs = {
             frozenset((left_id, right_id))
@@ -792,8 +878,37 @@ class CorrelationEngine:
             left_id, right_id = sorted(pair, key=str)
             score = self.score_candidate_pair(by_id[left_id], by_id[right_id])
             edges[pair] = score
-            if score.score >= self.minimum_score:
-                union(left_id, right_id)
+
+        core_edges: list[tuple[int, float, str, UUID, UUID]] = []
+        auxiliary_edges: dict[UUID, list[tuple[int, float, str, UUID]]] = defaultdict(list)
+        for pair, score in edges.items():
+            if score.score < self.minimum_score:
+                continue
+            left_id, right_id = sorted(pair, key=str)
+            left, right = by_id[left_id], by_id[right_id]
+            delta = abs((_document_time(right) - _document_time(left)).total_seconds())
+            left_aux, right_aux = left.type in _AUXILIARY_TYPES, right.type in _AUXILIARY_TYPES
+            if left_aux and right_aux:
+                continue
+            if left_aux or right_aux:
+                auxiliary_id, target_id = (
+                    (left_id, right_id) if left_aux else (right_id, left_id)
+                )
+                auxiliary_edges[auxiliary_id].append(
+                    (-score.score, delta, str(target_id), target_id)
+                )
+                continue
+            core_edges.append((-score.score, delta, f"{left_id}:{right_id}", left_id, right_id))
+
+        for _, _, _, left_id, right_id in sorted(core_edges):
+            union(left_id, right_id)
+        for auxiliary_id, candidates in sorted(
+            auxiliary_edges.items(), key=lambda item: str(item[0])
+        ):
+            # One non-economic document gets exactly one parent.  It can enrich
+            # an episode but cannot bridge two otherwise independent episodes.
+            _, _, _, target_id = min(candidates)
+            union(auxiliary_id, target_id)
 
         groups: dict[UUID, list[NormalizedDocument]] = defaultdict(list)
         for document in ordered:
@@ -880,25 +995,22 @@ class CorrelationEngine:
             for document in fiscal_documents
             if document.complete and _total(document) is not None
         ]
-        fiscal_total = sum(
-            (
-                -(_total(document) or ZERO)
-                if document.type is DocumentType.REFUND
-                else (_total(document) or ZERO)
-            )
-            for document in valid_fiscal_documents
-        )
-        economic_closures = [
+        # Refunds are post-close adjustments, not a lower value for the
+        # original sale.  They remain immutable timeline evidence but do not
+        # reduce the commercial aggregate compared with the prebill.
+        fiscal_total = sum((_total(document) or ZERO) for document in valid_fiscal_documents)
+        management_closures = [
             document
             for document in documents
-            if document.type in _ECONOMIC_CLOSE_TYPES
+            if document.type is DocumentType.MANAGEMENT_DOCUMENT
             and document is not prebill
             and _total(document) is not None
             and (
-                document in valid_fiscal_documents
-                or bool(document.raw_metadata.get("economic_close"))
+                bool(document.raw_metadata.get("economic_close"))
+                or document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
             )
         ]
+        economic_closures = valid_fiscal_documents or management_closures
         comparison_total = (
             fiscal_total
             if valid_fiscal_documents

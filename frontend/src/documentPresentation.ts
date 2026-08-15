@@ -8,6 +8,7 @@ export const ALL_EVIDENCE_FILTER = '__ALL__'
  */
 export function documentApiSearchParams(uiParams: URLSearchParams) {
   const apiParams = new URLSearchParams(uiParams)
+  apiParams.delete('period')
   const selectedType = apiParams.get('type') ?? ''
   if (selectedType === ALL_EVIDENCE_FILTER) {
     apiParams.delete('type')
@@ -31,4 +32,10 @@ export function presentedDocuments<T extends { type: string }>(
 ) {
   if (selectedType) return [...documents]
   return documents.filter((document) => document.type !== TECHNICAL_DOCUMENT_TYPE)
+}
+
+export function confidencePercent(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) return undefined
+  const percent = value <= 1 ? value * 100 : value
+  return Math.round(percent * 10) / 10
 }
