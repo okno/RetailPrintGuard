@@ -138,7 +138,7 @@ else
     apt-get install -y --no-install-recommends "${required_packages[@]}"
 fi
 
-for command in flock install mariadb openssl python3 rsync runuser sha256sum systemctl tesseract; do
+for command in find flock install mariadb openssl python3 rsync runuser sha256sum systemctl tesseract; do
     rpg_require_command "${command}"
 done
 
@@ -402,12 +402,44 @@ PY
 )"
 web_release="${RPG_WEB_RELEASES}/${frontend_hash}"
 rpg_assert_managed_path "${web_release}"
+
+normalize_web_tree() {
+    local web_tree="$1"
+    local unexpected_entry=""
+
+    [[ -d "${web_tree}" && ! -L "${web_tree}" ]] || \
+        rpg_die "frontend release must be a regular directory: ${web_tree}"
+    unexpected_entry="$(
+        find "${web_tree}" -xdev ! \( -type d -o -type f \) -print -quit
+    )"
+    [[ -z "${unexpected_entry}" ]] || \
+        rpg_die "frontend release contains a symlink or special file: ${unexpected_entry}"
+
+    # mktemp creates the staging root as 0700 and the installer uses umask 027.
+    # Nginx runs as www-data, so make the static, non-secret web tree explicitly
+    # traversable/readable. Apply this to existing content-addressed releases as
+    # well: a rebuilt release may legitimately have the same frontend hash.
+    chown -R root:root -- "${web_tree}"
+    find "${web_tree}" -xdev -type d -exec chmod 0755 -- {} +
+    find "${web_tree}" -xdev -type f -exec chmod 0644 -- {} +
+
+    [[ -f "${web_tree}/index.html" && ! -L "${web_tree}/index.html" ]] || \
+        rpg_die "frontend release has no regular index.html: ${web_tree}"
+    if ! runuser -u www-data -- test -x "${web_tree}" || \
+       ! runuser -u www-data -- test -r "${web_tree}/index.html"; then
+        rpg_die "frontend release is not readable by nginx: ${web_tree}"
+    fi
+}
+
 if [[ ! -d "${web_release}" ]]; then
     web_stage="$(mktemp -d "${RPG_WEB_RELEASES}/.stage.XXXXXXXX")"
     rsync -a -- "${frontend_source}/" "${web_stage}/"
-    chmod -R go-w "${web_stage}"
+    normalize_web_tree "${web_stage}"
     mv -- "${web_stage}" "${web_release}"
 fi
+# Repair and verify an already content-addressed release too. In particular,
+# this fixes releases created by older installers that preserved staging 0700.
+normalize_web_tree "${web_release}"
 
 previous_release="$(rpg_current_release)"
 if [[ -n "${previous_release}" && "${previous_release}" != "${release_path}" ]]; then

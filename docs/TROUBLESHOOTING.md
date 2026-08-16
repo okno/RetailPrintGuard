@@ -28,6 +28,35 @@ curl --fail http://127.0.0.1:8080/api/v1/system/health
 Se loopback funziona ma la LAN no, controllare il firewall per TCP/8081 e il
 percorso di rete. Non esporre direttamente la porta API 8080.
 
+### `403 Forbidden` sulla WebUI ma API raggiungibile
+
+Se `/api/v1/system/health` risponde `200` ma `/` restituisce `403`, verificare
+che la release statica sia attraversabile e leggibile dall'utente nginx:
+
+```bash
+WEB_RELEASE="$(readlink -f /var/www/retailprintguard/current)"
+case "${WEB_RELEASE}" in
+  /var/www/retailprintguard/releases/*) ;;
+  *) echo "percorso frontend inatteso: ${WEB_RELEASE}" >&2; exit 1 ;;
+esac
+namei -l "${WEB_RELEASE}/index.html"
+runuser -u www-data -- test -r "${WEB_RELEASE}/index.html"
+```
+
+Nelle release precedenti alla `0.4.2`, una build con `umask 027` poteva
+propagare directory `0750` e file `0640`. Il ripristino non richiede reload di
+nginx e non tocca i proxy:
+
+```bash
+find "${WEB_RELEASE}" -xdev -type d -exec chmod 0755 -- {} +
+find "${WEB_RELEASE}" -xdev -type f -exec chmod 0644 -- {} +
+runuser -u www-data -- test -r "${WEB_RELEASE}/index.html"
+curl -fsS -o /dev/null -w 'WebUI HTTP %{http_code}\n' http://127.0.0.1:8081/
+```
+
+Aggiornare poi almeno alla `0.4.2`, che normalizza e verifica i permessi prima
+dello switch e include la root WebUI nelle postcondizioni dell'updater.
+
 ## L'installer rifiuta un indirizzo RFC 5737
 
 Messaggio tipico: configurazione con indirizzo di documentazione. Gli IP

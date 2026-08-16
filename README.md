@@ -10,7 +10,7 @@ le direzioni e non importa parser, API o database. La cattura usa una coda
 limitata e uno spool locale; un guasto del control plane non deve trasformarsi
 in una dipendenza sincrona della stampa.
 
-> Stato: release `0.4.1`. I test software sintetici coprono relay,
+> Stato: release `0.4.2`. I test software sintetici coprono relay,
 > spool, configurazione, import, correlazione, regole, modelli e API. Il collaudo
 > su hardware reale, il confronto PCAP direct-vs-proxy e l'installazione sul
 > target Debian 12 non sono ancora attestati da questo repository. Consultare

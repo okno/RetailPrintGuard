@@ -170,6 +170,22 @@ def test_no_start_stages_without_switching_current_release() -> None:
     assert "exit 0" in install[no_start:activate_app]
 
 
+def test_frontend_release_is_normalized_and_verified_for_nginx() -> None:
+    install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
+    normalize = install.index("normalize_web_tree()")
+    stage = install.index('normalize_web_tree "${web_stage}"')
+    existing = install.index('normalize_web_tree "${web_release}"')
+    activate = install.index('rpg_atomic_symlink "${web_release}" "${RPG_WEB_CURRENT}"')
+
+    assert 'find "${web_tree}" -xdev ! \\( -type d -o -type f \\)' in install
+    assert 'chown -R root:root -- "${web_tree}"' in install
+    assert 'find "${web_tree}" -xdev -type d -exec chmod 0755 -- {} +' in install
+    assert 'find "${web_tree}" -xdev -type f -exec chmod 0644 -- {} +' in install
+    assert 'runuser -u www-data -- test -x "${web_tree}"' in install
+    assert 'runuser -u www-data -- test -r "${web_tree}/index.html"' in install
+    assert normalize < stage < existing < activate
+
+
 def test_control_plane_update_never_restarts_or_changes_proxy_code() -> None:
     install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
     update = (SCRIPTS / "update.sh").read_text(encoding="utf-8")
@@ -217,6 +233,11 @@ def test_git_control_plane_updater_is_tagged_locked_and_fail_closed() -> None:
     assert "ExecMainStartTimestampMonotonic" in updater
     assert "listener_snapshot" in updater
     assert "listeners_at_exit" in updater
+    assert "require_ui_http_200" in updater
+    assert "new web UI did not return HTTP 200 within 60 seconds" in updater
+    assert updater.index('require_ui_http_200 60') < updater.index(
+        'note "SUCCESS: ${release} is active"'
+    )
     assert "No proxy stop/start/restart fallback was attempted" in updater
     assert "rollback.sh" not in updater
     assert updater.index("rpg_assert_data_plane_unchanged") < updater.index(

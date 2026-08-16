@@ -4,6 +4,21 @@
 installabile in staging; l'attivazione sui dispositivi reali resta subordinata
 al collaudo controllato descritto nel piano di deployment.
 
+## Hotfix 0.4.2 — accessibilità della release frontend
+
+Il `403 Forbidden` osservato dopo `v0.4.1` è stato isolato alla propagazione dei
+mode restrittivi prodotti con `umask 027`: API, database e proxy risultavano
+sani. Il fix normalizza owner e mode dei soli file statici, ripara anche release
+content-addressed già esistenti e verifica la lettura come `www-data` prima
+dello switch. L'updater richiede inoltre HTTP `200` sulla WebUI entro una
+deadline reale di 60 secondi.
+
+Il gate finale ha prodotto `188 passed`, `26 skipped` e zero failure; Ruff,
+`git diff --check`, Bash, ShellCheck, ESLint, TypeScript e i 23 test frontend
+sono passati. Il diff data-plane rispetto a `v0.4.1` è vuoto. Decisione: `GO`
+per pubblicazione immediata di `v0.4.2` e aggiornamento control-plane senza
+restart dei proxy.
+
 ## Release 0.4.1 — temi web e aggiornamento senza restart dei relay
 
 Il candidato `codex/web-ui-themes` aggiunge quattro temi persistenti e un

@@ -69,7 +69,7 @@ done
     die "TAG must be a stable semantic release such as v0.4.1"
 [[ "${remote}" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid remote name"
 
-for command in awk bash date flock git grep install mktemp node pnpm python3 readlink sleep sort ss systemctl tee; do
+for command in awk bash curl date flock git grep install mktemp node pnpm python3 readlink sleep sort ss systemctl tee; do
     require_command "${command}"
 done
 
@@ -128,6 +128,33 @@ require_healthy_status() {
             return 0
         fi
         (( attempt == attempts )) || sleep 2
+    done
+    return 1
+}
+
+require_ui_http_200() {
+    local timeout_seconds="${1:-1}"
+    local deadline=$((SECONDS + timeout_seconds))
+    local http_code=""
+    local remaining
+    local request_timeout
+    local sleep_seconds
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        request_timeout=2
+        (( remaining >= request_timeout )) || request_timeout="${remaining}"
+        if http_code="$(
+            curl --silent --show-error --output /dev/null \
+                --write-out '%{http_code}' --max-time "${request_timeout}" \
+                http://127.0.0.1:8081/ 2>/dev/null
+        )" && [[ "${http_code}" == 200 ]]; then
+            return 0
+        fi
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+        sleep_seconds=2
+        (( remaining >= sleep_seconds )) || sleep_seconds="${remaining}"
+        sleep "${sleep_seconds}"
     done
     return 1
 }
@@ -320,6 +347,8 @@ listeners_after="$(listener_snapshot "${pos_pid_after}" "${rch_pid_after}")"
 active_release_after="$(readlink -f -- "${ACTIVE_RELEASE_LINK}")"
 require_healthy_status "${active_release_after}/scripts/status.sh" 30 || \
     die "new control plane did not become healthy within 60 seconds"
+require_ui_http_200 60 || \
+    die "new web UI did not return HTTP 200 within 60 seconds"
 
 note "SUCCESS: ${release} is active"
 note "Proxy PIDs preserved: POS=${pos_pid_after}, RCH=${rch_pid_after}"

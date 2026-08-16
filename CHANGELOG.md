@@ -5,6 +5,16 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-08-16
+
+### Fixed
+
+- normalizzati a `0755` per le directory e `0644` per i file i contenuti
+  statici frontend, inclusi quelli già presenti con lo stesso hash, impedendo
+  il `403 Forbidden` nginx causato dalla build con `umask 027`;
+- aggiunta una postcondizione HTTP sulla root WebUI: l'updater non dichiara più
+  successo se API e servizi sono sani ma `index.html` non è servibile.
+
 ## [0.4.1] — 2026-08-16
 
 ### Added

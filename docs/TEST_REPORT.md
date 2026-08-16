@@ -6,6 +6,24 @@
 > risultati finali saranno consolidati in
 > [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
+## Hotfix 0.4.2 — permessi frontend nginx
+
+**Stato:** gate software offline completato il 16 agosto 2026 dopo la
+riproduzione live del `403` con API sana.
+
+| Controllo | Risultato |
+|---|---|
+| suite Python completa | `188 passed`, `26 skipped`, `0 failed`; una warning Starlette/httpx nota |
+| test operativi updater/installer | `17 passed`, `25 skipped`, `0 failed` |
+| Ruff e `git diff --check` | PASS |
+| frontend ESLint, TypeScript e Vitest | PASS; `23 passed`, `0 failed` |
+| `bash -n` e ShellCheck | PASS su installer, updater e libreria condivisa |
+| diff data-plane rispetto a `v0.4.1` | vuoto |
+
+La regressione verifica che la release statica venga normalizzata e validata
+prima dello switch anche quando l'hash frontend esiste già, e che l'updater non
+dichiari successo prima di un HTTP `200` reale sulla root WebUI.
+
 ## Release 0.4.1 — temi web e updater control-plane
 
 **Stato:** gate software offline completato il 16 agosto 2026. Il diff della
