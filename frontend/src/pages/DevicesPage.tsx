@@ -22,7 +22,7 @@ export function DevicesPage() {
               <Card sx={{ height: '100%' }}>
                 <CardContent>
                   <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, mb: 2 }}>
-                    <Box sx={{ p: 1, borderRadius: 2, bgcolor: 'primary.main', color: 'white' }}>
+                    <Box sx={{ p: 1, borderRadius: 2, bgcolor: 'primary.main', color: 'primary.contrastText' }}>
                       {device.type === 'rch' ? <DnsOutlined /> : <PrintOutlined />}
                     </Box>
                     <Box sx={{ flex: 1 }}>

@@ -81,13 +81,13 @@ export function AlertsPage() {
       <DialogTitle>Analisi alert</DialogTitle>
       <DialogContent dividers>
         {detail.isLoading ? <LoadingState /> : detail.error ? <ErrorState error={detail.error} /> : selected && <>
-          <Box sx={{ display: 'flex', gap: 1, mb: 2 }}><StatusChip value={selected.severity} /><StatusChip value={selected.status} /></Box>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 2 }}><StatusChip value={selected.severity} /><StatusChip value={selected.status} /></Box>
           <Typography variant="h2">{selected.description}</Typography>
           <Typography sx={{ mt: 1, mb: 3 }} color="text.secondary">{selected.explanation}</Typography>
           <Typography variant="h2" sx={{ mb: 1 }}>Evidenze</Typography>
-          <Box component="pre" sx={{ p: 2, bgcolor: 'grey.100', borderRadius: 1, whiteSpace: 'pre-wrap', fontSize: 12 }}>{JSON.stringify(selected.evidence, null, 2)}</Box>
+          <Box component="pre" sx={{ p: 2, bgcolor: 'action.hover', color: 'text.primary', border: '1px solid', borderColor: 'divider', borderRadius: 1, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflowX: 'auto', fontSize: 12 }}>{JSON.stringify(selected.evidence, null, 2)}</Box>
           <Typography variant="h2" sx={{ mt: 2, mb: 1 }}>Storico</Typography>
-          <Box component="pre" sx={{ p: 2, bgcolor: 'grey.100', borderRadius: 1, whiteSpace: 'pre-wrap', fontSize: 12 }}>{JSON.stringify(selected.history, null, 2)}</Box>
+          <Box component="pre" sx={{ p: 2, bgcolor: 'action.hover', color: 'text.primary', border: '1px solid', borderColor: 'divider', borderRadius: 1, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflowX: 'auto', fontSize: 12 }}>{JSON.stringify(selected.history, null, 2)}</Box>
           {canReview && <TextField fullWidth multiline minRows={3} label="Nota dell’auditor" value={note} onChange={(event) => setNote(event.target.value)} sx={{ mt: 2 }} />}
           {update.error && <Box sx={{ mt: 2 }}><ErrorState error={update.error} /></Box>}
         </>}

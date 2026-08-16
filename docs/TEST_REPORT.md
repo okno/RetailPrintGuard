@@ -6,6 +6,30 @@
 > risultati finali saranno consolidati in
 > [FINAL_VALIDATION_REPORT.md](FINAL_VALIDATION_REPORT.md).
 
+## Release 0.4.1 — temi web e updater control-plane
+
+**Stato:** gate software offline completato il 16 agosto 2026. Il diff della
+closure data-plane rispetto a `v0.4.0` è vuoto; nessun proxy, modulo condiviso,
+lock runtime o unità POS/RCH è stato modificato.
+
+| Controllo | Risultato |
+|---|---|
+| suite Python completa | `187 passed`, `26 skipped`, `0 failed`; una warning Starlette/httpx nota |
+| test operativi updater | `16 passed`, `25 skipped`, `0 failed` |
+| Ruff e `git diff --check` | PASS |
+| frontend ESLint e TypeScript | PASS |
+| frontend Vitest completo | `23 passed`, `0 failed` |
+| `bash -n` | PASS su installer e updater |
+| ShellCheck | PASS su installer, updater e libreria condivisa |
+| identità versione backend/frontend | `0.4.1` |
+| build Vite | PASS, `11783` moduli; warning non bloccante sul chunk principale da `554.48 kB` |
+
+I test coprono i quattro identificatori tema, persistenza e fallback sicuro
+dello storage, contrasto AA delle palette e il contratto fail-closed
+dell'updater. La procedura conserva PID, invocation ID, timestamp di avvio e
+listener dei due relay; una modifica della closure data-plane, delle dipendenze
+Debian o della configurazione MariaDB richiede invece una finestra ordinaria.
+
 ## Release 0.4.0 — episodi di vendita e riduzione falsi positivi
 
 **Stato:** gate software offline completato il 15 agosto 2026. Nessun payload,

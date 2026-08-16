@@ -4,6 +4,23 @@
 installabile in staging; l'attivazione sui dispositivi reali resta subordinata
 al collaudo controllato descritto nel piano di deployment.
 
+## Release 0.4.1 — temi web e aggiornamento senza restart dei relay
+
+Il candidato `codex/web-ui-themes` aggiunge quattro temi persistenti e un
+updater riutilizzabile che lavora esclusivamente da tag Git annotati. Il gate
+finale del 16 agosto 2026 ha prodotto `187 passed`, `26 skipped` e zero
+failure; Ruff, `git diff --check`, ESLint, TypeScript, 23 test frontend,
+`bash -n` e ShellCheck sono passati.
+
+Il diff della closure data-plane rispetto a `v0.4.0` è vuoto. L'updater
+mantiene un lock unico, costruisce il frontend prima del backup, invoca
+`--control-plane-only` e verifica in ogni uscita PID, invocation ID, timestamp
+di avvio, stato e listener dei proxy POS/RCH. Non contiene rollback o fallback
+che possa fermarli. Decisione: `GO` per commit, tag `v0.4.1` e pubblicazione;
+la build Vite finale è passata (`11783` moduli, solo warning non bloccante sul
+chunk principale) e viene comunque ripetuta dall'updater su Debian come
+pre-gate fail-closed prima di qualsiasi attivazione.
+
 ## Release 0.4.0 — antifrode per episodi di vendita
 
 Il candidato `codex/antifraud-sale-episodes` introduce correlazione e antifrode

@@ -9,6 +9,7 @@ import {
   WarningAmberOutlined,
 } from '@mui/icons-material'
 import { Box, Card, CardContent, Grid, LinearProgress, List, ListItem, ListItemText, Typography } from '@mui/material'
+import { useTheme } from '@mui/material/styles'
 import { useQuery } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { api, scopedQueryKey } from '../api/client'
@@ -34,6 +35,7 @@ function routeWithPeriod(path: string, period: URLSearchParams, extras?: Record<
 }
 
 export function DashboardPage() {
+  const theme = useTheme()
   const [params, setParams] = useSearchParams()
   // A seven-day default keeps the latest completed service visible after
   // midnight while the operator can still switch explicitly to Oggi.
@@ -68,11 +70,11 @@ export function DashboardPage() {
       />
       <Grid container spacing={2.2}>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Documenti acquisiti" value={data.documents} helper={`${data.pre_bills} preconti nel periodo`} icon={<DescriptionOutlined />} to={routeWithPeriod('/documenti', period)} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Alert operativi attivi" value={operationalAlerts} helper={`${data.critical_alerts} critici; escluso lo storico chiuso`} icon={<ShieldOutlined />} tone="#b42318" to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con riduzione" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone="#b54708" to={operationalReductionTransactionsPath(period)} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Differenza economica unica" value={euros.format(Number(economicDifference))} helper="aggregata per episodio, non per alert" icon={<EuroOutlined />} tone="#b54708" to={operationalReductionTransactionsPath(period)} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Incompleti da revisionare" value={incompleteJobs} helper="il RAW originale non viene eliminato" icon={<AssignmentLateOutlined />} tone="#7a4e00" to={routeWithPeriod('/incompleti', period)} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Storico non operativo" value={archivedKnown ? archived : '—'} helper="falsi positivi e giustificati" icon={<HistoryOutlined />} tone="#52606d" to={routeWithPeriod('/alert', period, { view: 'archive' })} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Alert operativi attivi" value={operationalAlerts} helper={`${data.critical_alerts} critici; escluso lo storico chiuso`} icon={<ShieldOutlined />} tone={theme.palette.error.main} to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con riduzione" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone={theme.palette.warning.main} to={operationalReductionTransactionsPath(period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Differenza economica unica" value={euros.format(Number(economicDifference))} helper="aggregata per episodio, non per alert" icon={<EuroOutlined />} tone={theme.palette.warning.main} to={operationalReductionTransactionsPath(period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Incompleti da revisionare" value={incompleteJobs} helper="il RAW originale non viene eliminato" icon={<AssignmentLateOutlined />} tone={theme.palette.secondary.main} to={routeWithPeriod('/incompleti', period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Storico non operativo" value={archivedKnown ? archived : '—'} helper="falsi positivi e giustificati" icon={<HistoryOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'archive' })} /></Grid>
         <Grid size={{ xs: 12, lg: 7 }}>
           <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Copertura documentale</Typography>
             {[

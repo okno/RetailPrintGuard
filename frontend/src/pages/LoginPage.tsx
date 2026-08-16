@@ -1,7 +1,9 @@
 import { FactCheckOutlined, LockOutlined } from '@mui/icons-material'
 import { Alert, Box, Button, Card, CardContent, Container, TextField, Typography } from '@mui/material'
+import { alpha } from '@mui/material/styles'
 import { FormEvent, useState } from 'react'
 import { login } from '../api/client'
+import { ThemeSwitcher } from '../components/ThemeSwitcher'
 import type { User } from '../types'
 
 export function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
@@ -22,12 +24,27 @@ export function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
     }
   }
   return (
-    <Box sx={{ minHeight: '100vh', display: 'grid', placeItems: 'center', p: 2, background: 'linear-gradient(135deg,#102a43 0%,#173f5f 55%,#2f6c7e 100%)' }}>
+    <Box sx={{
+      minHeight: '100vh',
+      display: 'grid',
+      placeItems: 'center',
+      p: 2,
+      position: 'relative',
+      background: (theme) => `linear-gradient(135deg, ${theme.appChrome.loginStart} 0%, ${theme.appChrome.loginMiddle} 58%, ${theme.appChrome.loginEnd} 120%)`,
+    }}>
+      <Box sx={{ position: 'absolute', top: { xs: 12, sm: 20 }, right: { xs: 12, sm: 20 }, zIndex: 1 }}>
+        <ThemeSwitcher />
+      </Box>
       <Container maxWidth="xs">
         <Card sx={{ overflow: 'visible' }}>
           <CardContent sx={{ p: { xs: 3, sm: 4 } }}>
             <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center', mb: 3 }}>
-              <Box sx={{ bgcolor: '#f2b84b22', color: '#b06b00', p: 1.2, borderRadius: 2 }}><FactCheckOutlined /></Box>
+              <Box sx={{
+                bgcolor: (theme) => alpha(theme.palette.secondary.main, theme.palette.mode === 'dark' ? 0.2 : 0.12),
+                color: 'secondary.main',
+                p: 1.2,
+                borderRadius: 2,
+              }}><FactCheckOutlined /></Box>
               <Box><Typography variant="h2">RetailPrintGuard</Typography><Typography color="text.secondary" variant="body2">Piattaforma antifrode retail</Typography></Box>
             </Box>
             <Typography component="h1" variant="h1" sx={{ mb: 1 }}>Accesso</Typography>
@@ -42,7 +59,7 @@ export function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
             </Box>
           </CardContent>
         </Card>
-        <Typography variant="caption" sx={{ display: 'block', textAlign: 'center', color: '#d9e2ec', mt: 2 }}>Accesso registrato nell’audit log · rete autorizzata</Typography>
+        <Typography variant="caption" sx={(theme) => ({ display: 'block', textAlign: 'center', color: theme.appChrome.loginFooter, mt: 2 })}>Accesso registrato nell’audit log · rete autorizzata</Typography>
       </Container>
     </Box>
   )

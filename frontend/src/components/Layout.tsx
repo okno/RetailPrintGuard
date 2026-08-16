@@ -34,6 +34,7 @@ import {
 import { useState, type ReactNode } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import type { Role, User } from '../types'
+import { ThemeSwitcher } from './ThemeSwitcher'
 
 const drawerWidth = 252
 const reviewerRoles: Role[] = ['ADMIN', 'AUDITOR', 'OPERATOR']
@@ -57,15 +58,21 @@ export function Layout({ children, user, onLogout }: { children: ReactNode; user
   const [mobileOpen, setMobileOpen] = useState(false)
   const location = useLocation()
   const drawer = (
-    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', bgcolor: '#102a43', color: 'white' }}>
+    <Box sx={{
+      height: '100%',
+      display: 'flex',
+      flexDirection: 'column',
+      bgcolor: theme.appChrome.drawerBackground,
+      color: theme.appChrome.drawerText,
+    }}>
       <Toolbar sx={{ minHeight: 76, gap: 1.5 }}>
-        <FactCheckOutlined sx={{ color: '#f2b84b' }} />
+        <FactCheckOutlined sx={{ color: theme.appChrome.drawerAccent }} />
         <Box>
           <Typography fontWeight={780} letterSpacing="-0.02em">RetailPrintGuard</Typography>
-          <Typography variant="caption" sx={{ color: '#9fb3c3' }}>Centro antifrode</Typography>
+          <Typography variant="caption" sx={{ color: theme.appChrome.drawerMuted }}>Centro antifrode</Typography>
         </Box>
       </Toolbar>
-      <Divider sx={{ borderColor: 'rgba(255,255,255,.08)' }} />
+      <Divider sx={{ borderColor: theme.appChrome.drawerDivider }} />
       <List sx={{ px: 1.5, py: 2 }}>
         {navigation.filter((item) => !item.roles || item.roles.some((role) => user.roles.includes(role))).map((item) => (
           <ListItemButton
@@ -77,9 +84,9 @@ export function Layout({ children, user, onLogout }: { children: ReactNode; user
             sx={{
               mb: 0.5,
               borderRadius: 1.5,
-              color: '#d9e2ec',
-              '&.Mui-selected': { bgcolor: 'rgba(242,184,75,.14)', color: '#fff' },
-              '&.Mui-selected:hover': { bgcolor: 'rgba(242,184,75,.2)' },
+              color: theme.appChrome.drawerText,
+              '&.Mui-selected': { bgcolor: theme.appChrome.drawerSelected, color: theme.appChrome.drawerText },
+              '&.Mui-selected:hover': { bgcolor: theme.appChrome.drawerSelectedHover },
             }}
           >
             <ListItemIcon sx={{ minWidth: 40, color: 'inherit' }}>{item.icon}</ListItemIcon>
@@ -88,9 +95,9 @@ export function Layout({ children, user, onLogout }: { children: ReactNode; user
         ))}
       </List>
       <Box sx={{ mt: 'auto', p: 2 }}>
-        <Divider sx={{ mb: 2, borderColor: 'rgba(255,255,255,.08)' }} />
+        <Divider sx={{ mb: 2, borderColor: theme.appChrome.drawerDivider }} />
         <Typography variant="body2" fontWeight={650}>{user.username}</Typography>
-        <Typography variant="caption" sx={{ color: '#9fb3c3' }}>{user.roles.join(' · ')}</Typography>
+        <Typography variant="caption" sx={{ color: theme.appChrome.drawerMuted }}>{user.roles.join(' · ')}</Typography>
       </Box>
     </Box>
   )
@@ -102,10 +109,11 @@ export function Layout({ children, user, onLogout }: { children: ReactNode; user
         <Drawer open={mobileOpen} onClose={() => setMobileOpen(false)} sx={{ '& .MuiDrawer-paper': { width: drawerWidth } }}>{drawer}</Drawer>
       )}
       <Box sx={{ flex: 1, minWidth: 0 }}>
-        <AppBar position="sticky" color="inherit" elevation={0} sx={{ borderBottom: '1px solid #e5ebef' }}>
+        <AppBar position="sticky" color="inherit" elevation={0} sx={{ bgcolor: theme.appChrome.appBarBackground, borderBottom: '1px solid', borderColor: theme.appChrome.appBarBorder }}>
           <Toolbar sx={{ gap: 1 }}>
             {!desktop && <IconButton aria-label="Apri navigazione" onClick={() => setMobileOpen(true)}><MenuOutlined /></IconButton>}
             <Box sx={{ flex: 1 }} />
+            <ThemeSwitcher />
             <Avatar sx={{ width: 32, height: 32, bgcolor: 'primary.main', fontSize: 14 }}>{user.username.slice(0, 2).toUpperCase()}</Avatar>
             <Tooltip title="Esci"><IconButton aria-label="Esci" onClick={onLogout}><LogoutOutlined /></IconButton></Tooltip>
           </Toolbar>

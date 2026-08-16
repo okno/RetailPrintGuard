@@ -96,7 +96,41 @@ separato che attivi implicitamente i file staged.
 ### Attivazione del solo control plane senza interrompere i proxy
 
 Per una release che modifica soltanto correlazione, antifrode, pricing, API,
-frontend o documentazione, usare:
+frontend o documentazione, il metodo raccomandato è un unico updater da tag
+annotato. Dal secondo utilizzo in poi è già presente nella release attiva:
+
+```bash
+sudo /opt/retailprintguard/current/scripts/update_control_plane_from_git.sh \
+  v<MAJOR>.<MINOR>.<PATCH> \
+  --repo /srv/RetailPrintGuard
+```
+
+Lo script non cambia il checkout in `/srv`: scarica il tag dall'`origin`
+approvato, verifica che sia annotato, pubblicato e contenuto in `origin/main`,
+quindi prepara l'esatto commit in un worktree temporaneo. Richiede coerenza tra
+tag, versione Python, package e frontend, usa la versione `pnpm` dichiarata,
+esegue installazione lockata, lint, test e build Vite e infine invoca soltanto
+`update.sh --control-plane-only`.
+
+Per installare la release che introduce per la prima volta lo script, senza
+fare checkout e senza salvarne una copia non verificata:
+
+```bash
+cd /srv/RetailPrintGuard
+git fetch --tags origin
+git show v0.4.1:scripts/update_control_plane_from_git.sh | \
+  sudo bash -s -- v0.4.1 --repo /srv/RetailPrintGuard
+```
+
+L'updater acquisisce lo stesso lock per backup e installazione e confronta
+prima di ogni mutazione l'intera closure del data plane. Cattura e verifica
+sempre `MainPID`, `InvocationID`, timestamp monotono di avvio e set dei listener
+dei due proxy, anche in uscita per errore. Non chiama mai `rollback.sh` e non ha
+fallback che fermi, avvii o riavvii un proxy. Se una futura release modifica la
+closure del relay, viene rifiutata e richiede una finestra ordinaria.
+
+Il comando di basso livello equivalente, utile solo per diagnosi da un clone
+già preparato e approvato, resta:
 
 ```bash
 cd /percorso/clone-approvato
@@ -133,7 +167,9 @@ e li verifica di nuovo a fine procedura.
 
 Il comando crea il backup, applica le migrazioni, attiva applicazione/frontend,
 installa le unità approvate, riavvia soltanto ingestion, parser, correlazione,
-antifrode e API e ricarica nginx. Non invia `stop`, `start` o `restart` ai due
+antifrode e API e ricarica nginx. Non modifica pacchetti Debian e non riavvia
+MariaDB: se mancano dipendenze o cambia la configurazione DB, si ferma e
+richiede una finestra ordinaria. Non invia `stop`, `start` o `restart` ai due
 proxy. `--control-plane-only` e `--no-start` sono volutamente incompatibili.
 
 Il processo proxy già in memoria continua a usare il codice con cui è stato

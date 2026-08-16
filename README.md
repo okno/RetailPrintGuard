@@ -10,7 +10,7 @@ le direzioni e non importa parser, API o database. La cattura usa una coda
 limitata e uno spool locale; un guasto del control plane non deve trasformarsi
 in una dipendenza sincrona della stampa.
 
-> Stato: release `0.4.0`. I test software sintetici coprono relay,
+> Stato: release `0.4.1`. I test software sintetici coprono relay,
 > spool, configurazione, import, correlazione, regole, modelli e API. Il collaudo
 > su hardware reale, il confronto PCAP direct-vs-proxy e l'installazione sul
 > target Debian 12 non sono ancora attestati da questo repository. Consultare
@@ -35,7 +35,8 @@ in una dipendenza sincrona della stampa.
 - `retailprintguard-api`: API FastAPI versionate, autenticazione e RBAC;
 - `retailprintguard-admin`: bootstrap interattivo e auditato del solo primo
   amministratore;
-- `frontend/`: applicazione React/TypeScript in italiano;
+- `frontend/`: applicazione React/TypeScript in italiano, con temi persistenti
+  Office professionale, Scuro, Unix old school e Hacker;
 - `migrations/`: schema MariaDB/InnoDB versionato con Alembic.
 
 ## Principi di sicurezza e integrità
@@ -78,6 +79,18 @@ pnpm build
 La procedura completa è in [QUICKSTART.md](QUICKSTART.md). Installazione,
 permessi, unità systemd e reverse proxy sono descritti solo per gli artefatti
 effettivamente presenti in [Installazione Debian](docs/INSTALLAZIONE_DEBIAN.md).
+
+Un aggiornamento futuro del solo control plane, da un tag annotato approvato,
+si esegue con un unico comando senza fermare i relay POS/RCH:
+
+```bash
+sudo /opt/retailprintguard/current/scripts/update_control_plane_from_git.sh \
+  v<MAJOR>.<MINOR>.<PATCH> --repo /srv/RetailPrintGuard
+```
+
+Lo script rifiuta automaticamente release che cambiano il data plane. Dettagli,
+bootstrap della prima esecuzione e recovery sono in
+[Aggiornamento produzione](docs/AGGIORNAMENTO_PRODUZIONE.md).
 
 ## Struttura del monorepo
 

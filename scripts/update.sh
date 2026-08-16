@@ -45,10 +45,12 @@ while (( $# > 0 )); do
 done
 
 rpg_require_root
+rpg_acquire_lock
 [[ -f "${RPG_CONFIG_PATH}" ]] || rpg_die "RetailPrintGuard is not installed"
-"${SCRIPT_DIR}/backup.sh"
+RPG_MAINTENANCE_LOCK_HELD=1 "${SCRIPT_DIR}/backup.sh"
 args=(--frontend-dir "${frontend_dir}")
 [[ "${no_start}" == yes ]] && args+=(--no-start)
 [[ "${control_plane_only}" == yes ]] && args+=(--control-plane-only)
 [[ "${allow_unlocked}" == yes ]] && args+=(--allow-unlocked)
+export RPG_MAINTENANCE_LOCK_HELD=1
 exec "${SCRIPT_DIR}/install.sh" "${args[@]}"

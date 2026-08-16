@@ -5,6 +5,25 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-16
+
+### Added
+
+- quattro temi web persistenti e accessibili (`Office`, `Scuro`, `Unix old
+  school`, `Hacker`), selezionabili dall'angolo superiore destro anche prima
+  del login;
+- updater da tag Git annotato `update_control_plane_from_git.sh`, con build
+  frontend pulita, verifica identità versione e invarianti PID, invocation ID,
+  timestamp di avvio e listener dei due proxy.
+
+### Changed
+
+- la modalità `--control-plane-only` mantiene un unico lock tra backup e
+  installazione, non esegue mutazioni APT e non riavvia MariaDB; nuove
+  dipendenze o configurazioni DB richiedono una finestra di manutenzione;
+- drawer, AppBar, login, dashboard, tabelle, stati e anteprima scontrino usano
+  token cromatici coerenti e leggibili in tutti i temi.
+
 ## [0.4.0] — 2026-08-15
 
 ### Added

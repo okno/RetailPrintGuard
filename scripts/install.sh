@@ -114,13 +114,29 @@ if [[ "${control_plane_only}" == yes ]]; then
     [[ "${rch_proxy_pid_before}" =~ ^[1-9][0-9]*$ ]] || rpg_die "invalid RCH proxy PID"
 fi
 
-rpg_note "Installing Debian dependencies"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends \
+required_packages=(
     ca-certificates curl gzip iproute2 logrotate mariadb-client mariadb-server \
     nginx openssl python3 python3-pip python3-venv rsync tar tesseract-ocr \
     tesseract-ocr-eng tesseract-ocr-ita util-linux
+)
+if [[ "${control_plane_only}" == yes ]]; then
+    rpg_note "Verifying existing Debian dependencies without package changes"
+    rpg_require_command dpkg-query
+    missing_packages=()
+    for package in "${required_packages[@]}"; do
+        if ! dpkg-query -W -f='${Status}' "${package}" 2>/dev/null | \
+            grep -qx 'install ok installed'; then
+            missing_packages+=("${package}")
+        fi
+    done
+    (( ${#missing_packages[@]} == 0 )) || rpg_die \
+        "system dependencies changed; use an approved proxy maintenance window: ${missing_packages[*]}"
+else
+    rpg_note "Installing Debian dependencies"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends "${required_packages[@]}"
+fi
 
 for command in flock install mariadb openssl python3 rsync runuser sha256sum systemctl tesseract; do
     rpg_require_command "${command}"
@@ -286,10 +302,19 @@ while IFS=$'\t' read -r device_type device_id; do
 done <<<"${device_listing}"
 
 rpg_note "Configuring MariaDB for loopback-only application access"
-install -m 0644 -o root -g root -- "${SOURCE_ROOT}/deploy/mariadb/70-retailprintguard.cnf" \
-    /etc/mysql/mariadb.conf.d/70-retailprintguard.cnf
-systemctl enable --now mariadb.service
-systemctl restart mariadb.service
+if [[ "${control_plane_only}" == yes ]]; then
+    [[ -f /etc/mysql/mariadb.conf.d/70-retailprintguard.cnf ]] || \
+        rpg_die "installed MariaDB configuration is missing"
+    cmp -s -- "${SOURCE_ROOT}/deploy/mariadb/70-retailprintguard.cnf" \
+        /etc/mysql/mariadb.conf.d/70-retailprintguard.cnf || rpg_die \
+        "MariaDB configuration changed; use an approved proxy maintenance window"
+    systemctl is-active --quiet mariadb.service || rpg_die "MariaDB is not active"
+else
+    install -m 0644 -o root -g root -- "${SOURCE_ROOT}/deploy/mariadb/70-retailprintguard.cnf" \
+        /etc/mysql/mariadb.conf.d/70-retailprintguard.cnf
+    systemctl enable --now mariadb.service
+    systemctl restart mariadb.service
+fi
 
 if [[ ! -e "${RPG_DATABASE_PASSWORD_FILE}" ]]; then
     openssl rand -hex 32 >"${RPG_DATABASE_PASSWORD_FILE}"

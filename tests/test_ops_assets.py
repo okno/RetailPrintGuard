@@ -200,6 +200,40 @@ def test_control_plane_update_never_restarts_or_changes_proxy_code() -> None:
     )
 
 
+def test_git_control_plane_updater_is_tagged_locked_and_fail_closed() -> None:
+    updater = (SCRIPTS / "update_control_plane_from_git.sh").read_text(encoding="utf-8")
+    update = (SCRIPTS / "update.sh").read_text(encoding="utf-8")
+    install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
+
+    assert "^v[0-9]+\\.[0-9]+\\.[0-9]+$" in updater
+    assert "release reference must be an annotated tag" in updater
+    assert "local and remote tag targets do not match" in updater
+    assert "merge-base --is-ancestor" in updater
+    assert "version mismatch: tag=" in updater
+    assert "pnpm install --frozen-lockfile" in updater
+    assert "pnpm lint" in updater and "pnpm test" in updater and "pnpm build" in updater
+    assert "--control-plane-only" in updater
+    assert "InvocationID" in updater
+    assert "ExecMainStartTimestampMonotonic" in updater
+    assert "listener_snapshot" in updater
+    assert "listeners_at_exit" in updater
+    assert "No proxy stop/start/restart fallback was attempted" in updater
+    assert "rollback.sh" not in updater
+    assert updater.index("rpg_assert_data_plane_unchanged") < updater.index(
+        "pnpm install --frozen-lockfile"
+    )
+    assert updater.index("pnpm build") < updater.index(
+        'note "Activating only the control plane'
+    )
+
+    assert update.index("rpg_acquire_lock") < update.index('"${SCRIPT_DIR}/backup.sh"')
+    assert update.count("RPG_MAINTENANCE_LOCK_HELD=1") >= 2
+    assert "exec 9>/run/lock/retailprintguard-maintenance.lock" in updater
+    assert "export RPG_MAINTENANCE_LOCK_HELD=1" in updater
+    assert "Verifying existing Debian dependencies without package changes" in install
+    assert "MariaDB configuration changed; use an approved proxy maintenance window" in install
+
+
 def test_control_plane_gate_rejects_a_changed_proxy_entrypoint(tmp_path: Path) -> None:
     bash = Path("/bin/bash")
     if not bash.exists():

@@ -1,4 +1,5 @@
 import { Box, Card, CardActionArea, CardContent, Typography } from '@mui/material'
+import { alpha, useTheme } from '@mui/material/styles'
 import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 
@@ -7,7 +8,7 @@ export function StatCard({
   value,
   helper,
   icon,
-  tone = '#173f5f',
+  tone,
   to,
 }: {
   label: string
@@ -17,6 +18,8 @@ export function StatCard({
   tone?: string
   to?: string
 }) {
+  const theme = useTheme()
+  const resolvedTone = tone ?? theme.palette.primary.main
   const content = <CardContent sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
     <Box>
       <Typography variant="body2" color="text.secondary" fontWeight={650}>
@@ -27,7 +30,13 @@ export function StatCard({
       </Typography>
       {helper && <Typography variant="caption" color="text.secondary">{helper}</Typography>}
     </Box>
-    <Box sx={{ color: tone, bgcolor: `${tone}12`, borderRadius: 2, p: 1.25, height: 44 }}>{icon}</Box>
+    <Box sx={{
+      color: resolvedTone,
+      bgcolor: alpha(resolvedTone, theme.palette.mode === 'dark' ? 0.2 : 0.08),
+      borderRadius: 2,
+      p: 1.25,
+      height: 44,
+    }}>{icon}</Box>
   </CardContent>
   return (
     <Card sx={{ height: '100%' }}>
