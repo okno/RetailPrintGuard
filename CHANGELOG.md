@@ -5,6 +5,33 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+
+- correlazione `rpg-correlation-1.4.0` della sequenza di vendita composta da
+  comanda, baseline gestionale/preconto, Documento Commerciale e copia
+  gestionale, con vincoli congiunti su tavolo, articolo, direzione temporale e
+  finestre bounded anti-bridge;
+- campi versionati distinti per progressivo proprio osservato, suffisso RCH e
+  riferimento commerciale, con ricerca, tabelle Web, JSON e PDF; l'eventuale
+  codice commerciale completo risolto dalla correlazione resta una proiezione
+  read-only con provenienza esplicita;
+- dashboard con elenco rosso degli episodi economici nel periodo selezionato,
+  totale dell'ammanco potenziale e collegamenti alla transazione e ai documenti.
+
+### Changed
+
+- motore antifrode `rpg-fraud-1.2.0`: una riduzione materiale tra baseline e
+  chiusura genera un solo `MODIFICA_POST_PRECONTO`, includendo importi,
+  percentuale, differenze di riga e riferimenti documentali append-only;
+- risposte dispositivo, copie di output, footer tecnici a zero e sintomi
+  economici già assorbiti dall'alert primario non generano più alert operativi
+  duplicati; gli alert storici riconoscibili vengono riclassificati senza
+  cancellarne evidenza o storia;
+- il parser RCH conserva soltanto il suffisso realmente osservato nelle
+  risposte di stato e non costruisce un falso codice completo dai digit di
+  stato; i progressivi generati internamente dalla RCH sono dichiarati non
+  osservabili nel flusso quando manca una fonte indipendente.
+
 ## [0.4.2] — 2026-08-16
 
 ### Fixed

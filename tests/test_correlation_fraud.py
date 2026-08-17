@@ -58,7 +58,10 @@ def _document(
     *,
     minute: int,
     device: str,
-    external_code: str,
+    external_code: str | None,
+    table_code: str = "T-7",
+    external_code_suffix: str | None = None,
+    commercial_reference_code: str | None = None,
     payments: tuple[PaymentRecord, ...] = (),
 ) -> NormalizedDocument:
     return NormalizedDocument(
@@ -69,8 +72,10 @@ def _document(
         type=document_type,
         subtype=document_type.value,
         external_document_code=external_code,
+        external_document_code_suffix=external_code_suffix,
+        commercial_reference_code=commercial_reference_code,
         order_code="ORD-80",
-        table_code="25-B",
+        table_code=table_code,
         operator_code="OP-7",
         terminal_code="TERM-1" if device.startswith("pos") else "RCH-1",
         document_timestamp=BASE_TIME + timedelta(minutes=minute),
@@ -89,7 +94,18 @@ def _document(
         complete=True,
         lines=lines,
         payments=payments,
-        raw_metadata={"order_reference": "REFERENCE-80"},
+        raw_metadata={
+            "order_reference": "REFERENCE-80",
+            **(
+                {
+                    "external_document_code_suffix_evidence": (
+                        "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+                    )
+                }
+                if external_code_suffix is not None
+                else {}
+            ),
+        },
     )
 
 
@@ -172,6 +188,183 @@ def test_scenario_a_100_to_50_creates_diff_and_explainable_high_alerts() -> None
 
     first = finding_chain_record(amount_alert, sequence=1, previous_hash=None)
     assert verify_chain([first])
+
+
+def test_lab_cash_prebill_to_ten_cent_close_is_one_loss_alert() -> None:
+    """Sanitized regression for a price reduction after a cash prebill."""
+
+    prebill = _document(
+        "table-25b-prebill",
+        DocumentType.MANAGEMENT_DOCUMENT,
+        "3.00",
+        (_line(1, "COFFEE-MILK", "3.00"),),
+        minute=0,
+        device="pos_bar",
+        external_code=None,
+        table_code="LAB-25B",
+    )
+    fiscal = _document(
+        "table-25b-commercial",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "0.10",
+        (_line(1, "COFFEE-MILK", "0.10"),),
+        minute=2,
+        device="rch_1",
+        external_code=None,
+        external_code_suffix="0041",
+        table_code="LAB-25B",
+        payments=(
+            PaymentRecord(
+                method="CONTANTI",
+                amount=Decimal("0.10"),
+                evidence=EvidenceLevel.CONFIRMED,
+            ),
+        ),
+    )
+    management_copy = _document(
+        "table-25b-management-copy",
+        DocumentType.MANAGEMENT_DOCUMENT,
+        "0.10",
+        (_line(1, "COFFEE-MILK", "0.10"),),
+        minute=3,
+        device="rch_1",
+        external_code=None,
+        commercial_reference_code="LAB-FSC-0041",
+        table_code="LAB-25B",
+    )
+
+    transactions = CorrelationEngine().correlate((management_copy, fiscal, prebill))
+    assert len(transactions) == 1
+    transaction = transactions[0]
+    assert transaction.prebill_total == Decimal("3.00")
+    assert transaction.fiscal_total == Decimal("0.10")
+    assert transaction.observed_final_total == Decimal("0.10")
+    assert transaction.difference_amount == Decimal("2.90")
+    assert transaction.difference_percent == Decimal("96.6667")
+
+    findings = FraudEngine().evaluate(
+        FraudContext(
+            transaction=transaction,
+            evaluated_at=BASE_TIME + timedelta(minutes=4),
+        )
+    )
+    assert len(findings) == 1
+    alert = findings[0]
+    assert alert.rule_code == "MODIFICA_POST_PRECONTO"
+    assert alert.severity.value == "HIGH"
+    assert alert.evidence[0]["prebill_total"] == "3.00"
+    assert alert.evidence[0]["observed_final_total"] == "0.10"
+    assert alert.evidence[0]["difference_amount"] == "2.90"
+    assert alert.evidence[0]["difference_percent"] == "96.6667"
+    assert set(alert.document_ids) == {prebill.id, fiscal.id, management_copy.id}
+    assert {item["change_type"] for item in alert.evidence[1:]} == {"PRICE_CHANGED"}
+
+
+def test_default_profile_ignores_immaterial_post_prebill_price_correction() -> None:
+    prebill = _document(
+        "minor-prebill",
+        DocumentType.PRE_BILL,
+        "3.00",
+        (_line(1, "COFFEE-MILK", "3.00"),),
+        minute=0,
+        device="pos_bar",
+        external_code="MGMT-MINOR-1",
+        table_code="LAB-MINOR",
+    )
+    fiscal = _document(
+        "minor-commercial",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "2.90",
+        (_line(1, "COFFEE-MILK", "2.90"),),
+        minute=1,
+        device="rch_1",
+        external_code="COMM-MINOR-1",
+        table_code="LAB-MINOR",
+        payments=(
+            PaymentRecord(
+                method="CONTANTI",
+                amount=Decimal("2.90"),
+                evidence=EvidenceLevel.CONFIRMED,
+            ),
+        ),
+    )
+    transaction = CorrelationEngine().correlate((prebill, fiscal))[0]
+
+    # The configured materiality threshold is authoritative: legacy line and
+    # same-reference symptom rules must not bypass it in the default profile.
+    assert (
+        FraudEngine().evaluate(
+            FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(minutes=2))
+        )
+        == ()
+    )
+
+
+def test_zero_technical_line_is_ignored_but_negative_sale_line_is_not() -> None:
+    zero_technical = _document(
+        "zero-technical-line",
+        DocumentType.PRE_BILL,
+        "3.00",
+        (
+            _line(1, "BEVERAGE", "3.00"),
+            _line(2, "RESTO", "0.00").model_copy(update={"description": "RESTO"}),
+        ),
+        minute=0,
+        device="pos_lab",
+        external_code="LAB-MGMT-ZERO",
+        table_code="LAB-ZERO",
+    )
+    negative_sale = _document(
+        "negative-sale-line",
+        DocumentType.PRE_BILL,
+        "2.00",
+        (_line(1, "BEVERAGE", "3.00"), _line(2, "MANUAL-ADJUSTMENT", "-1.00")),
+        minute=0,
+        device="pos_lab",
+        external_code="LAB-MGMT-NEGATIVE",
+        table_code="LAB-NEGATIVE",
+    )
+    zero_sale = _document(
+        "zero-sale-line",
+        DocumentType.PRE_BILL,
+        "3.00",
+        (_line(1, "BEVERAGE", "3.00"), _line(2, "PROMO-ITEM", "0.00")),
+        minute=0,
+        device="pos_lab",
+        external_code="LAB-MGMT-ZERO-SALE",
+        table_code="LAB-ZERO-SALE",
+    )
+
+    zero_codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(
+                transaction=CorrelationEngine().correlate((zero_technical,))[0],
+                evaluated_at=BASE_TIME + timedelta(minutes=1),
+            )
+        )
+    }
+    negative_codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(
+                transaction=CorrelationEngine().correlate((negative_sale,))[0],
+                evaluated_at=BASE_TIME + timedelta(minutes=1),
+            )
+        )
+    }
+    zero_sale_codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(
+                transaction=CorrelationEngine().correlate((zero_sale,))[0],
+                evaluated_at=BASE_TIME + timedelta(minutes=1),
+            )
+        )
+    }
+    assert "NEGATIVE_OR_ZERO_VALUE_ITEM" not in zero_codes
+    assert "NEGATIVE_OR_ZERO_VALUE_ITEM" in negative_codes
+    assert "NEGATIVE_OR_ZERO_VALUE_ITEM" in zero_sale_codes
 
 
 def test_incomplete_commercial_attempt_is_not_an_economic_closure() -> None:
@@ -749,6 +942,23 @@ def test_global_duplicate_finding_is_emitted_once_and_never_on_unrelated_transac
     }
     assert duplicate_alert_count == 1
     assert "DUPLICATE_DOCUMENT" not in unrelated_codes
+
+    responses = tuple(
+        document.model_copy(update={"type": DocumentType.DEVICE_RESPONSE})
+        for document in (duplicate_one, duplicate_two)
+    )
+    for response in responses:
+        response_codes = {
+            finding.rule_code
+            for finding in engine.evaluate(
+                FraudContext(
+                    transaction=CorrelationEngine().correlate((response,))[0],
+                    comparison_documents=responses,
+                    evaluated_at=BASE_TIME + timedelta(hours=1),
+                )
+            )
+        }
+        assert "DUPLICATE_DOCUMENT" not in response_codes
 
 
 def _pos_evidence(

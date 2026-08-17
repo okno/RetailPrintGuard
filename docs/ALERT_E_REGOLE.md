@@ -20,7 +20,7 @@ flowchart LR
 
 ## Correlazione spiegabile
 
-La versione correttiva corrente è `rpg-correlation-1.3.0`. Il punteggio usa criteri
+La versione correttiva corrente è `rpg-correlation-1.4.0`. Il punteggio usa criteri
 disponibili senza penalizzare automaticamente un campo assente. Tra i pesi
 massimi:
 
@@ -62,6 +62,14 @@ Copie conformi, ristampe, risposte RCH e rimborsi sono membri ausiliari: possono
 arricchire la timeline appropriata ma non fanno da ponte tra due episodi. La
 descrizione completa e gli esempi sono in
 [Episodi di vendita](ANTIFRODE_EPISODI_VENDITA.md).
+
+La sequenza tavolo viene collegata soltanto con criteri compositi. La comanda
+precede la baseline gestionale entro 30 secondi con stessa riga; la chiusura
+commerciale segue la baseline entro 300 secondi con stesso tavolo e articolo.
+Un riferimento commerciale completo può confermare il Documento Commerciale;
+un suffisso RCH è utilizzabile solo con provenienza status-sequence e gli altri
+criteri concordanti. I progressivi propri gestionali e commerciali restano in
+namespace distinti.
 
 Il motore calcola `ADDED`, `REMOVED`, `QUANTITY_CHANGED`, `PRICE_CHANGED`,
 `DISCOUNT_CHANGED` e `UNCHANGED`. Per i conti separati, il totale fiscale è la
@@ -140,6 +148,15 @@ precedente quando l'evidenza dimostra un difetto noto:
   tasso diventa `FALSE_POSITIVE`;
 - `DUPLICATE_DOCUMENT` assegnato a una transazione che non contiene alcuno dei
   documenti duplicati diventa `FALSE_POSITIVE`;
+- duplicati costituiti esclusivamente da risposte dispositivo o copie di output
+  diventano `FALSE_POSITIVE`, mentre duplicati commerciali reali restano
+  operativi;
+- righe tecniche a zero (`TOT`, `IVA`, `RESTO` e proiezioni equivalenti) non
+  producono `NEGATIVE_OR_ZERO_VALUE_ITEM`; una voce di vendita a zero o negativa
+  continua invece a essere segnalata;
+- quando l'alert primario `MODIFICA_POST_PRECONTO` è attivo, i sintomi
+  economici ausiliari dello stesso episodio vengono archiviati per evitare di
+  moltiplicare evento e ammanco;
 - un alert collegato a una correlazione sostituita da quella corrente diventa
   `JUSTIFIED`.
 

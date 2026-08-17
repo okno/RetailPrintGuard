@@ -132,6 +132,12 @@ export interface DocumentRecord {
   job_id: string
   type: string
   subtype: string
+  external_document_code?: string
+  external_document_code_suffix?: string
+  resolved_external_document_code?: string
+  resolved_external_document_code_provenance?: string
+  commercial_reference_code?: string
+  progressive_observation_status?: string
   external_code?: string
   order_code?: string
   table_code?: string

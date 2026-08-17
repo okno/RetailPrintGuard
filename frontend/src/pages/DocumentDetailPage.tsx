@@ -15,6 +15,13 @@ import type { DocumentRecord } from '../types'
 
 const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
 
+function progressiveObservationLabel(value: string | undefined) {
+  if (value === 'FULL_CODE_OBSERVED_IN_CAPTURE') return 'Progressivo completo osservato nel flusso'
+  if (value === 'SUFFIX_ONLY_OBSERVED_IN_CAPTURE') return 'Solo suffisso osservato; non è un codice completo'
+  if (value === 'NOT_OBSERVED_IN_CAPTURE') return 'Progressivo proprio generato dalla RCH, non presente nel flusso osservato'
+  return 'Non applicabile'
+}
+
 function LinePrice({ line }: { line: DocumentRecord['lines'][number] }) {
   const value = line.unit_price ?? line.derived_unit_price
   if (value === undefined && line.derived_price_source === 'CONFLICTING_SOURCES') {
@@ -128,7 +135,7 @@ export function DocumentDetailPage() {
         </Card>
       </Grid>
       <Grid size={{ xs: 12, lg: 4 }}>
-        <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />{[['Acquisito', formatDateTime(doc.captured_at)], ['Codice ordine', doc.order_code], ['Tavolo', doc.table_code], ['Coperti', doc.covers], ['Operatore', doc.operator_code], ['Hash SHA-256', doc.sha256], ['Confidenza', `${doc.confidence}%`]].map(([label, value]) => <Box key={label} sx={{ mt: 2 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography sx={{ wordBreak: 'break-all' }}>{value ?? '—'}</Typography></Box>)}</CardContent></Card>
+        <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />{[['Acquisito', formatDateTime(doc.captured_at)], ['Progressivo documento', doc.external_document_code ?? doc.external_code ?? (doc.resolved_external_document_code ? `${doc.resolved_external_document_code} (da riferimento gestionale correlato)` : undefined) ?? (doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE' ? 'Non osservato nel flusso catturato' : undefined)], ['Suffisso progressivo RCH', doc.external_document_code_suffix], ['Osservabilità progressivo', progressiveObservationLabel(doc.progressive_observation_status)], ['Provenienza risoluzione', doc.resolved_external_document_code_provenance === 'CORRELATED_MANAGEMENT_REFERENCE' ? 'Riferimento commerciale in documento gestionale correlato' : undefined], ['Riferimento commerciale', doc.commercial_reference_code], ['Codice ordine', doc.order_code], ['Tavolo', doc.table_code], ['Coperti', doc.covers], ['Operatore', doc.operator_code], ['Hash SHA-256', doc.sha256], ['Confidenza', `${doc.confidence}%`]].map(([label, value]) => <Box key={label} sx={{ mt: 2 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography sx={{ wordBreak: 'break-all' }}>{value ?? '—'}</Typography></Box>)}</CardContent></Card>
         {doc.warnings.length > 0 && <Alert severity="warning" sx={{ mt: 2 }}>{doc.warnings.join(' · ')}</Alert>}
       </Grid>
     </Grid>

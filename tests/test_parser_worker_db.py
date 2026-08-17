@@ -227,6 +227,8 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
                 "type": DocumentType.ORDER_CHANGE,
                 "subtype": "ORDER_CHANGE_REPARSED",
                 "external_document_code": "DOC-V2",
+                "external_document_code_suffix": "0042",
+                "commercial_reference_code": "FISCAL-V1",
                 "order_code": "ORDER-V2",
                 "table_code": "TABLE-V2",
                 "operator_code": "OP-V2",
@@ -259,6 +261,9 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         assert versions[0].document_type == DocumentType.PRE_BILL.value
         assert versions[1].document_type == DocumentType.ORDER_CHANGE.value
         assert versions[1].subtype == "ORDER_CHANGE_REPARSED"
+        assert versions[1].external_document_code == "DOC-V2"
+        assert versions[1].external_document_code_suffix == "0042"
+        assert versions[1].commercial_reference_code == "FISCAL-V1"
         assert versions[1].order_code == "ORDER-V2"
         assert versions[1].table_code == "TABLE-V2"
         assert versions[1].operator_code == "OP-V2"
@@ -266,6 +271,9 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         projection = session.scalar(select(Document))
         assert projection is not None
         assert projection.document_type == DocumentType.ORDER_CHANGE.value
+        assert projection.external_document_code == "DOC-V2"
+        assert projection.external_document_code_suffix == "0042"
+        assert projection.commercial_reference_code == "FISCAL-V1"
         assert projection.table_code == "TABLE-V2"
         revised_line = session.scalar(
             select(DocumentLine).where(DocumentLine.document_version_id == versions[1].id)

@@ -30,6 +30,9 @@ in una dipendenza sincrona della stampa.
 - `retailprintguard-correlate`: worker DB per correlazione deterministica, diff
   delle righe, episodi di vendita, ordini/eventi/snapshot, aggregazione delle
   chiusure fiscali e prezzi POS derivati con provenienza;
+- la correlazione conserva separatamente progressivo proprio, suffisso RCH e
+  riferimento commerciale e segnala in dashboard le riduzioni materiali tra
+  baseline gestionale/preconto e chiusura, senza inventare codici non osservati;
 - `retailprintguard-fraud`: worker DB per regole spiegabili e versionate, evidenze,
   storia alert e whitelist documentate;
 - `retailprintguard-api`: API FastAPI versionate, autenticazione e RBAC;

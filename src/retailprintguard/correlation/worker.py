@@ -78,6 +78,8 @@ _VERSION_SEMANTIC_FIELDS = (
     "document_type",
     "subtype",
     "external_document_code",
+    "external_document_code_suffix",
+    "commercial_reference_code",
     "order_code",
     "table_code",
     "operator_code",
@@ -109,6 +111,13 @@ class CorrelationRunReport:
 
 def _document_time(document: NormalizedDocument) -> datetime:
     return document.document_timestamp or document.captured_at
+
+
+def _printed_counter_suffix(value: str | None) -> str | None:
+    if not value:
+        return None
+    tail = value.strip().upper().replace("/", "-").rsplit("-", 1)[-1]
+    return tail if tail.isdigit() else None
 
 
 def _document_type(value: str) -> DocumentType:
@@ -447,6 +456,12 @@ def load_latest_documents(
             type=_document_type(_versioned_semantic(version, document, "document_type")),
             subtype=_versioned_semantic(version, document, "subtype") or "UNKNOWN",
             external_document_code=_versioned_semantic(version, document, "external_document_code"),
+            external_document_code_suffix=_versioned_semantic(
+                version, document, "external_document_code_suffix"
+            ),
+            commercial_reference_code=_versioned_semantic(
+                version, document, "commercial_reference_code"
+            ),
             order_code=_versioned_semantic(version, document, "order_code"),
             table_code=_versioned_semantic(version, document, "table_code"),
             operator_code=_versioned_semantic(version, document, "operator_code"),
@@ -570,6 +585,16 @@ def _candidate_batch(
         for item in loaded_seeds
         if item.value.external_document_code
     }
+    commercial_reference_codes = {
+        item.value.commercial_reference_code
+        for item in loaded_seeds
+        if item.value.commercial_reference_code
+    }
+    commercial_reference_suffixes = {
+        suffix
+        for item in loaded_seeds
+        if (suffix := _printed_counter_suffix(item.value.commercial_reference_code)) is not None
+    }
     table_codes = {item.value.table_code for item in loaded_seeds if item.value.table_code}
     source_job_ids = {item.value.source_job_id for item in loaded_seeds if item.value.source_job_id}
     strong_blocks = []
@@ -590,6 +615,39 @@ def _candidate_batch(
                 and_(
                     _legacy_version_semantics(),
                     Document.external_document_code.in_(external_codes),
+                ),
+            )
+        )
+    commercial_link_codes = external_codes | commercial_reference_codes
+    if commercial_link_codes:
+        strong_blocks.append(
+            or_(
+                DocumentVersion.external_document_code.in_(commercial_link_codes),
+                DocumentVersion.commercial_reference_code.in_(commercial_link_codes),
+                and_(
+                    _legacy_version_semantics(),
+                    or_(
+                        Document.external_document_code.in_(commercial_link_codes),
+                        Document.commercial_reference_code.in_(commercial_link_codes),
+                    ),
+                ),
+            )
+        )
+    if commercial_reference_suffixes:
+        # This indexed lookup only broadens the bounded candidate
+        # neighbourhood. The engine still requires same table, line identity,
+        # status-response provenance and a narrow time window before a suffix
+        # can contribute to a correlation.
+        strong_blocks.append(
+            or_(
+                DocumentVersion.external_document_code_suffix.in_(
+                    commercial_reference_suffixes
+                ),
+                and_(
+                    _legacy_version_semantics(),
+                    Document.external_document_code_suffix.in_(
+                        commercial_reference_suffixes
+                    ),
                 ),
             )
         )
@@ -665,6 +723,31 @@ def _candidate_pairs(
         ):
             if value:
                 blocks[(name, value)].append(document)
+        if document.type is DocumentType.COMMERCIAL_DOCUMENT and document.external_document_code:
+            blocks[("commercial_link", document.external_document_code)].append(document)
+        if document.commercial_reference_code:
+            blocks[("commercial_link", document.commercial_reference_code)].append(document)
+        if (
+            document.type is DocumentType.COMMERCIAL_DOCUMENT
+            and document.external_document_code_suffix
+        ):
+            blocks[(
+                "commercial_suffix",
+                document.external_document_code_suffix,
+            )].append(document)
+        if (
+            document.type
+            in {
+                DocumentType.MANAGEMENT_DOCUMENT,
+                DocumentType.CONFORMING_COPY,
+                DocumentType.REPRINT,
+            }
+            and (
+                suffix := _printed_counter_suffix(document.commercial_reference_code)
+            )
+            is not None
+        ):
+            blocks[("commercial_suffix", suffix)].append(document)
     for documents in blocks.values():
         for index, left in enumerate(documents):
             for right in documents[index + 1 :]:

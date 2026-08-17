@@ -215,6 +215,13 @@ class DocumentView(BaseModel):
     job_id: UUID
     type: str
     subtype: str
+    external_document_code: str | None = None
+    external_document_code_suffix: str | None = None
+    resolved_external_document_code: str | None = None
+    resolved_external_document_code_provenance: str | None = None
+    commercial_reference_code: str | None = None
+    progressive_observation_status: str = "NOT_AVAILABLE"
+    # Backward-compatible name retained for existing API clients.
     external_code: str | None = None
     order_code: str | None = None
     table_code: str | None = None

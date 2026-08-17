@@ -99,6 +99,24 @@ export function DocumentsPage() {
           value={params.get('order_code') ?? ''}
           onChange={(event) => filter('order_code', event.target.value)}
         />
+        <TextField
+          size="small"
+          label="Progressivo documento"
+          value={params.get('external_document_code') ?? ''}
+          onChange={(event) => filter('external_document_code', event.target.value)}
+        />
+        <TextField
+          size="small"
+          label="Suffisso progressivo RCH"
+          value={params.get('external_document_code_suffix') ?? ''}
+          onChange={(event) => filter('external_document_code_suffix', event.target.value)}
+        />
+        <TextField
+          size="small"
+          label="Riferimento commerciale"
+          value={params.get('commercial_reference_code') ?? ''}
+          onChange={(event) => filter('commercial_reference_code', event.target.value)}
+        />
         <PeriodPicker params={params} onChange={setParams} />
       </Box>
     </Card>
@@ -125,7 +143,19 @@ export function DocumentsPage() {
             >
               <TableCell>{date.format(new Date(doc.captured_at))}</TableCell>
               <TableCell><strong>{doc.subtype}</strong><br /><small>{doc.type}</small></TableCell>
-              <TableCell>{doc.order_code ?? doc.external_code ?? '—'}<br />{doc.table_code ? `Tavolo ${doc.table_code}` : ''}</TableCell>
+              <TableCell>
+                {(doc.external_document_code ?? doc.external_code)
+                  ? <strong>Doc. {doc.external_document_code ?? doc.external_code}</strong>
+                  : doc.resolved_external_document_code
+                    ? <strong>Doc. {doc.resolved_external_document_code} (da riferimento correlato)</strong>
+                  : doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE'
+                    ? <strong>Progressivo proprio non osservato nel flusso</strong>
+                    : '—'}
+                {doc.external_document_code_suffix && <><br />Suffisso RCH {doc.external_document_code_suffix} (non completo)</>}
+                {doc.commercial_reference_code && <><br />Rif. commerciale {doc.commercial_reference_code}</>}
+                {doc.order_code && <><br />Ordine {doc.order_code}</>}
+                {doc.table_code && <><br />Tavolo {doc.table_code}</>}
+              </TableCell>
               <TableCell>{doc.device_id}</TableCell>
               <TableCell align="right">{doc.gross_total ? money.format(Number(doc.gross_total)) : '—'}</TableCell>
               <TableCell><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} /></TableCell>

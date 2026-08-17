@@ -4,7 +4,10 @@ export const OPERATIONAL_REDUCTION_FILTERS = Object.freeze({
   minimum_difference: '0.01',
 })
 
-export function operationalReductionTransactionsPath(period: URLSearchParams) {
+export function operationalReductionQuery(
+  period: URLSearchParams,
+  pagination?: { limit: number; offset: number },
+) {
   const query = new URLSearchParams()
   for (const key of ['from', 'to']) {
     const value = period.get(key)
@@ -13,6 +16,15 @@ export function operationalReductionTransactionsPath(period: URLSearchParams) {
   for (const [key, value] of Object.entries(OPERATIONAL_REDUCTION_FILTERS)) {
     query.set(key, value)
   }
+  if (pagination) {
+    query.set('limit', String(pagination.limit))
+    query.set('offset', String(pagination.offset))
+  }
+  return query
+}
+
+export function operationalReductionTransactionsPath(period: URLSearchParams) {
+  const query = operationalReductionQuery(period)
   return `/transazioni?${query.toString()}`
 }
 

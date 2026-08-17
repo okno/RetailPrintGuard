@@ -191,7 +191,7 @@ def _seed_api(factory):
                 subtype="PRECONTO",
                 external_document_code="PB-0001",
                 order_code="ORD-80",
-                table_code="25-B",
+                table_code="LAB-25",
                 captured_at=NOW,
             )
         )
@@ -359,7 +359,7 @@ def _add_correlated_document(
         subtype=document_type,
         external_document_code=f"{document_type}-{document_id}",
         order_code="ORD-80",
-        table_code="25-B",
+        table_code="LAB-25",
         document_timestamp=NOW + timedelta(minutes=minute),
         captured_at=NOW + timedelta(minutes=minute, seconds=1),
     )
@@ -413,6 +413,90 @@ def _add_correlated_document(
         )
     )
     return document_id, version.id
+
+
+def test_commercial_progressive_is_resolved_only_from_strong_current_correlation() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    strong_correlation_id = uuid4()
+    with factory.begin() as session:
+        fiscal_id, fiscal_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="COMMERCIAL_DOCUMENT",
+            total="0.10",
+            complete=True,
+            line_total="0.10",
+        )
+        management_id, management_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="MANAGEMENT_DOCUMENT",
+            total="0.10",
+            complete=True,
+            minute=2,
+            line_total="0.10",
+        )
+        fiscal = session.get(Document, fiscal_id)
+        fiscal_version = session.get(DocumentVersion, fiscal_version_id)
+        management = session.get(Document, management_id)
+        management_version = session.get(DocumentVersion, management_version_id)
+        assert fiscal is not None and fiscal_version is not None
+        assert management is not None and management_version is not None
+        fiscal.external_document_code = None
+        fiscal.external_document_code_suffix = "0042"
+        fiscal_version.external_document_code = None
+        fiscal_version.external_document_code_suffix = "0042"
+        management.external_document_code = None
+        management.commercial_reference_code = "9901-0042"
+        management_version.external_document_code = None
+        management_version.commercial_reference_code = "9901-0042"
+        session.add(
+            DocumentCorrelation(
+                id=strong_correlation_id,
+                transaction_id=uuid4(),
+                algorithm_version="rpg-correlation-1.4.0",
+                input_fingerprint=hashlib.sha256(b"strong-progressive").hexdigest(),
+                score=100,
+                status="AUTOMATIC",
+                matched_criteria=[
+                    "commercial_reference_to_observed_fiscal_suffix",
+                    "table_code",
+                    "line_identity_overlap",
+                    "time_proximity",
+                ],
+                explanation="Correlazione progressivo sintetica forte",
+            )
+        )
+        session.flush()
+        session.add_all(
+            [
+                DocumentCorrelationMember(
+                    correlation_id=strong_correlation_id,
+                    document_id=fiscal_id,
+                    role="FISCAL",
+                    contribution_score=100,
+                ),
+                DocumentCorrelationMember(
+                    correlation_id=strong_correlation_id,
+                    document_id=management_id,
+                    role="MANAGEMENT_COPY",
+                    contribution_score=100,
+                ),
+            ]
+        )
+
+    selected = SqlAlchemyApiRepository(factory).get_document(fiscal_id)
+    assert selected is not None
+    assert selected.external_document_code is None
+    assert selected.external_document_code_suffix == "0042"
+    assert selected.resolved_external_document_code == "9901-0042"
+    assert (
+        selected.resolved_external_document_code_provenance
+        == "CORRELATED_MANAGEMENT_REFERENCE"
+    )
+    assert selected.progressive_observation_status == "SUFFIX_ONLY_OBSERVED_IN_CAPTURE"
+    engine.dispose()
 
 
 def test_sqlalchemy_api_repository_read_models_workflow_and_audit_chain() -> None:
@@ -946,6 +1030,156 @@ def test_transaction_reduction_drilldown_requires_closure_and_operational_econom
     engine.dispose()
 
 
+def test_transaction_uses_correlated_management_pre_fiscal_baseline() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        correlation = session.get(DocumentCorrelation, ids["correlation"])
+        management = session.get(Document, ids["document"])
+        management_version = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == ids["document"]
+            )
+        )
+        assert management_version is not None
+        management_line = session.scalar(
+            select(DocumentLine).where(
+                DocumentLine.document_version_id == management_version.id
+            )
+        )
+        assert correlation is not None
+        assert management is not None
+        assert management_line is not None
+        correlation.algorithm_version = "rpg-correlation-1.4.0"
+        correlation.status = "AUTOMATIC"
+        correlation.score = 100
+        correlation.matched_criteria = [
+            "table_sale_sequence",
+            "line_identity_overlap",
+            "time_proximity",
+        ]
+        management.document_type = DocumentType.MANAGEMENT_DOCUMENT.value
+        management.subtype = "GESTIONALE_PRE_FISCALE"
+        management.external_document_code = "MGT-LAB-0014"
+        management.commercial_reference_code = None
+        management_version.gross_total = Decimal("3.00")
+        management_version.complete = True
+        management_version.status = "COMPLETE"
+        management_version.raw_metadata = {}
+        management_line.description = "Prodotto laboratorio"
+        management_line.unit_price = Decimal("3.00")
+        management_line.line_total = Decimal("3.00")
+
+        fiscal_id, _fiscal_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="COMMERCIAL_DOCUMENT",
+            total="0.10",
+            complete=True,
+            minute=1,
+            line_total="0.10",
+        )
+        session.flush()
+        fiscal = session.get(Document, fiscal_id)
+        assert fiscal is not None
+        fiscal.external_document_code = None
+        fiscal.external_document_code_suffix = "0042"
+        fiscal_version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == fiscal_id)
+        )
+        assert fiscal_version is not None
+        fiscal_version.external_document_code = None
+        fiscal_version.external_document_code_suffix = "0042"
+        fiscal_line = session.scalar(
+            select(DocumentLine).where(
+                DocumentLine.document_version_id == fiscal_version.id
+            )
+        )
+        assert fiscal_line is not None
+        fiscal_line.description = "Prodotto laboratorio"
+
+        copy_id, copy_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="MANAGEMENT_DOCUMENT",
+            total="0.10",
+            complete=True,
+            minute=2,
+            line_total="0.10",
+        )
+        management_copy = session.get(Document, copy_id)
+        management_copy_version = session.get(DocumentVersion, copy_version_id)
+        assert management_copy is not None and management_copy_version is not None
+        management_copy.commercial_reference_code = "FSC-LAB-0042"
+        management_copy_version.commercial_reference_code = "FSC-LAB-0042"
+
+    repository = SqlAlchemyApiRepository(factory)
+    transaction = repository.get_transaction(ids["transaction"])
+    assert transaction is not None
+    assert transaction.pre_bill_total == Decimal("3.00")
+    assert transaction.fiscal_total == Decimal("0.10")
+    assert transaction.difference == Decimal("2.90")
+    assert transaction.diff["baseline_basis"] == "CORRELATED_MANAGEMENT_PRE_FISCAL"
+    assert transaction.diff["baseline_document_id"] == str(ids["document"])
+    assert transaction.diff["baseline_document_type"] == "MANAGEMENT_DOCUMENT"
+    assert transaction.diff["lines"]["removed"] == []
+    assert len(transaction.diff["lines"]["price_changed"]) == 1
+
+    dashboard_rows, count = repository.list_transactions(
+        limit=10,
+        offset=0,
+        filters={
+            "operational_economic_only": True,
+            "reduction_only": True,
+            "minimum_difference": Decimal("0.01"),
+        },
+    )
+    assert count == 1
+    assert dashboard_rows[0].pre_bill_total == Decimal("3.00")
+    assert dashboard_rows[0].fiscal_total == Decimal("0.10")
+    assert dashboard_rows[0].difference == Decimal("2.90")
+    engine.dispose()
+
+
+def test_transaction_does_not_infer_management_baseline_without_line_evidence() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        correlation = session.get(DocumentCorrelation, ids["correlation"])
+        management = session.get(Document, ids["document"])
+        management_version = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == ids["document"]
+            )
+        )
+        assert correlation is not None
+        assert management is not None and management_version is not None
+        correlation.algorithm_version = "rpg-correlation-1.4.0"
+        correlation.status = "AUTOMATIC"
+        correlation.matched_criteria = ["table_sale_sequence", "time_proximity"]
+        management.document_type = DocumentType.MANAGEMENT_DOCUMENT.value
+        management_version.gross_total = Decimal("3.00")
+        management_version.complete = True
+        management_version.raw_metadata = {}
+        _add_correlated_document(
+            session,
+            ids,
+            document_type="COMMERCIAL_DOCUMENT",
+            total="0.10",
+            complete=True,
+            minute=1,
+            line_total="0.10",
+        )
+
+    transaction = SqlAlchemyApiRepository(factory).get_transaction(ids["transaction"])
+    assert transaction is not None
+    assert transaction.pre_bill_total is None
+    assert transaction.fiscal_total == Decimal("0.10")
+    assert transaction.difference is None
+    assert transaction.diff["baseline_basis"] is None
+    engine.dispose()
+
+
 def test_transaction_prefers_room_close_over_incomplete_fiscal_and_uses_room_lines() -> None:
     engine, factory = _factory()
     ids = _seed_api(factory)
@@ -1077,10 +1311,13 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
         active_version.document_type = "PRE_BILL"
         active_version.subtype = "PRECONTO"
         active_version.external_document_code = "PB-0001"
+        active_version.external_document_code_suffix = "0001"
+        active_version.commercial_reference_code = "COMM-0007"
         active_version.order_code = None
-        active_version.table_code = "25-B"
+        active_version.table_code = "LAB-25"
         document.document_type = "KITCHEN_ORDER"
         document.subtype = "SHADOW_NEW"
+        document.commercial_reference_code = "SHADOW-REF"
         document.order_code = "SHADOW-NEW"
         newer_parser = ParserVersion(
             id=newer_parser_id,
@@ -1168,6 +1405,25 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
     )
     assert selected.normalized_text == "PRECONTO ORD-80 TOTALE 100,00"
     assert selected.receipt_text == "PRECONTO ORD-80 TOTALE 100,00"
+    assert selected.external_document_code == "PB-0001"
+    assert selected.external_document_code_suffix == "0001"
+    assert selected.external_code == "PB-0001"
+    assert selected.commercial_reference_code == "COMM-0007"
+    assert selected.progressive_observation_status == "FULL_CODE_OBSERVED_IN_CAPTURE"
+    by_reference, reference_total = repository.list_documents(
+        limit=20,
+        offset=0,
+        filters={"commercial_reference_code": "COMM-0007"},
+    )
+    assert reference_total == 1
+    assert [item.id for item in by_reference] == [ids["document"]]
+    search_hits, search_total = repository.search(
+        query="COMM-0007",
+        limit=20,
+        offset=0,
+    )
+    assert search_total == 1
+    assert [item.entity_id for item in search_hits] == [ids["document"]]
     leaked, leaked_total = repository.list_documents(
         limit=20,
         offset=0,

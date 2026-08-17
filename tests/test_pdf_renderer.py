@@ -26,6 +26,10 @@ def _document() -> DocumentView:
         job_id=UUID("20000000-0000-4000-8000-000000000002"),
         type="MANAGEMENT_DOCUMENT",
         subtype="SYNTHETIC_SETTLEMENT",
+        external_document_code="9901-0043",
+        external_document_code_suffix="0043",
+        commercial_reference_code="9901-0042",
+        progressive_observation_status="FULL_CODE_OBSERVED_IN_CAPTURE",
         external_code="LAB-0001",
         order_code="ORDER-LAB",
         table_code="TABLE-LAB",
@@ -63,6 +67,42 @@ def _document() -> DocumentView:
 
 
 def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> None:
+    text = "\n".join(line.text for line in _document_lines(_document()))
+    assert "Documento: 9901-0043" in text
+    assert "Suffisso progressivo RCH: 0043" in text
+    assert "progressivo completo osservato nel flusso" in text
+    assert "Rif. commerciale: 9901-0042" in text
+
+    suffix_only = _document().model_copy(
+        update={
+            "external_document_code": None,
+            "external_code": None,
+            "external_document_code_suffix": "0042",
+            "resolved_external_document_code": "9901-0042",
+            "resolved_external_document_code_provenance": (
+                "CORRELATED_MANAGEMENT_REFERENCE"
+            ),
+            "progressive_observation_status": "SUFFIX_ONLY_OBSERVED_IN_CAPTURE",
+        }
+    )
+    suffix_text = "\n".join(line.text for line in _document_lines(suffix_only))
+    assert "Suffisso progressivo RCH: 0042" in suffix_text
+    assert "non e' un codice completo" in suffix_text
+    assert "Documento risolto: 9901-0042 (da riferimento gestionale correlato)" in (
+        suffix_text
+    )
+
+    own_not_observed = suffix_only.model_copy(
+        update={
+            "external_document_code_suffix": None,
+            "progressive_observation_status": "NOT_OBSERVED_IN_CAPTURE",
+        }
+    )
+    unavailable_text = "\n".join(
+        line.text for line in _document_lines(own_not_observed)
+    )
+    assert "progressivo proprio generato dalla RCH" in unavailable_text
+
     first = render_document_pdf(_document())
     second = render_document_pdf(_document())
 

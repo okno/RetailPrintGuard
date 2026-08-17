@@ -22,11 +22,13 @@ from retailprintguard.common.domain import (
     PaymentRecord,
 )
 
-ALGORITHM_VERSION = "rpg-correlation-1.3.0"
+ALGORITHM_VERSION = "rpg-correlation-1.4.0"
 ZERO = Decimal("0.0000")
 HUNDRED = Decimal("100")
 _CROSS_DEPARTMENT_WINDOW_SECONDS = 30
+_KITCHEN_BASELINE_WINDOW_SECONDS = 30
 _SAME_TABLE_CHANGE_WINDOW_SECONDS = 300
+_TABLE_SALE_WINDOW_SECONDS = 300
 
 _SOURCE_TYPES = {
     DocumentType.ORDER,
@@ -52,6 +54,15 @@ _AUXILIARY_TYPES = {
     DocumentType.CONFORMING_COPY,
     DocumentType.REPRINT,
     DocumentType.DEVICE_RESPONSE,
+    DocumentType.REFUND,
+}
+
+_MANAGEMENT_PROGRESSIVE_TYPES = {
+    DocumentType.PRE_BILL,
+    DocumentType.MANAGEMENT_DOCUMENT,
+}
+_COMMERCIAL_PROGRESSIVE_TYPES = {
+    DocumentType.COMMERCIAL_DOCUMENT,
     DocumentType.REFUND,
 }
 
@@ -333,6 +344,54 @@ def _metadata_references(document: NormalizedDocument) -> set[str]:
     return references
 
 
+def _progressive_namespace(document: NormalizedDocument) -> str | None:
+    """Return the namespace of a document's own printed progressive.
+
+    Management and commercial devices maintain distinct counters. Equal text
+    across those namespaces is therefore not a sale identity, while different
+    values are not a conflict. A commercial reference printed by a management
+    copy is handled separately by ``_commercial_reference_pair``.
+    """
+
+    if document.type in _MANAGEMENT_PROGRESSIVE_TYPES:
+        return "MANAGEMENT"
+    if document.type in _COMMERCIAL_PROGRESSIVE_TYPES:
+        return "COMMERCIAL"
+    return None
+
+
+def _printed_counter_suffix(value: str | None) -> str | None:
+    normalized = _normalise(value)
+    if normalized is None:
+        return None
+    match = re.search(r"(?:^|[-/])(?P<counter>\d{1,8})$", normalized)
+    return match.group("counter") if match is not None else None
+
+
+def _is_auxiliary(document: NormalizedDocument) -> bool:
+    if document.type in _AUXILIARY_TYPES:
+        return True
+    return (
+        document.type is DocumentType.MANAGEMENT_DOCUMENT
+        and document.commercial_reference_code is not None
+        and not bool(document.raw_metadata.get("economic_close"))
+        and document.raw_metadata.get("settlement_kind") != "ROOM_CHARGE"
+    )
+
+
+def _is_prebill_source(document: NormalizedDocument) -> bool:
+    if document.type is DocumentType.PRE_BILL:
+        return True
+    return (
+        document.type is DocumentType.MANAGEMENT_DOCUMENT
+        and document.complete
+        and _total(document) is not None
+        and document.commercial_reference_code is None
+        and not bool(document.raw_metadata.get("economic_close"))
+        and document.raw_metadata.get("settlement_kind") != "ROOM_CHARGE"
+    )
+
+
 def _authoritative_payments(
     documents: Iterable[NormalizedDocument],
     fiscal_documents: Iterable[NormalizedDocument],
@@ -388,6 +447,19 @@ def _strong_reference(document: NormalizedDocument) -> str | None:
         ) is not None:
             return normalised
     return None
+
+
+def _shared_strong_sale_identity(documents: Iterable[NormalizedDocument]) -> bool:
+    """Return true only when every document carries the same explicit identity."""
+
+    items = tuple(documents)
+    if len(items) < 2:
+        return False
+    order_codes = tuple(_normalise(item.order_code) for item in items)
+    if all(order_codes) and len(set(order_codes)) == 1:
+        return True
+    references = tuple(_strong_reference(item) for item in items)
+    return all(references) and len(set(references)) == 1
 
 
 def _identity_conflict(left: NormalizedDocument, right: NormalizedDocument) -> str | None:
@@ -473,11 +545,27 @@ class CorrelationEngine:
             criteria.append(_Criterion(name=name, weight=weight, matched=matched, detail=detail))
 
         exact("order_code", 35, left.order_code, right.order_code)
-        exact(
-            "external_document_code",
-            15,
-            left.external_document_code,
-            right.external_document_code,
+        left_namespace = _progressive_namespace(left)
+        right_namespace = _progressive_namespace(right)
+        left_progressive = _normalise(left.external_document_code)
+        right_progressive = _normalise(right.external_document_code)
+        same_progressive = (
+            left_namespace is not None
+            and left_namespace == right_namespace
+            and left_progressive is not None
+            and left_progressive == right_progressive
+        )
+        criteria.append(
+            _Criterion(
+                name="own_progressive_same_namespace",
+                weight=15,
+                matched=same_progressive,
+                detail=(
+                    f"progressivo proprio coincidente nel namespace {left_namespace}"
+                    if same_progressive
+                    else "progressivi propri assenti, differenti o di namespace distinti"
+                ),
+            )
         )
         exact("table_code", 12, left.table_code, right.table_code)
         exact("operator_code", 5, left.operator_code, right.operator_code)
@@ -593,6 +681,177 @@ class CorrelationEngine:
             criteria=tuple(criteria),
         )
 
+    def _commercial_reference_pair(
+        self, left: NormalizedDocument, right: NormalizedDocument
+    ) -> _PairScore | None:
+        """Link a management/copy reference to the fiscal document it names.
+
+        The match is deliberately cross-field: the copy's commercial
+        reference points to the commercial document's own progressive. The
+        copy's own management progressive remains independent evidence.
+        """
+
+        fiscal = left if left.type is DocumentType.COMMERCIAL_DOCUMENT else right
+        referring = right if fiscal is left else left
+        if fiscal.type is not DocumentType.COMMERCIAL_DOCUMENT:
+            return None
+        if referring.type not in {
+            DocumentType.MANAGEMENT_DOCUMENT,
+            DocumentType.CONFORMING_COPY,
+            DocumentType.REPRINT,
+        }:
+            return None
+        reference = _normalise(referring.commercial_reference_code)
+        fiscal_progressive = _normalise(fiscal.external_document_code)
+        exact_reference = reference is not None and reference == fiscal_progressive
+        delta_seconds = abs((_document_time(right) - _document_time(left)).total_seconds())
+        fiscal_suffix = fiscal.external_document_code_suffix
+        reference_suffix = _printed_counter_suffix(reference)
+        observed_suffix = _printed_counter_suffix(fiscal_suffix)
+        suffix_reference = (
+            reference is not None
+            and fiscal_suffix is not None
+            and reference_suffix is not None
+            and reference_suffix == observed_suffix
+            and fiscal.raw_metadata.get("external_document_code_suffix_evidence")
+            == "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+        )
+        if not exact_reference and not suffix_reference:
+            return None
+        if delta_seconds > self.time_window_seconds:
+            return None
+        if suffix_reference:
+            referring_table = _normalise(referring.table_code)
+            fiscal_table = _normalise(fiscal.table_code)
+            shared_items = set(_aggregate_lines(referring.lines)) & set(
+                _aggregate_lines(fiscal.lines)
+            )
+            if (
+                referring_table is None
+                or referring_table != fiscal_table
+                or not shared_items
+                or delta_seconds > _TABLE_SALE_WINDOW_SECONDS
+            ):
+                return None
+            criteria = (
+                _Criterion(
+                    name="commercial_reference_to_observed_fiscal_suffix",
+                    weight=55,
+                    matched=True,
+                    detail=(
+                        "suffisso fiscale osservato nella risposta RCH uguale al suffisso "
+                        "del riferimento commerciale"
+                    ),
+                ),
+                _Criterion(
+                    name="table_code",
+                    weight=15,
+                    matched=True,
+                    detail=f"stesso tavolo {referring_table}",
+                ),
+                _Criterion(
+                    name="line_identity_overlap",
+                    weight=20,
+                    matched=True,
+                    detail=(
+                        f"{len(shared_items)} articolo/i comuni per codice o descrizione "
+                        "normalizzata"
+                    ),
+                ),
+                _Criterion(
+                    name="time_proximity",
+                    weight=10,
+                    matched=True,
+                    detail=f"distanza {int(delta_seconds)} secondi",
+                ),
+            )
+            return _PairScore(
+                left_id=left.id,
+                right_id=right.id,
+                score=100,
+                criteria=criteria,
+            )
+        criteria = (
+            _Criterion(
+                name="commercial_reference_to_fiscal_progressive",
+                weight=85,
+                matched=True,
+                detail="riferimento commerciale uguale al progressivo proprio fiscale",
+            ),
+            _Criterion(
+                name="time_proximity",
+                weight=10,
+                matched=True,
+                detail=f"distanza {int(delta_seconds)} secondi",
+            ),
+        )
+        return _PairScore(
+            left_id=left.id,
+            right_id=right.id,
+            score=95,
+            criteria=criteria,
+        )
+
+    def _table_sale_sequence_pair(
+        self, left: NormalizedDocument, right: NormalizedDocument
+    ) -> _PairScore | None:
+        """Correlate a prebill/management source with its prompt fiscal close.
+
+        A table code alone is never enough. The pair must also share at least
+        one normalized line identity, have a valid source-to-commercial type
+        sequence and fall inside a narrow sale window. Episode-boundary checks
+        run before this method, preventing an earlier close from absorbing a
+        later table reuse.
+        """
+
+        source = left if _is_prebill_source(left) else right
+        fiscal = right if source is left else left
+        if not _is_prebill_source(source):
+            return None
+        if fiscal.type is not DocumentType.COMMERCIAL_DOCUMENT:
+            return None
+        source_table = _normalise(source.table_code)
+        fiscal_table = _normalise(fiscal.table_code)
+        if source_table is None or source_table != fiscal_table:
+            return None
+        delta_seconds = (_document_time(fiscal) - _document_time(source)).total_seconds()
+        if not 0 <= delta_seconds <= _TABLE_SALE_WINDOW_SECONDS:
+            return None
+        shared_items = set(_aggregate_lines(source.lines)) & set(_aggregate_lines(fiscal.lines))
+        if not shared_items:
+            return None
+        criteria = (
+            _Criterion(
+                name="table_sale_sequence",
+                weight=40,
+                matched=True,
+                detail=f"preconto/gestionale seguito da chiusura fiscale sul tavolo {source_table}",
+            ),
+            _Criterion(
+                name="line_identity_overlap",
+                weight=35,
+                matched=True,
+                detail=(
+                    f"{len(shared_items)} articolo/i comuni per codice o descrizione normalizzata"
+                ),
+            ),
+            _Criterion(
+                name="time_proximity",
+                weight=25,
+                matched=True,
+                detail=(
+                    f"chiusura dopo {int(delta_seconds)} secondi; limite episodio "
+                    f"{_TABLE_SALE_WINDOW_SECONDS}"
+                ),
+            ),
+        )
+        return _PairScore(
+            left_id=left.id,
+            right_id=right.id,
+            score=100,
+            criteria=criteria,
+        )
+
     def _cross_department_dispatch_pair(
         self, left: NormalizedDocument, right: NormalizedDocument
     ) -> _PairScore | None:
@@ -637,6 +896,70 @@ class CorrelationEngine:
             left_id=left.id,
             right_id=right.id,
             score=85,
+            criteria=criteria,
+        )
+
+    def _kitchen_management_baseline_pair(
+        self, left: NormalizedDocument, right: NormalizedDocument
+    ) -> _PairScore | None:
+        """Link a kitchen ticket only to its immediately following baseline.
+
+        This narrow rule recovers the observed four-document sale sequence
+        without treating a table number as a durable identity. The management
+        document must be a non-economic pre-fiscal source and the ticket must
+        precede it by no more than thirty seconds with at least one common
+        normalized line.
+        """
+
+        kitchen = left if left.type is DocumentType.KITCHEN_ORDER else right
+        management = right if kitchen is left else left
+        if kitchen.type is not DocumentType.KITCHEN_ORDER:
+            return None
+        if management.type is not DocumentType.MANAGEMENT_DOCUMENT:
+            return None
+        if not _is_prebill_source(management):
+            return None
+        kitchen_table = _normalise(kitchen.table_code)
+        management_table = _normalise(management.table_code)
+        if kitchen_table is None or kitchen_table != management_table:
+            return None
+        shared_items = set(_aggregate_lines(kitchen.lines)) & set(
+            _aggregate_lines(management.lines)
+        )
+        if not shared_items:
+            return None
+        delta_seconds = (_document_time(management) - _document_time(kitchen)).total_seconds()
+        if not 0 <= delta_seconds <= _KITCHEN_BASELINE_WINDOW_SECONDS:
+            return None
+        criteria = (
+            _Criterion(
+                name="kitchen_to_management_baseline",
+                weight=40,
+                matched=True,
+                detail=f"comanda seguita dalla baseline gestionale sul tavolo {kitchen_table}",
+            ),
+            _Criterion(
+                name="line_identity_overlap",
+                weight=35,
+                matched=True,
+                detail=(
+                    f"{len(shared_items)} articolo/i comuni per codice o descrizione normalizzata"
+                ),
+            ),
+            _Criterion(
+                name="time_proximity",
+                weight=25,
+                matched=True,
+                detail=(
+                    f"baseline dopo {int(delta_seconds)} secondi; limite apertura "
+                    f"{_KITCHEN_BASELINE_WINDOW_SECONDS}"
+                ),
+            ),
+        )
+        return _PairScore(
+            left_id=left.id,
+            right_id=right.id,
+            score=100,
             criteria=criteria,
         )
 
@@ -787,7 +1110,10 @@ class CorrelationEngine:
         if (conflict := _identity_conflict(left, right)) is not None:
             return _rejected_pair(left, right, conflict)
         return (
-            self._fiscal_siblings(left, right)
+            self._commercial_reference_pair(left, right)
+            or self._table_sale_sequence_pair(left, right)
+            or self._kitchen_management_baseline_pair(left, right)
+            or self._fiscal_siblings(left, right)
             or self._same_table_change_pair(left, right)
             or self._cross_department_dispatch_pair(left, right)
             or self.score_pair(left, right)
@@ -863,6 +1189,31 @@ class CorrelationEngine:
                 times = [_document_time(item) for item in proposed]
                 if (max(times) - min(times)).total_seconds() > _CROSS_DEPARTMENT_WINDOW_SECONDS:
                     return False
+            opening_sources = [
+                item
+                for item in proposed
+                if item.type is DocumentType.KITCHEN_ORDER
+                or (
+                    item.type is DocumentType.MANAGEMENT_DOCUMENT
+                    and _is_prebill_source(item)
+                )
+            ]
+            if (
+                any(item.type is DocumentType.KITCHEN_ORDER for item in opening_sources)
+                and any(
+                    item.type is DocumentType.MANAGEMENT_DOCUMENT
+                    for item in opening_sources
+                )
+                and (
+                    max(_document_time(item) for item in opening_sources)
+                    - min(_document_time(item) for item in opening_sources)
+                ).total_seconds()
+                > _KITCHEN_BASELINE_WINDOW_SECONDS
+                and not _shared_strong_sale_identity(opening_sources)
+            ):
+                # Prevent a 0s -> 29s -> 58s chain of individually valid
+                # ticket/baseline links from joining repeated table episodes.
+                return False
             first, second = sorted((left_root, right_root), key=str)
             parent[second] = first
             component_members[first] = proposed_ids
@@ -887,7 +1238,7 @@ class CorrelationEngine:
             left_id, right_id = sorted(pair, key=str)
             left, right = by_id[left_id], by_id[right_id]
             delta = abs((_document_time(right) - _document_time(left)).total_seconds())
-            left_aux, right_aux = left.type in _AUXILIARY_TYPES, right.type in _AUXILIARY_TYPES
+            left_aux, right_aux = _is_auxiliary(left), _is_auxiliary(right)
             if left_aux and right_aux:
                 continue
             if left_aux or right_aux:
@@ -986,15 +1337,40 @@ class CorrelationEngine:
                 ),
             )
 
-        prebills = [document for document in documents if document.type is DocumentType.PRE_BILL]
-        prebill = prebills[-1] if prebills else None
-        prebill_total = None if prebill is None else _total(prebill)
         fiscal_documents = [document for document in documents if document.type in _FISCAL_TYPES]
         valid_fiscal_documents = [
             document
             for document in fiscal_documents
             if document.complete and _total(document) is not None
         ]
+        first_fiscal = valid_fiscal_documents[0] if valid_fiscal_documents else None
+        prebill_candidates = [
+            document
+            for document in documents
+            if document.type is DocumentType.PRE_BILL
+            and (first_fiscal is None or _document_time(document) <= _document_time(first_fiscal))
+        ]
+        prebill = prebill_candidates[-1] if prebill_candidates else None
+        if prebill is None and first_fiscal is not None:
+            # Some RCH management streams identify a printed prebill only as
+            # MANAGEMENT_DOCUMENT. Treat it as a comparison baseline solely
+            # when it is complete, non-economic, before the fiscal close and
+            # tied to that close by both table and line identity. A post-fiscal
+            # management copy can therefore never become the baseline.
+            fiscal_table = _normalise(first_fiscal.table_code)
+            fiscal_lines = set(_aggregate_lines(first_fiscal.lines))
+            management_candidates = [
+                document
+                for document in documents
+                if _is_prebill_source(document)
+                and document.type is DocumentType.MANAGEMENT_DOCUMENT
+                and _document_time(document) <= _document_time(first_fiscal)
+                and fiscal_table is not None
+                and _normalise(document.table_code) == fiscal_table
+                and bool(set(_aggregate_lines(document.lines)) & fiscal_lines)
+            ]
+            prebill = management_candidates[-1] if management_candidates else None
+        prebill_total = None if prebill is None else _total(prebill)
         # Refunds are post-close adjustments, not a lower value for the
         # original sale.  They remain immutable timeline evidence but do not
         # reduce the commercial aggregate compared with the prebill.

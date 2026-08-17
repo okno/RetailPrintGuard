@@ -92,11 +92,21 @@ def _document(
     lines: tuple[tuple[str, str], ...],
     payment: str | None = None,
     order_code: str = "ORDER-80",
-    table_code: str = "25-B",
+    table_code: str = "LAB-25",
     operator_code: str = "OP-1",
     complete: bool = True,
+    external_document_code: str | None = None,
+    external_document_code_suffix: str | None = None,
+    commercial_reference_code: str | None = None,
+    auto_external_document_code: bool = True,
+    raw_metadata: dict[str, object] | None = None,
 ) -> UUID:
     session_id, job_id, document_id = uuid4(), uuid4(), uuid4()
+    effective_external_code = (
+        external_document_code
+        if external_document_code is not None or not auto_external_document_code
+        else f"DOC-{source}"
+    )
     session.add(  # type: ignore[attr-defined]
         ProxySession(
             id=session_id,
@@ -166,7 +176,9 @@ def _document(
             source_document_key=f"document-{source}",
             document_type=document_type,
             subtype=document_type,
-            external_document_code=f"DOC-{source}",
+            external_document_code=effective_external_code,
+            external_document_code_suffix=external_document_code_suffix,
+            commercial_reference_code=commercial_reference_code,
             order_code=order_code,
             table_code=table_code,
             operator_code=operator_code,
@@ -182,7 +194,9 @@ def _document(
         version_sequence=1,
         document_type=document_type,
         subtype=document_type,
-        external_document_code=f"DOC-{source}",
+        external_document_code=effective_external_code,
+        external_document_code_suffix=external_document_code_suffix,
+        commercial_reference_code=commercial_reference_code,
         order_code=order_code,
         table_code=table_code,
         operator_code=operator_code,
@@ -196,6 +210,7 @@ def _document(
         source_payload_sha256=raw.sha256,
         source_path=raw.source_path,
         complete=complete,
+        raw_metadata=raw_metadata or {},
         chain_scope=f"document:{job_id}",
         chain_sequence=1,
         previous_record_hash="0" * 64,
@@ -886,6 +901,7 @@ def test_post_prebill_economic_close_persists_the_observed_35_to_5_delta() -> No
             select(DocumentVersion).where(DocumentVersion.document_id == close_id)
         )
         assert close_version is not None
+        close_version.commercial_reference_code = "LAB-COMM-9901-0041"
         close_version.raw_metadata = {
             "economic_close": True,
             "settlement_kind": "ROOM_CHARGE",
@@ -895,9 +911,18 @@ def test_post_prebill_economic_close_persists_the_observed_35_to_5_delta() -> No
     assert correlation.run_once().correlations_inserted == 1
     fraud = FraudWorker(factory)
     first = fraud.run_once()
+    with factory.begin() as session:
+        primary_version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "MODIFICA_POST_PRECONTO")
+        )
+        assert primary_version is not None
+        primary_version.configuration_fingerprint = _sha("simulated-previous-rule-version")
     second = fraud.run_once()
     assert first.alerts_inserted >= 1
     assert second.alerts_inserted == 0
+    assert second.evidence_inserted == 0
 
     with factory() as session:
         alert = session.scalar(
@@ -919,6 +944,194 @@ def test_post_prebill_economic_close_persists_the_observed_35_to_5_delta() -> No
         )
         assert evidence is not None
         assert Decimal(evidence.evidence["observed_final_total"]) == Decimal("5.00")
+        references = session.scalars(
+            select(FraudAlertEvidence)
+            .where(
+                FraudAlertEvidence.fraud_alert_id == alert.id,
+                FraudAlertEvidence.evidence_type == "CORRELATED_DOCUMENT_REFERENCE",
+            )
+            .order_by(FraudAlertEvidence.sequence)
+        ).all()
+        assert len(references) == 2
+        assert {item.evidence["role"] for item in references} == {
+            "PRE_BILL",
+            "NON_FISCAL_CLOSE",
+        }
+        assert {item.evidence["external_document_code"] for item in references} == {
+            "DOC-synthetic-prebill-35",
+            "DOC-synthetic-room-close-5",
+        }
+        assert all("commercial_reference_code" in item.evidence for item in references)
+        management_reference = next(
+            item for item in references if item.evidence["role"] == "NON_FISCAL_CLOSE"
+        )
+        assert management_reference.evidence["commercial_reference_code"] == "LAB-COMM-9901-0041"
+        assert all(item.document_id is not None for item in references)
+        assert all(item.raw_payload_id is not None for item in references)
+        assert all(item.artifact_path for item in references)
+        assert all(item.artifact_sha256 for item in references)
+    engine.dispose()
+
+
+def test_cash_price_reduction_persists_one_alert_loss_and_all_document_references() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        pos_id = _device(session, "pos_lab", "pos", 9100)
+        rch_id = _device(session, "rch_lab", "rch", 23)
+        parser = ParserVersion(
+            name="test",
+            version="1.0.0",
+            build_sha256=_sha("lab-price-reduction-parser"),
+            protocol="test",
+        )
+        session.add(parser)
+        session.flush()
+        prebill_id = _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="lab-prebill-three-euro",
+            document_type="MANAGEMENT_DOCUMENT",
+            total="3.00",
+            when=NOW,
+            lines=(("Synthetic beverage", "3.00"),),
+            order_code="LAB-ORDER-25B",
+            table_code="LAB-25B",
+            external_document_code=None,
+            auto_external_document_code=False,
+        )
+        fiscal_id = _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="lab-commercial-ten-cent",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="0.10",
+            when=NOW + timedelta(minutes=2),
+            lines=(("Synthetic beverage", "0.10"),),
+            payment="0.10",
+            order_code="LAB-ORDER-25B",
+            table_code="LAB-25B",
+            external_document_code=None,
+            external_document_code_suffix="0041",
+            auto_external_document_code=False,
+            raw_metadata={
+                "external_document_code_suffix_evidence": (
+                    "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+                )
+            },
+        )
+        management_id = _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="lab-management-copy-ten-cent",
+            document_type="MANAGEMENT_DOCUMENT",
+            total="0.10",
+            when=NOW + timedelta(minutes=3),
+            lines=(("Synthetic beverage", "0.10"),),
+            order_code="LAB-ORDER-25B",
+            table_code="LAB-25B",
+            external_document_code=None,
+            commercial_reference_code="LAB-FSC-0041",
+            auto_external_document_code=False,
+        )
+
+    correlation = CorrelationWorker(factory)
+    assert correlation.run_once().correlations_inserted == 1
+    fraud = FraudWorker(factory)
+    first = fraud.run_once()
+    second = fraud.run_once()
+    assert first.alerts_inserted == 1
+    assert second.alerts_inserted == 0
+    assert second.evidence_inserted == 0
+
+    with factory() as session:
+        alerts = session.execute(
+            select(FraudAlert, FraudRule.code)
+            .join(FraudRuleVersion, FraudRuleVersion.id == FraudAlert.fraud_rule_version_id)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+        ).all()
+        assert len(alerts) == 1
+        alert, rule_code = alerts[0]
+        assert rule_code == "MODIFICA_POST_PRECONTO"
+        assert alert.status == "OPEN"
+        assert alert.severity == "HIGH"
+        assert alert.original_amount == Decimal("3.0000")
+        assert alert.final_amount == Decimal("0.1000")
+        assert alert.difference_amount == Decimal("2.9000")
+        assert alert.difference_percent == Decimal("96.6667")
+
+        references = session.scalars(
+            select(FraudAlertEvidence)
+            .where(
+                FraudAlertEvidence.fraud_alert_id == alert.id,
+                FraudAlertEvidence.evidence_type == "CORRELATED_DOCUMENT_REFERENCE",
+            )
+            .order_by(FraudAlertEvidence.sequence)
+        ).all()
+        assert {item.document_id for item in references} == {
+            prebill_id,
+            fiscal_id,
+            management_id,
+        }
+        by_role = {item.evidence["role"]: item.evidence for item in references}
+        assert by_role["MANAGEMENT_PREBILL"]["external_document_code"] is None
+        assert by_role["COMMERCIAL_CLOSE"]["external_document_code"] is None
+        assert by_role["COMMERCIAL_CLOSE"]["external_document_code_suffix"] == "0041"
+        assert by_role["MANAGEMENT_COPY"]["external_document_code"] is None
+        assert (
+            by_role["MANAGEMENT_COPY"]["commercial_reference_code"]
+            == "LAB-FSC-0041"
+        )
+        assert all(item.artifact_path and item.artifact_sha256 for item in references)
+
+    # Historical 1.1 workers treated the printed management copy as a new POS
+    # action.  Verify that the upgrade closes that auxiliary false positive
+    # without deleting its evidence.
+    with factory.begin() as session:
+        late_version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "LATE_ORDER_MODIFICATION")
+        )
+        correlation_row = session.scalar(select(DocumentCorrelation))
+        late_event = session.scalar(
+            select(OrderEvent).where(OrderEvent.source_document_id == management_id)
+        )
+        assert late_version is not None and correlation_row is not None and late_event is not None
+        late_version.implementation_version = "rpg-fraud-1.1.0"
+        old_late_alert = FraudAlert(
+            fraud_rule_version_id=late_version.id,
+            correlation_id=correlation_row.id,
+            transaction_id=correlation_row.transaction_id,
+            finding_key=_sha("old-management-output-late-alert"),
+            severity="HIGH",
+            score=75,
+            status="OPEN",
+            description="Output gestionale interpretato come modifica tardiva",
+            explanation="Fixture sintetica",
+            confidence=90,
+            opened_at=NOW + timedelta(minutes=3),
+        )
+        session.add(old_late_alert)
+        session.flush()
+        session.add(
+            FraudAlertEvidence(
+                fraud_alert_id=old_late_alert.id,
+                sequence=1,
+                document_id=management_id,
+                evidence_type="late_order_event",
+                summary="Evento sintetico derivato dall'output gestionale",
+                evidence={
+                    "kind": "late_order_event",
+                    "event_id": str(late_event.id),
+                },
+            )
+        )
+        session.flush()
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 1
+        assert old_late_alert.status == "FALSE_POSITIVE"
     engine.dispose()
 
 
@@ -1229,6 +1442,106 @@ def test_old_operator_self_amplification_alert_is_reclassified_idempotently() ->
         )
         assert history is not None
         assert history.event_type == "ALERT_AUTO_FALSE_POSITIVE"
+    engine.dispose()
+
+
+def test_old_auxiliary_amount_alert_is_reclassified_under_canonical_loss_rule() -> None:
+    engine, factory = _database()
+    FraudWorker(factory).run_once()
+    with factory.begin() as session:
+        version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "PREBILL_FISCAL_AMOUNT_DROP")
+        )
+        assert version is not None
+        version.implementation_version = "rpg-fraud-1.1.0"
+        alert = FraudAlert(
+            fraud_rule_version_id=version.id,
+            transaction_id=uuid4(),
+            finding_key=_sha("old-auxiliary-amount-alert"),
+            severity="HIGH",
+            score=90,
+            status="OPEN",
+            description="Sintomo economico ausiliario",
+            explanation="Fixture sintetica",
+            original_amount=Decimal("3.00"),
+            final_amount=Decimal("0.10"),
+            difference_amount=Decimal("2.90"),
+            confidence=90,
+            opened_at=NOW,
+        )
+        session.add(alert)
+        session.flush()
+        alert_id = alert.id
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 1
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 0
+
+    with factory() as session:
+        alert = session.get(FraudAlert, alert_id)
+        assert alert is not None and alert.status == "FALSE_POSITIVE"
+        evidence = session.scalar(
+            select(FraudAlertEvidence).where(
+                FraudAlertEvidence.fraud_alert_id == alert_id,
+                FraudAlertEvidence.evidence_type == "ENGINE_FALSE_POSITIVE",
+            )
+        )
+        assert evidence is not None
+        assert evidence.evidence["defect"] == "auxiliary_post_prebill_alert_noise"
+        assert evidence.evidence["canonical_rule_code"] == "MODIFICA_POST_PRECONTO"
+    engine.dispose()
+
+
+def test_old_zero_value_footer_alert_is_reclassified_but_sale_item_is_preserved() -> None:
+    engine, factory = _database()
+    FraudWorker(factory).run_once()
+    with factory.begin() as session:
+        version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "NEGATIVE_OR_ZERO_VALUE_ITEM")
+        )
+        assert version is not None
+        version.implementation_version = "rpg-fraud-1.1.0"
+        alert_ids: dict[str, UUID] = {}
+        for label, description in (("technical", "RESTO"), ("sale", "PROMO ITEM")):
+            alert = FraudAlert(
+                fraud_rule_version_id=version.id,
+                transaction_id=uuid4(),
+                finding_key=_sha(f"old-zero-{label}-alert"),
+                severity="HIGH",
+                score=70,
+                status="OPEN",
+                description="Riga a valore zero",
+                explanation="Fixture sintetica",
+                confidence=90,
+                opened_at=NOW,
+            )
+            session.add(alert)
+            session.flush()
+            alert_ids[label] = alert.id
+            session.add(
+                FraudAlertEvidence(
+                    fraud_alert_id=alert.id,
+                    sequence=1,
+                    evidence_type="non_positive_item",
+                    summary="Riga sintetica",
+                    evidence={
+                        "kind": "non_positive_item",
+                        "description": description,
+                        "unit_price": "0.00",
+                        "line_total": "0.00",
+                    },
+                )
+            )
+        session.flush()
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 1
+
+    with factory() as session:
+        technical = session.get(FraudAlert, alert_ids["technical"])
+        sale = session.get(FraudAlert, alert_ids["sale"])
+        assert technical is not None and technical.status == "FALSE_POSITIVE"
+        assert sale is not None and sale.status == "OPEN"
     engine.dispose()
 
 
@@ -1552,7 +1865,7 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         assert loaded[0].value.gross_total == Decimal("100.0000")
         assert loaded[0].value.type.value == "PRE_BILL"
         assert loaded[0].value.order_code is None
-        assert loaded[0].value.table_code == "25-B"
+        assert loaded[0].value.table_code == "LAB-25"
         assert loaded[0].value.operator_code == "OP-1"
     engine.dispose()
 

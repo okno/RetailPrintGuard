@@ -151,13 +151,19 @@ append-only.
 
 ## Correlazione
 
-L'algoritmo correttivo `rpg-correlation-1.3.0` usa, quando disponibili, codice
+L'algoritmo correttivo `rpg-correlation-1.4.0` usa, quando disponibili, codice
 ordine, codice documento, riferimenti embedded, tavolo, operatore, terminale,
 data operativa, prossimità temporale, totale, similarità righe,
 sequenza e dispositivo. I gruppi sono deterministici e il punteggio è limitato
 a 100. La sessione TCP resta provenienza tecnica a peso zero e non rappresenta
 l'identità della vendita. Conflitti espliciti di ordine/tavolo/riferimento e una
 chiusura economica precedente costituiscono confini rigidi dell'episodio.
+
+La sequenza comanda → baseline gestionale → commerciale → copia è ammessa solo
+con tavolo, righe e ordine temporale concordanti entro finestre bounded. I
+progressivi propri gestionali e commerciali appartengono a namespace distinti;
+un suffisso fiscale osservato può essere risolto tramite un riferimento
+commerciale completo soltanto in una correlazione automatica forte e univoca.
 
 I documenti fiscali multipli vengono aggregati prima di calcolare la differenza
 dal preconto. Un preconto da 100,00 € seguito da due documenti da 50,00 € può

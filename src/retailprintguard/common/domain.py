@@ -121,6 +121,14 @@ class NormalizedDocument(BaseModel):
     type: DocumentType
     subtype: str
     external_document_code: str | None = None
+    # Some RCH status responses expose only the final counter.  It must never
+    # be promoted to a full document number without separately observed proof.
+    external_document_code_suffix: str | None = None
+    # A conforming/management print can have its own progressive while
+    # referring to a distinct commercial document.  Keeping the two values
+    # separate prevents the reference from replacing the immutable identity
+    # of the document being parsed.
+    commercial_reference_code: str | None = None
     order_code: str | None = None
     table_code: str | None = None
     operator_code: str | None = None

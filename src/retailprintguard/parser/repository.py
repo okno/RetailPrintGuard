@@ -242,6 +242,10 @@ class SqlAlchemyParserRepository:
                             document_type=parsed.type.value,
                             subtype=parsed.subtype,
                             external_document_code=parsed.external_document_code,
+                            external_document_code_suffix=(
+                                parsed.external_document_code_suffix
+                            ),
+                            commercial_reference_code=parsed.commercial_reference_code,
                             order_code=parsed.order_code,
                             table_code=parsed.table_code,
                             operator_code=parsed.operator_code,
@@ -330,6 +334,10 @@ class SqlAlchemyParserRepository:
                         document_type=parsed.type.value,
                         subtype=parsed.subtype,
                         external_document_code=parsed.external_document_code,
+                        external_document_code_suffix=(
+                            parsed.external_document_code_suffix
+                        ),
+                        commercial_reference_code=parsed.commercial_reference_code,
                         order_code=parsed.order_code,
                         table_code=parsed.table_code,
                         operator_code=parsed.operator_code,
@@ -365,6 +373,10 @@ class SqlAlchemyParserRepository:
                     document.document_type = parsed.type.value
                     document.subtype = parsed.subtype
                     document.external_document_code = parsed.external_document_code
+                    document.external_document_code_suffix = (
+                        parsed.external_document_code_suffix
+                    )
+                    document.commercial_reference_code = parsed.commercial_reference_code
                     document.order_code = parsed.order_code
                     document.table_code = parsed.table_code
                     document.operator_code = parsed.operator_code

@@ -46,10 +46,18 @@ from retailprintguard.fraud.engine import (
     WhitelistEntry,
     WhitelistScope,
     finding_fingerprint,
+    technical_non_sale_line,
 )
 from retailprintguard.fraud.versioning import rule_configuration_fingerprint
 
-FRAUD_ENGINE_VERSION = "rpg-fraud-1.1.0"
+FRAUD_ENGINE_VERSION = "rpg-fraud-1.2.0"
+_AUXILIARY_ECONOMIC_RULE_CODES = (
+    "PREBILL_FISCAL_AMOUNT_DROP",
+    "ITEM_REMOVED_AFTER_PREBILL",
+    "PRICE_REDUCED_AFTER_PREBILL",
+    "EXTREME_PRICE_CHANGE",
+    "SAME_REFERENCE_DIFFERENT_AMOUNT",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +278,13 @@ class FraudWorker:
 
     @staticmethod
     def _reclassify_known_false_positives(session: Session, now: datetime) -> int:
+        primary_rule_enabled = bool(
+            session.scalar(
+                select(FraudRule.enabled).where(
+                    FraudRule.code == "MODIFICA_POST_PRECONTO"
+                )
+            )
+        )
         candidates = session.execute(
             select(FraudAlert, FraudRule.code, FraudRuleVersion.implementation_version)
             .join(
@@ -279,8 +294,18 @@ class FraudWorker:
             .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
             .where(
                 FraudAlert.status == "OPEN",
-                FraudRule.code.in_(("DUPLICATE_DOCUMENT", "UNUSUAL_OPERATOR_PATTERN")),
-                FraudRuleVersion.implementation_version == "rpg-fraud-1.0.0",
+                FraudRule.code.in_(
+                    (
+                        "DUPLICATE_DOCUMENT",
+                        "UNUSUAL_OPERATOR_PATTERN",
+                        "LATE_ORDER_MODIFICATION",
+                        "NEGATIVE_OR_ZERO_VALUE_ITEM",
+                        *_AUXILIARY_ECONOMIC_RULE_CODES,
+                    )
+                ),
+                FraudRuleVersion.implementation_version.in_(
+                    ("rpg-fraud-1.0.0", "rpg-fraud-1.1.0")
+                ),
             )
             .order_by(FraudAlert.opened_at, FraudAlert.id)
             .with_for_update()
@@ -294,14 +319,95 @@ class FraudWorker:
                 "previous_implementation_version": implementation_version,
                 "current_implementation_version": FRAUD_ENGINE_VERSION,
             }
-            if rule_code == "UNUSUAL_OPERATOR_PATTERN":
+            if (
+                rule_code == "UNUSUAL_OPERATOR_PATTERN"
+                and implementation_version == "rpg-fraud-1.0.0"
+            ):
                 reason = (
                     "La versione precedente includeva alert non operativi e la stessa regola "
                     "nel tasso operatore, producendo auto-amplificazione. Il risultato viene "
                     "ricalcolato dalla versione corretta."
                 )
                 diagnostic["defect"] = "operator_rate_self_amplification"
-            elif alert.correlation_id is not None:
+            elif (
+                rule_code in _AUXILIARY_ECONOMIC_RULE_CODES
+                and primary_rule_enabled
+                and alert.original_amount is not None
+            ):
+                reason = (
+                    "La regola era un sintomo ausiliario della riduzione post-preconto. "
+                    "Nel profilo operativo corrente la perdita viene rappresentata una sola "
+                    "volta da MODIFICA_POST_PRECONTO, rispettandone le soglie di materialita'."
+                )
+                diagnostic["defect"] = "auxiliary_post_prebill_alert_noise"
+                diagnostic["canonical_rule_code"] = "MODIFICA_POST_PRECONTO"
+            elif rule_code == "LATE_ORDER_MODIFICATION":
+                evidence_rows = session.scalars(
+                    select(FraudAlertEvidence).where(
+                        FraudAlertEvidence.fraud_alert_id == alert.id,
+                        FraudAlertEvidence.evidence_type == "late_order_event",
+                    )
+                ).all()
+                event_ids: set[UUID] = set()
+                for evidence in evidence_rows:
+                    try:
+                        event_ids.add(UUID(str((evidence.evidence or {}).get("event_id"))))
+                    except (TypeError, ValueError):
+                        continue
+                source_types = set(
+                    session.scalars(
+                        select(Document.document_type)
+                        .join(OrderEvent, OrderEvent.source_document_id == Document.id)
+                        .where(OrderEvent.id.in_(event_ids))
+                    )
+                )
+                output_types = {
+                    "COMMERCIAL_DOCUMENT",
+                    "MANAGEMENT_DOCUMENT",
+                    "CONFORMING_COPY",
+                    "REPRINT",
+                    "DEVICE_RESPONSE",
+                }
+                if event_ids and source_types and source_types <= output_types:
+                    reason = (
+                        "Gli eventi provenivano esclusivamente da documenti di output o copie "
+                        "stampate dopo la chiusura, non da una modifica POS dell'ordine."
+                    )
+                    diagnostic["defect"] = "printed_output_treated_as_late_action"
+                    diagnostic["source_document_types"] = sorted(source_types)
+            elif rule_code == "NEGATIVE_OR_ZERO_VALUE_ITEM":
+                evidence_rows = session.scalars(
+                    select(FraudAlertEvidence).where(
+                        FraudAlertEvidence.fraud_alert_id == alert.id,
+                        FraudAlertEvidence.evidence_type == "non_positive_item",
+                    )
+                ).all()
+                observed_values: list[Decimal] = []
+                descriptions: list[str] = []
+                for evidence in evidence_rows:
+                    description = (evidence.evidence or {}).get("description")
+                    if description is not None:
+                        descriptions.append(str(description))
+                    for key in ("unit_price", "line_total"):
+                        value = (evidence.evidence or {}).get(key)
+                        if value is not None:
+                            try:
+                                observed_values.append(Decimal(str(value)))
+                            except (ArithmeticError, TypeError, ValueError):
+                                continue
+                if (
+                    observed_values
+                    and all(value >= 0 for value in observed_values)
+                    and descriptions
+                    and all(technical_non_sale_line(item) for item in descriptions)
+                ):
+                    reason = (
+                        "L'alert conteneva esclusivamente righe a valore zero, tipiche di "
+                        "footer/proiezioni tecniche riconosciute. Le riduzioni economiche "
+                        "restano coperte dal confronto preconto-chiusura."
+                    )
+                    diagnostic["defect"] = "zero_value_technical_line_noise"
+            elif rule_code == "DUPLICATE_DOCUMENT" and alert.correlation_id is not None:
                 member_ids = set(
                     session.scalars(
                         select(DocumentCorrelationMember.document_id).where(
@@ -322,7 +428,40 @@ class FraudWorker:
                             involved_ids.add(UUID(str(candidate_id)))
                         except (TypeError, ValueError):
                             continue
-                if involved_ids and not (member_ids & involved_ids):
+                involved_rows = session.execute(
+                    select(
+                        Document.id,
+                        Document.document_type,
+                        Document.commercial_reference_code,
+                    ).where(Document.id.in_(involved_ids))
+                ).all()
+                benign_output_types = {
+                    "REPRINT",
+                    "CONFORMING_COPY",
+                    "DEVICE_RESPONSE",
+                }
+                only_output_artifacts = (
+                    involved_ids
+                    and len(involved_rows) == len(involved_ids)
+                    and all(
+                        document_type in benign_output_types
+                        or (
+                            document_type == "MANAGEMENT_DOCUMENT"
+                            and commercial_reference_code is not None
+                        )
+                        for _, document_type, commercial_reference_code in involved_rows
+                    )
+                )
+                if only_output_artifacts:
+                    reason = (
+                        "Il gruppo era composto esclusivamente da risposte dispositivo o "
+                        "copie/proiezioni di output, non da documenti di vendita duplicati."
+                    )
+                    diagnostic["defect"] = "output_artifact_duplicate_noise"
+                    diagnostic["source_document_types"] = sorted(
+                        {row.document_type for row in involved_rows}
+                    )
+                elif involved_ids and not (member_ids & involved_ids):
                     reason = (
                         "La precedente valutazione globale ha assegnato alla transazione un "
                         "gruppo duplicato composto esclusivamente da documenti esterni."
@@ -743,6 +882,104 @@ class FraudWorker:
         return counts, anomalous, void_counts
 
     @staticmethod
+    def _append_primary_document_reference_evidence(
+        session: Session,
+        alert: FraudAlert,
+        finding: Any,
+        loaded_by_id: dict[UUID, LoadedDocument],
+    ) -> int:
+        """Append one idempotent, file-backed reference record per involved document.
+
+        The rule finding fingerprint deliberately remains based on the economic
+        outcome.  Progressive codes are stored as append-only evidence instead,
+        so enriching their projection cannot create a duplicate operational
+        alert for the same transaction.
+        """
+
+        if finding.rule_code != "MODIFICA_POST_PRECONTO":
+            return 0
+        existing_document_ids = set(
+            session.scalars(
+                select(FraudAlertEvidence.document_id).where(
+                    FraudAlertEvidence.fraud_alert_id == alert.id,
+                    FraudAlertEvidence.evidence_type == "CORRELATED_DOCUMENT_REFERENCE",
+                    FraudAlertEvidence.document_id.is_not(None),
+                )
+            )
+        )
+        sequence = (
+            session.scalar(
+                select(func.max(FraudAlertEvidence.sequence)).where(
+                    FraudAlertEvidence.fraud_alert_id == alert.id
+                )
+            )
+            or 0
+        )
+        inserted = 0
+        for document_id in finding.document_ids:
+            if document_id in existing_document_ids:
+                continue
+            loaded = loaded_by_id.get(document_id)
+            if loaded is None:
+                continue
+            document = loaded.value
+            raw = (
+                session.get(RawPayload, loaded.raw_payload_id)
+                if loaded.raw_payload_id is not None
+                else None
+            )
+            total = document.gross_total if document.gross_total is not None else document.net_total
+            document_type = document.type.value
+            if document_type == "PRE_BILL":
+                role = "PRE_BILL"
+            elif document_type == "COMMERCIAL_DOCUMENT":
+                role = "COMMERCIAL_CLOSE"
+            elif document_type == "MANAGEMENT_DOCUMENT":
+                if bool(document.raw_metadata.get("economic_close")) or document.raw_metadata.get(
+                    "settlement_kind"
+                ) == "ROOM_CHARGE":
+                    role = "NON_FISCAL_CLOSE"
+                elif getattr(document, "commercial_reference_code", None) is not None:
+                    role = "MANAGEMENT_COPY"
+                else:
+                    role = "MANAGEMENT_PREBILL"
+            else:
+                role = "SUPPORTING_DOCUMENT"
+            occurred_at = document.document_timestamp or document.captured_at
+            sequence += 1
+            inserted += 1
+            session.add(
+                FraudAlertEvidence(
+                    fraud_alert_id=alert.id,
+                    sequence=sequence,
+                    document_id=document.id,
+                    print_job_id=loaded.database_job_id,
+                    raw_payload_id=None if raw is None else raw.id,
+                    evidence_type="CORRELATED_DOCUMENT_REFERENCE",
+                    summary="Documento correlato alla riduzione post-preconto",
+                    evidence={
+                        "kind": "correlated_document_reference",
+                        "role": role,
+                        "document_id": str(document.id),
+                        "document_type": document_type,
+                        "external_document_code": document.external_document_code,
+                        "external_document_code_suffix": getattr(
+                            document, "external_document_code_suffix", None
+                        ),
+                        "commercial_reference_code": getattr(
+                            document, "commercial_reference_code", None
+                        ),
+                        "table_code": document.table_code,
+                        "total": None if total is None else str(total),
+                        "occurred_at": occurred_at.isoformat(),
+                    },
+                    artifact_path=None if raw is None else raw.source_path,
+                    artifact_sha256=None if raw is None else raw.sha256,
+                )
+            )
+        return inserted
+
+    @staticmethod
     def _persist_finding(
         session: Session,
         correlation: DocumentCorrelation,
@@ -766,13 +1003,49 @@ class FraudWorker:
             )
         ).hexdigest()
         existing = session.scalar(
-            select(FraudAlert).where(
-                FraudAlert.fraud_rule_version_id == rule_version.id,
+            select(FraudAlert)
+            .join(
+                FraudRuleVersion,
+                FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
+            )
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(
+                FraudRule.code == finding.rule_code,
                 FraudAlert.transaction_id == finding.transaction_id,
                 FraudAlert.finding_key == finding_key,
             )
+            .order_by(
+                FraudAlert.is_canonical.desc(),
+                FraudAlert.opened_at.desc(),
+                FraudAlert.id.desc(),
+            )
+            .limit(1)
         )
+        if existing is None and finding.rule_code == "MODIFICA_POST_PRECONTO":
+            # Rule-version numbers are part of the immutable finding fingerprint.
+            # Reusing the canonical incident for the same immutable correlation
+            # prevents an engine upgrade from duplicating the economic loss while
+            # still allowing a replacement correlation to open a new finding.
+            existing = session.scalar(
+                select(FraudAlert)
+                .join(
+                    FraudRuleVersion,
+                    FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
+                )
+                .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+                .where(
+                    FraudRule.code == finding.rule_code,
+                    FraudAlert.transaction_id == finding.transaction_id,
+                    FraudAlert.correlation_id == correlation.id,
+                    FraudAlert.is_canonical.is_(True),
+                )
+                .order_by(FraudAlert.opened_at.desc(), FraudAlert.id.desc())
+                .limit(1)
+            )
         if existing is not None:
+            reference_evidence_inserted = FraudWorker._append_primary_document_reference_evidence(
+                session, existing, finding, loaded_by_id
+            )
             # A job re-inclusion only clears the analysis exclusion and rewinds the
             # correlation worker.  Reopen a previously justified alert solely when
             # this exact finding has just been reproduced by the current engines and
@@ -857,8 +1130,8 @@ class FraudWorker:
                         record_hash=chained_hash(history_payload, latest.record_hash),
                     )
                 )
-                return False, 1
-            return False, 0
+                return False, 1 + reference_evidence_inserted
+            return False, reference_evidence_inserted
         documents = [
             loaded_by_id[document_id].value
             for document_id in finding.document_ids
@@ -981,6 +1254,9 @@ class FraudWorker:
                     artifact_sha256=None if raw is None else raw.sha256,
                 )
             )
+        reference_evidence_inserted = FraudWorker._append_primary_document_reference_evidence(
+            session, alert, finding, loaded_by_id
+        )
         history_payload = {
             "alert_id": str(alert.id),
             "sequence": 1,
@@ -1005,7 +1281,7 @@ class FraudWorker:
                 record_hash=chained_hash(history_payload, ZERO_HASH),
             )
         )
-        return True, len(serialized_evidence)
+        return True, len(serialized_evidence) + reference_evidence_inserted
 
 
 __all__ = ["FRAUD_ENGINE_VERSION", "FraudRunReport", "FraudWorker"]

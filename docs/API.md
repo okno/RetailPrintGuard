@@ -62,7 +62,7 @@ tramite il repository.
 | `GET /sessions` | `limit`, `offset`, `device_id` | sessioni TCP |
 | `GET /jobs` | `limit`, `offset`, `device_id`, `status`, `incomplete`, `review_state`, `from`, `to` | job cattura/import/revisione |
 | `POST /jobs/{id}/review` | azione, motivazione, password di conferma | proiezione job aggiornata e auditata |
-| `GET /documents` | `limit`, `offset`, `type`, `device_id`, `order_code`, `from`, `to` | documenti |
+| `GET /documents` | `limit`, `offset`, `type`, `device_id`, `order_code`, progressivo/suffisso/riferimento, `from`, `to` | documenti |
 | `GET /documents/{id}` | UUID | dettaglio e righe |
 | `GET /documents/{id}/raw` | UUID | `application/octet-stream` auditato |
 | `GET /documents/{id}/txt` | UUID | testo normalizzato derivato |
@@ -105,6 +105,14 @@ viene chiamato direttamente senza filtri. Il drill-down economico usa
 `operational_economic_only=true`, `reduction_only=true` e una differenza minima
 positiva: include soltanto episodi chiusi con un alert economico operativo,
 preservando `from` e `to` della card selezionata.
+
+I documenti distinguono `external_document_code` (progressivo proprio completo
+osservato), `external_document_code_suffix` (solo suffisso RCH),
+`commercial_reference_code` (riferimento a un Documento Commerciale) e
+`progressive_observation_status`. Quando una correlazione automatica forte
+risolve in modo univoco il codice commerciale completo, l'API espone
+`resolved_external_document_code` e la relativa provenienza senza modificare
+il documento o la versione parser.
 
 ## Revisione dei job incompleti
 

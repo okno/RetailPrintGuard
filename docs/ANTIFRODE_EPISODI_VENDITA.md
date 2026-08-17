@@ -14,7 +14,7 @@ costituiscono da sole prova di frode.
 
 ## Algoritmo dell'episodio
 
-La correlazione `rpg-correlation-1.3.0` ordina deterministicamente i documenti
+La correlazione `rpg-correlation-1.4.0` ordina deterministicamente i documenti
 della versione parser attiva e considera soltanto job non esclusi dall'analisi.
 La selezione dei candidati è bounded per chiavi operative e finestra temporale;
 non assume che una connessione TCP corrisponda a una singola vendita.
@@ -42,6 +42,14 @@ Il collegamento procede con queste regole:
    preconto;
 8. una nuova interpretazione non sovrascrive la precedente: la correlazione
    sostitutiva è append-only e la precedente diventa `SUPERSEDED`.
+
+Per la sequenza comanda → baseline gestionale → Documento Commerciale → copia
+gestionale si applicano criteri più stretti: comanda e baseline devono avere
+stesso tavolo e almeno una riga comune entro 30 secondi; baseline e chiusura
+devono avere stesso tavolo e una riga comune entro 300 secondi. Il riferimento
+commerciale completo di una copia può collegarsi al progressivo fiscale; se la
+RCH espone soltanto il suffisso, sono richiesti anche provenienza status-sequence,
+tavolo, riga e prossimità. Un suffisso isolato non è mai sufficiente.
 
 Ogni gruppo conserva score, criteri soddisfatti e mancanti, spiegazione,
 versione algoritmo, membri e fingerprint dell'input. Gli stessi input ordinati
@@ -103,6 +111,27 @@ da verificare e conteggi archiviati come falsi positivi/giustificati.
 La webapp apre questo quadro sugli ultimi sette giorni. Le card “episodi con
 riduzione” e “differenza economica” portano alla stessa lista filtrata per
 periodo, alert economico operativo, chiusura osservata e differenza positiva.
+Sotto le card mostra inoltre gli episodi del periodo con baseline, totale
+finale, ammanco potenziale, tavolo, confidenza e collegamenti ai documenti.
+
+## Progressivi e riferimenti documentali
+
+Il modello non confonde identità appartenenti a contatori diversi:
+
+- `external_document_code` è il progressivo proprio completo solo quando è
+  realmente presente nel flusso catturato;
+- `external_document_code_suffix` è esclusivamente il suffisso osservato nella
+  risposta di stato RCH e non viene promosso da solo a codice completo;
+- `commercial_reference_code` è il numero commerciale stampato nella copia
+  gestionale e resta distinto dal progressivo proprio di quella copia;
+- `resolved_external_document_code` è una proiezione read-only ammessa soltanto
+  quando una correlazione automatica forte e univoca collega suffisso fiscale e
+  riferimento gestionale. La UI e il PDF ne dichiarano la provenienza.
+
+I progressivi propri dei Documenti Gestionali possono essere generati
+internamente dalla RCH dopo l'invio dei comandi e quindi non attraversare il
+flusso osservato. In quel caso l'applicazione mostra esplicitamente
+“non osservato nel flusso” invece di inventare il numero visto sulla carta.
 
 ## Prezzi derivati per le comande
 
@@ -143,6 +172,20 @@ Preconto 100,00 EUR, rimozione documentata di una riga e chiusura completa a
 - un finding `MODIFICA_POST_PRECONTO` con importi, percentuale, diff righe e
   riferimenti alle evidenze;
 - nessun raddoppio dell'importo dovuto a regole secondarie.
+
+### Riduzione di prezzo dopo la consegna del preconto
+
+Baseline gestionale 3,00 EUR e Documento Commerciale completo 0,10 EUR per lo
+stesso tavolo e articolo, seguiti dalla copia gestionale:
+
+- un episodio composto dai documenti compatibili;
+- ammanco potenziale 2,90 EUR e riduzione 96,6667%;
+- un solo alert rosso `MODIFICA_POST_PRECONTO` con baseline, chiusura, diff di
+  prezzo e riferimenti ai file delle evidenze;
+- nessun duplicato dovuto alla risposta RCH o alla copia gestionale.
+
+L'alert dimostra la discrepanza osservata, non da solo l'identità dell'autore o
+l'intenzionalità: queste conclusioni richiedono revisione umana e altre prove.
 
 ### Conto diviso legittimo
 

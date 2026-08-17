@@ -20,7 +20,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.1.0"
+PARSER_VERSION = "1.2.0"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -35,11 +35,23 @@ _ITEM_RE = re.compile(
 _TOTAL_RE = re.compile(r"^=T(?P<code>[^/]+)/\$(?P<amount>[+-]?\d+)$")
 _COMMERCIAL_TEXT_RE = re.compile(r'^="/\?A/\((?P<text>.*)\)(?:/\*(?P<style>\d+))?$')
 _MANAGEMENT_TEXT_RE = re.compile(r'^="/\((?P<text>.*)\)(?:/\*(?P<style>\d+))?$')
-_COUNTER_RE = re.compile(r"^s\d{6}RE(?P<counter>\d{4})$")
+_COUNTER_RE = re.compile(r"^s(?P<status_digits>\d{6})RE(?P<counter>\d{4})$")
 _ORDER_RE = re.compile(r"^\s*(?:ORDINE|ORDER)\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
 _TABLE_RE = re.compile(r"^\s*TAVOLO\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
 _DOCUMENT_CODE_RE = re.compile(
     r"\b(?:DOC(?:UMENTO)?\.?\s*(?:GESTIONALE)?\s*N\.?|N\.?)\s*"
+    r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
+    re.IGNORECASE,
+)
+_MANAGEMENT_DOCUMENT_CODE_RE = re.compile(
+    r"\bDOC(?:UMENTO)?\.?\s*GESTIONALE\s*N\.?\s*"
+    r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
+    re.IGNORECASE,
+)
+_COMMERCIAL_REFERENCE_CODE_RE = re.compile(
+    r"\b(?:RIF(?:ERIMENTO)?\.?\s*(?:AL\s+)?(?:DOCUMENTO\s+COMMERCIALE|DOCUMENTO)"
+    r"|DOCUMENTO\s+COMMERCIALE(?:\s+DI\s+RIFERIMENTO)?"
+    r"|COPIA\s+CONFORME(?:\s+DEL)?\s+DOCUMENTO)\s*N\.?\s*"
     r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
     re.IGNORECASE,
 )
@@ -91,6 +103,12 @@ class _Draft:
     order_code: str | None = None
     table_code: str | None = None
     external_document_code: str | None = None
+    external_document_code_suffix: str | None = None
+    commercial_reference_code: str | None = None
+    external_document_code_evidence: str | None = None
+    external_document_code_suffix_evidence: str | None = None
+    commercial_reference_code_evidence: str | None = None
+    response_status_digits: str | None = None
     total: Decimal | None = None
     tax_total: Decimal | None = None
     payments: list[PaymentRecord] = field(default_factory=list)
@@ -206,6 +224,12 @@ def _printed_money(value: str) -> Decimal | None:
         return None
 
 
+def _document_code(value: str) -> str:
+    """Return the printer spelling in a stable separator/case form."""
+
+    return value.strip().upper().replace("/", "-")
+
+
 def _source(frame: Frame) -> SourceSpan:
     return SourceSpan(
         direction="CLIENT_TO_DEVICE",
@@ -239,8 +263,36 @@ def _append_management_line(draft: _Draft, frame: Frame, text: str) -> None:
         draft.order_code = match.group("value") or None
     if match := _TABLE_RE.fullmatch(text):
         draft.table_code = match.group("value") or None
-    if match := _DOCUMENT_CODE_RE.search(text):
-        draft.external_document_code = match.group("value")
+    if match := _COMMERCIAL_REFERENCE_CODE_RE.search(text):
+        draft.commercial_reference_code = _document_code(match.group("value"))
+        draft.commercial_reference_code_evidence = "RCH_PRINTED_COMMERCIAL_REFERENCE"
+    elif match := _MANAGEMENT_DOCUMENT_CODE_RE.search(text):
+        value = _document_code(match.group("value"))
+        if (
+            draft.external_document_code is not None
+            and draft.external_document_code != value
+            and draft.commercial_reference_code is None
+        ):
+            # A conforming management print contains the commercial number
+            # before its own ``DOC. GESTIONALE N.`` footer.  Preserve both;
+            # never overwrite the referenced commercial identity.
+            draft.commercial_reference_code = draft.external_document_code
+            draft.commercial_reference_code_evidence = (
+                "RCH_PRINTED_UNQUALIFIED_DOCUMENT_BEFORE_MANAGEMENT_FOOTER"
+            )
+        draft.external_document_code = value
+        draft.external_document_code_evidence = "RCH_PRINTED_MANAGEMENT_FOOTER"
+    elif match := _DOCUMENT_CODE_RE.search(text):
+        # In observed management-copy request frames an unqualified ``N.`` is
+        # the referenced commercial document.  The management print's own
+        # ``DOC. GESTIONALE N.`` footer is generated inside the printer and is
+        # absent from the captured request/response, so it must not be
+        # invented or assigned from this value.
+        value = _document_code(match.group("value"))
+        draft.commercial_reference_code = value
+        draft.commercial_reference_code_evidence = (
+            "RCH_REQUEST_UNQUALIFIED_COMMERCIAL_DOCUMENT_NUMBER"
+        )
 
     if match := _PRINTED_TOTAL_RE.match(text):
         total_values = [
@@ -367,6 +419,8 @@ def _draft_document(
         type=document_type,
         subtype=subtype,
         external_document_code=draft.external_document_code,
+        external_document_code_suffix=draft.external_document_code_suffix,
+        commercial_reference_code=draft.commercial_reference_code,
         order_code=draft.order_code,
         table_code=draft.table_code,
         captured_at=captured_at,
@@ -393,6 +447,21 @@ def _draft_document(
             "source_frame_ids": draft.frame_ids,
             "total_command_code": draft.total_code,
             "response_counter_suffix": response_counter,
+            "response_status_digits": draft.response_status_digits,
+            "external_document_code_evidence": draft.external_document_code_evidence,
+            "external_document_code_suffix_evidence": (
+                draft.external_document_code_suffix_evidence
+            ),
+            "commercial_reference_code_evidence": (
+                draft.commercial_reference_code_evidence
+            ),
+            "progressive_observation_status": (
+                "FULL_CODE_OBSERVED_IN_CAPTURE"
+                if draft.external_document_code
+                else "SUFFIX_ONLY_OBSERVED_IN_CAPTURE"
+                if draft.external_document_code_suffix
+                else "NOT_OBSERVED_IN_CAPTURE"
+            ),
             "semantic_evidence": "INFERRED_FROM_CAPTURE",
             "economic_close": (
                 draft.kind == "management"
@@ -558,7 +627,12 @@ def parse_rch(
         usedforsecurity=True,
     ).hexdigest()
     response_candidates = [
-        (index, frame, match.group("counter"))
+        (
+            index,
+            frame,
+            match.group("status_digits"),
+            match.group("counter"),
+        )
         for index, frame in enumerate(response.frames)
         if frame.address == "01"
         and frame.frame_class == "N"
@@ -566,7 +640,7 @@ def parse_rch(
         and (match := _COUNTER_RE.fullmatch(frame.text)) is not None
     ]
     used_responses: set[int] = set()
-    counters_by_document_start: dict[int, str] = {}
+    status_by_document_start: dict[int, dict[str, str]] = {}
     commercial_start: int | None = None
     total_seen = False
     for frame in request.frames:
@@ -582,14 +656,20 @@ def parse_rch(
             total_seen = True
             continue
         # Only the observed post-total status query can provide a document
-        # suffix.  Sequence correlation prevents a pre-document or unrelated
-        # response from being silently attached to the receipt.
+        # suffix.  Live capture confirms that the six status digits can all be
+        # zero while the physically printed document has a non-zero prefix;
+        # therefore only ``CCCC`` is retained as evidence.  Sequence
+        # correlation prevents a pre-document or unrelated response from
+        # being silently attached to the receipt.
         if total_seen and frame.text == "<</?s" and frame.sequence.isdigit():
             expected = str((int(frame.sequence) + 8) % 10)
-            for index, candidate, counter in response_candidates:
+            for index, candidate, status_digits, counter in response_candidates:
                 if index not in used_responses and candidate.sequence == expected:
                     used_responses.add(index)
-                    counters_by_document_start[commercial_start] = counter
+                    status_by_document_start[commercial_start] = {
+                        "status_digits": status_digits,
+                        "counter": counter,
+                    }
                     break
         if re.fullmatch(r"<</\?\d", frame.text):
             commercial_start = None
@@ -636,9 +716,11 @@ def parse_rch(
                 manifest_sha256=manifest_sha256,
                 source_hash=source_hash,
                 source_path=str(source_path),
-                response_counter=counters_by_document_start.get(active.frame_ids[0])
-                if active.frame_ids
-                else None,
+                response_counter=(
+                    status_by_document_start.get(active.frame_ids[0], {}).get("counter")
+                    if active.frame_ids
+                    else None
+                ),
             )
         )
         active = None
@@ -666,10 +748,22 @@ def parse_rch(
         if text == "=K":
             if active is not None:
                 finish(complete=False, warning="document_interrupted_by_commercial_open")
+            observed_status = status_by_document_start.get(frame.frame_id)
             active = _Draft(
                 "commercial",
                 len(documents) + 1,
                 frame.offset,
+                external_document_code_suffix=(
+                    observed_status.get("counter") if observed_status else None
+                ),
+                external_document_code_suffix_evidence=(
+                    "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+                    if observed_status
+                    else None
+                ),
+                response_status_digits=(
+                    observed_status.get("status_digits") if observed_status else None
+                ),
                 frame_ids=[frame.frame_id],
                 end_offset=frame.offset + len(frame.raw),
             )

@@ -1,5 +1,6 @@
 import {
   AssignmentLateOutlined,
+  ArrowForwardOutlined,
   DescriptionOutlined,
   DevicesOutlined,
   EuroOutlined,
@@ -8,19 +9,21 @@ import {
   ShieldOutlined,
   WarningAmberOutlined,
 } from '@mui/icons-material'
-import { Box, Card, CardContent, Grid, LinearProgress, List, ListItem, ListItemText, Typography } from '@mui/material'
-import { useTheme } from '@mui/material/styles'
+import { Alert, Box, Button, Card, CardContent, Grid, LinearProgress, List, ListItem, ListItemText, Paper, Stack, Typography } from '@mui/material'
+import { alpha, useTheme } from '@mui/material/styles'
 import { useQuery } from '@tanstack/react-query'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
 import { PeriodPicker } from '../components/PeriodPicker'
 import { StatCard } from '../components/StatCard'
 import { ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
-import { operationalReductionTransactionsPath } from '../dashboardDrilldown'
+import { operationalReductionQuery, operationalReductionTransactionsPath } from '../dashboardDrilldown'
+import { shortDateTime } from '../format'
 import { apiPeriodParams } from '../period'
-import type { Dashboard, Device, Diagnostics } from '../types'
+import { transactionDetailPath } from '../routes'
+import type { Dashboard, Device, Diagnostics, Page, Transaction } from '../types'
 
 const euros = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
 
@@ -43,6 +46,11 @@ export function DashboardPage() {
   const dashboard = useQuery({
     queryKey: scopedQueryKey('dashboard', period.toString()),
     queryFn: () => api<Dashboard>(`/dashboard?${period.toString()}`),
+  })
+  const episodeParams = operationalReductionQuery(period, { limit: 8, offset: 0 })
+  const episodes = useQuery({
+    queryKey: scopedQueryKey('dashboard', 'economic-episodes', episodeParams.toString()),
+    queryFn: () => api<Page<Transaction>>(`/transactions?${episodeParams.toString()}`),
   })
   const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices') })
   const diagnostics = useQuery({
@@ -70,11 +78,91 @@ export function DashboardPage() {
       />
       <Grid container spacing={2.2}>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Documenti acquisiti" value={data.documents} helper={`${data.pre_bills} preconti nel periodo`} icon={<DescriptionOutlined />} to={routeWithPeriod('/documenti', period)} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Alert operativi attivi" value={operationalAlerts} helper={`${data.critical_alerts} critici; escluso lo storico chiuso`} icon={<ShieldOutlined />} tone={theme.palette.error.main} to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con riduzione" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone={theme.palette.warning.main} to={operationalReductionTransactionsPath(period)} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Differenza economica unica" value={euros.format(Number(economicDifference))} helper="aggregata per episodio, non per alert" icon={<EuroOutlined />} tone={theme.palette.warning.main} to={operationalReductionTransactionsPath(period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Segnalazioni operative" value={operationalAlerts} helper={`${data.critical_alerts} critiche; consultazione di supporto`} icon={<ShieldOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con possibile ammanco" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ammanco potenziale totale" value={euros.format(Number(economicDifference))} helper="somma unica degli episodi del periodo" icon={<EuroOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Incompleti da revisionare" value={incompleteJobs} helper="il RAW originale non viene eliminato" icon={<AssignmentLateOutlined />} tone={theme.palette.secondary.main} to={routeWithPeriod('/incompleti', period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Storico non operativo" value={archivedKnown ? archived : '—'} helper="falsi positivi e giustificati" icon={<HistoryOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'archive' })} /></Grid>
+        <Grid size={{ xs: 12 }}>
+          <Card
+            sx={{
+              border: '1px solid',
+              borderColor: episodes.data?.total ? 'error.main' : 'divider',
+              boxShadow: episodes.data?.total
+                ? `0 14px 36px ${alpha(theme.palette.error.main, theme.palette.mode === 'dark' ? 0.22 : 0.14)}`
+                : undefined,
+            }}
+          >
+            <CardContent>
+              <Stack
+                direction={{ xs: 'column', md: 'row' }}
+                alignItems={{ xs: 'flex-start', md: 'center' }}
+                justifyContent="space-between"
+                gap={1.5}
+                sx={{ mb: 2 }}
+              >
+                <Box>
+                  <Typography variant="h2">Eventi economici prioritari</Typography>
+                  <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+                    Riduzioni tra preconto e documento finale ancora da verificare. Ogni vendita è conteggiata una sola volta.
+                  </Typography>
+                </Box>
+                <Button
+                  component={Link}
+                  to={operationalReductionTransactionsPath(period)}
+                  endIcon={<ArrowForwardOutlined />}
+                  color={episodes.data?.total ? 'error' : 'primary'}
+                  variant={episodes.data?.total ? 'contained' : 'outlined'}
+                >
+                  Vedi tutti gli eventi{episodes.data ? ` (${episodes.data.total})` : ''}
+                </Button>
+              </Stack>
+              {episodes.isLoading ? <LoadingState label="Analisi episodi economici…" />
+                : episodes.error ? <Alert severity="warning">Impossibile caricare il dettaglio degli episodi economici.</Alert>
+                  : !episodes.data?.items.length ? <Alert severity="success">Nessuna riduzione economica operativa nel periodo selezionato.</Alert>
+                    : <Stack spacing={1.25}>
+                      {episodes.data.items.map((episode) => <Paper
+                        key={episode.id}
+                        variant="outlined"
+                        sx={{
+                          p: 2,
+                          borderColor: 'error.main',
+                          bgcolor: alpha(theme.palette.error.main, theme.palette.mode === 'dark' ? 0.13 : 0.045),
+                        }}
+                      >
+                        <Stack direction={{ xs: 'column', lg: 'row' }} alignItems={{ xs: 'stretch', lg: 'center' }} gap={2}>
+                          <Box sx={{ flex: 1, minWidth: 0 }}>
+                            <Typography color="error.main" fontWeight={800}>
+                              Possibile ammanco {euros.format(Number(episode.difference ?? 0))}
+                            </Typography>
+                            <Typography fontWeight={700} sx={{ mt: 0.4 }}>
+                              Tavolo {episode.table_code ?? 'non identificato'}
+                              {episode.order_code ? ` · riferimento ${episode.order_code}` : ''}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.4 }}>
+                              {shortDateTime.format(new Date(episode.occurred_at))} · preconto {euros.format(Number(episode.pre_bill_total ?? 0))} → documento finale {euros.format(Number(episode.fiscal_total ?? 0))} · {episode.document_count} documenti correlati
+                            </Typography>
+                          </Box>
+                          <Box sx={{ textAlign: { xs: 'left', lg: 'right' } }}>
+                            <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.7 }}>
+                              Confidenza correlazione {episode.correlation_confidence}%
+                            </Typography>
+                            <Button
+                              component={Link}
+                              to={transactionDetailPath(episode.id)}
+                              color="error"
+                              variant="outlined"
+                              endIcon={<ArrowForwardOutlined />}
+                            >
+                              Apri evento e documenti
+                            </Button>
+                          </Box>
+                        </Stack>
+                      </Paper>)}
+                    </Stack>}
+            </CardContent>
+          </Card>
+        </Grid>
         <Grid size={{ xs: 12, lg: 7 }}>
           <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Copertura documentale</Typography>
             {[

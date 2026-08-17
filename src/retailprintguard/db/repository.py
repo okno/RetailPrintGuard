@@ -126,6 +126,8 @@ _VERSION_SEMANTIC_FIELDS = (
     "document_type",
     "subtype",
     "external_document_code",
+    "external_document_code_suffix",
+    "commercial_reference_code",
     "order_code",
     "table_code",
     "operator_code",
@@ -183,6 +185,33 @@ def _version_column(version_column: Any, legacy_column: Any) -> Any:
         ),
         else_=version_column,
     )
+
+
+def _progressive_observation_status(
+    version: DocumentVersion,
+    document: Document,
+) -> str:
+    metadata = version.raw_metadata if isinstance(version.raw_metadata, dict) else {}
+    explicit = metadata.get("progressive_observation_status")
+    if explicit in {
+        "FULL_CODE_OBSERVED_IN_CAPTURE",
+        "SUFFIX_ONLY_OBSERVED_IN_CAPTURE",
+        "NOT_OBSERVED_IN_CAPTURE",
+        "NOT_APPLICABLE",
+    }:
+        return str(explicit)
+    if _version_value(version, document, "external_document_code"):
+        return "FULL_CODE_OBSERVED_IN_CAPTURE"
+    if _version_value(version, document, "external_document_code_suffix"):
+        return "SUFFIX_ONLY_OBSERVED_IN_CAPTURE"
+    if _version_value(version, document, "document_type") in {
+        DocumentType.PRE_BILL.value,
+        DocumentType.MANAGEMENT_DOCUMENT.value,
+        DocumentType.CONFORMING_COPY.value,
+        DocumentType.COMMERCIAL_DOCUMENT.value,
+    }:
+        return "NOT_OBSERVED_IN_CAPTURE"
+    return "NOT_APPLICABLE"
 
 
 def _as_decimal(value: Any) -> Decimal | None:
@@ -1396,6 +1425,106 @@ class SqlAlchemyApiRepository:
             correlations_by_document.setdefault(member.document_id, []).append(
                 (member, correlation)
             )
+        required_suffix_criteria = {
+            "commercial_reference_to_observed_fiscal_suffix",
+            "table_code",
+            "line_identity_overlap",
+            "time_proximity",
+        }
+        resolving_correlation_ids = {
+            correlation.id
+            for correlations in correlations_by_document.values()
+            for _member, correlation in correlations
+            if correlation.status == "AUTOMATIC"
+            and correlation.algorithm_version == "rpg-correlation-1.4.0"
+            and correlation.score == 100
+            and required_suffix_criteria.issubset(
+                {str(value) for value in (correlation.matched_criteria or [])}
+            )
+        }
+        related_ids_by_correlation: dict[UUID, set[UUID]] = {}
+        if resolving_correlation_ids:
+            for member in session.scalars(
+                select(DocumentCorrelationMember).where(
+                    DocumentCorrelationMember.correlation_id.in_(
+                        resolving_correlation_ids
+                    )
+                )
+            ):
+                related_ids_by_correlation.setdefault(member.correlation_id, set()).add(
+                    member.document_id
+                )
+        related_document_ids = {
+            document_id
+            for values in related_ids_by_correlation.values()
+            for document_id in values
+        }
+        related_versions: dict[UUID, tuple[Document, DocumentVersion]] = {}
+        if related_document_ids:
+            for related_document, related_version in session.execute(
+                select(Document, DocumentVersion)
+                .join(
+                    DocumentVersion,
+                    DocumentVersion.document_id == Document.id,
+                )
+                .where(
+                    Document.id.in_(related_document_ids),
+                    DocumentVersion.id == _latest_version_id(),
+                )
+            ):
+                related_versions[related_document.id] = (
+                    related_document,
+                    related_version,
+                )
+
+        def resolved_external_code(
+            document: Document,
+            version: DocumentVersion,
+        ) -> tuple[str | None, str | None]:
+            if (
+                _version_value(version, document, "document_type")
+                != DocumentType.COMMERCIAL_DOCUMENT.value
+                or _version_value(version, document, "external_document_code")
+            ):
+                return None, None
+            suffix = _version_value(
+                version, document, "external_document_code_suffix"
+            )
+            if not suffix:
+                return None, None
+            candidates: set[str] = set()
+            for _member, correlation in correlations_by_document.get(document.id, []):
+                if correlation.id not in resolving_correlation_ids:
+                    continue
+                for related_id in related_ids_by_correlation.get(correlation.id, set()):
+                    if related_id == document.id:
+                        continue
+                    related = related_versions.get(related_id)
+                    if related is None:
+                        continue
+                    related_document, related_version = related
+                    if _version_value(
+                        related_version, related_document, "document_type"
+                    ) not in {
+                        DocumentType.MANAGEMENT_DOCUMENT.value,
+                        DocumentType.CONFORMING_COPY.value,
+                    }:
+                        continue
+                    reference = _version_value(
+                        related_version,
+                        related_document,
+                        "commercial_reference_code",
+                    )
+                    if (
+                        reference
+                        and reference.replace("/", "-").rsplit("-", 1)[-1]
+                        == str(suffix)
+                    ):
+                        candidates.add(str(reference))
+            if len(candidates) != 1:
+                return None, None
+            return candidates.pop(), "CORRELATED_MANAGEMENT_REFERENCE"
+
         result: list[DocumentView] = []
         for document in documents:
             version = version_by_document.get(document.id)
@@ -1406,6 +1535,9 @@ class SqlAlchemyApiRepository:
             lines = lines_by_version.get(version.id, [])
             payments = payments_by_version.get(version.id, [])
             correlations = correlations_by_document.get(document.id, [])
+            resolved_code, resolved_code_provenance = resolved_external_code(
+                document, version
+            )
             result.append(
                 DocumentView(
                     id=document.id,
@@ -1413,6 +1545,22 @@ class SqlAlchemyApiRepository:
                     job_id=document.job_id,
                     type=_version_value(version, document, "document_type"),
                     subtype=_version_value(version, document, "subtype"),
+                    external_document_code=_version_value(
+                        version, document, "external_document_code"
+                    ),
+                    external_document_code_suffix=_version_value(
+                        version, document, "external_document_code_suffix"
+                    ),
+                    resolved_external_document_code=resolved_code,
+                    resolved_external_document_code_provenance=(
+                        resolved_code_provenance
+                    ),
+                    commercial_reference_code=_version_value(
+                        version, document, "commercial_reference_code"
+                    ),
+                    progressive_observation_status=_progressive_observation_status(
+                        version, document
+                    ),
                     external_code=_version_value(
                         version, document, "external_document_code"
                     ),
@@ -1593,6 +1741,18 @@ class SqlAlchemyApiRepository:
                 DocumentVersion.order_code,
                 Document.order_code,
             )
+            semantic_external_code = _version_column(
+                DocumentVersion.external_document_code,
+                Document.external_document_code,
+            )
+            semantic_external_suffix = _version_column(
+                DocumentVersion.external_document_code_suffix,
+                Document.external_document_code_suffix,
+            )
+            semantic_commercial_reference = _version_column(
+                DocumentVersion.commercial_reference_code,
+                Document.commercial_reference_code,
+            )
             statement: Select[Any] = (
                 select(Document)
                 .join(Device)
@@ -1608,6 +1768,20 @@ class SqlAlchemyApiRepository:
             if filters.get("order_code"):
                 statement = statement.where(
                     semantic_order_code == str(filters["order_code"])
+                )
+            if filters.get("external_document_code"):
+                statement = statement.where(
+                    semantic_external_code == str(filters["external_document_code"])
+                )
+            if filters.get("external_document_code_suffix"):
+                statement = statement.where(
+                    semantic_external_suffix
+                    == str(filters["external_document_code_suffix"])
+                )
+            if filters.get("commercial_reference_code"):
+                statement = statement.where(
+                    semantic_commercial_reference
+                    == str(filters["commercial_reference_code"])
                 )
             if filters.get("from") is not None:
                 statement = statement.where(Document.captured_at >= filters["from"])
@@ -1804,8 +1978,13 @@ class SqlAlchemyApiRepository:
                 return getattr(document, field)
             return _version_value(version, document, field)
 
+        def document_time(document: Document) -> datetime:
+            return semantics(document, "document_timestamp") or document.captured_at
+
         prebill_documents = [
-            document for document in documents if semantics(document, "document_type") == "PRE_BILL"
+            document
+            for document in documents
+            if semantics(document, "document_type") == DocumentType.PRE_BILL.value
         ]
         commercial_documents = [
             document
@@ -1819,6 +1998,7 @@ class SqlAlchemyApiRepository:
             and versions[document.id].complete
             and versions[document.id].gross_total is not None
         ]
+        fiscal_documents.sort(key=lambda item: (document_time(item), item.captured_at, item.id))
         economic_closures = [
             document
             for document in documents
@@ -1836,9 +2016,98 @@ class SqlAlchemyApiRepository:
             for document in documents
             if semantics(document, "document_type") == DocumentType.CANCELLATION.value
         ]
+        first_fiscal = fiscal_documents[0] if fiscal_documents else None
+        first_fiscal_time = document_time(first_fiscal) if first_fiscal is not None else None
+        prebill_candidates = [
+            document
+            for document in prebill_documents
+            if document.id in versions
+            and (
+                first_fiscal_time is None
+                or document_time(document) <= first_fiscal_time
+            )
+        ]
+        prebill_candidates.sort(
+            key=lambda item: (document_time(item), item.captured_at, item.id)
+        )
+        prebill_document = prebill_candidates[-1] if prebill_candidates else None
+        baseline_basis = "OBSERVED_PRE_BILL" if prebill_document is not None else None
+
+        # RCH management streams do not always carry the PRE_BILL literal.  The
+        # correlation engine records a dedicated, explainable sale-sequence
+        # criterion when a complete non-economic management document precedes
+        # the fiscal close on the same table with overlapping line identity.
+        # Reuse that persisted evidence here rather than guessing from a table
+        # number or a total.  A post-fiscal management copy (which carries a
+        # commercial reference) and a room/economic close are explicitly
+        # ineligible as the comparison baseline.
+        matched_criteria = {
+            str(value) for value in (correlation.matched_criteria or [])
+        }
+
+        def stored_line_keys(document: Document) -> set[str]:
+            version = versions.get(document.id)
+            if version is None:
+                return set()
+            return {
+                _line_key(line)
+                for line in session.scalars(
+                    select(DocumentLine).where(
+                        DocumentLine.document_version_id == version.id
+                    )
+                )
+            }
+
+        if (
+            prebill_document is None
+            and first_fiscal is not None
+            and {"table_sale_sequence", "line_identity_overlap"}.issubset(
+                matched_criteria
+            )
+        ):
+            fiscal_table = semantics(first_fiscal, "table_code")
+            normalized_fiscal_table = (
+                " ".join(str(fiscal_table).upper().split())
+                if fiscal_table is not None
+                else None
+            )
+            fiscal_line_keys = stored_line_keys(first_fiscal)
+            management_candidates = []
+            for document in documents:
+                version = versions.get(document.id)
+                if (
+                    version is None
+                    or semantics(document, "document_type")
+                    != DocumentType.MANAGEMENT_DOCUMENT.value
+                    or not version.complete
+                    or version.gross_total is None
+                    or semantics(document, "commercial_reference_code") is not None
+                    or not isinstance(version.raw_metadata, dict)
+                    or bool(version.raw_metadata.get("economic_close"))
+                    or version.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
+                    or document_time(document) > first_fiscal_time
+                ):
+                    continue
+                table = semantics(document, "table_code")
+                normalized_table = (
+                    " ".join(str(table).upper().split()) if table is not None else None
+                )
+                if (
+                    normalized_fiscal_table is not None
+                    and normalized_table == normalized_fiscal_table
+                    and bool(fiscal_line_keys & stored_line_keys(document))
+                ):
+                    management_candidates.append(document)
+            management_candidates.sort(
+                key=lambda item: (document_time(item), item.captured_at, item.id)
+            )
+            if management_candidates:
+                prebill_document = management_candidates[-1]
+                baseline_basis = "CORRELATED_MANAGEMENT_PRE_FISCAL"
+
         prebill_total = (
-            versions[prebill_documents[-1].id].gross_total
-            if prebill_documents and prebill_documents[-1].id in versions
+            versions[prebill_document.id].gross_total
+            if prebill_document is not None and prebill_document.id in versions
             else None
         )
         fiscal_total = sum(
@@ -1871,6 +2140,7 @@ class SqlAlchemyApiRepository:
                 for document in documents
                 if semantics(document, "document_type") in SOURCE_TYPES
                 and document.id in versions
+                and versions[document.id].gross_total is not None
             ),
             None,
         )
@@ -1914,7 +2184,7 @@ class SqlAlchemyApiRepository:
                 "document_id": str(document.id),
                 "type": semantics(document, "document_type"),
                 "occurred_at": (
-                    semantics(document, "document_timestamp") or document.captured_at
+                    document_time(document)
                 ).isoformat(),
                 "total": (
                     str(versions[document.id].gross_total)
@@ -2015,8 +2285,8 @@ class SqlAlchemyApiRepository:
         )
         prebill_lines: list[DocumentLine] = []
         fiscal_lines: list[DocumentLine] = []
-        if prebill_documents:
-            prebill_version = versions.get(prebill_documents[-1].id)
+        if prebill_document is not None:
+            prebill_version = versions.get(prebill_document.id)
             if prebill_version is not None:
                 prebill_lines = list(
                     session.scalars(
@@ -2080,6 +2350,15 @@ class SqlAlchemyApiRepository:
             timeline=timeline,
             diff={
                 "pre_bill_total": str(prebill_total) if prebill_total is not None else None,
+                "baseline_basis": baseline_basis,
+                "baseline_document_id": (
+                    str(prebill_document.id) if prebill_document is not None else None
+                ),
+                "baseline_document_type": (
+                    semantics(prebill_document, "document_type")
+                    if prebill_document is not None
+                    else None
+                ),
                 "fiscal_total": str(fiscal_total) if fiscal_documents else None,
                 "observed_final_total": (
                     str(observed_final_total) if observed_final_total is not None else None
@@ -2631,6 +2910,14 @@ class SqlAlchemyApiRepository:
                 _version_column(
                     DocumentVersion.external_document_code,
                     Document.external_document_code,
+                ).ilike(pattern, escape="\\"),
+                _version_column(
+                    DocumentVersion.external_document_code_suffix,
+                    Document.external_document_code_suffix,
+                ).ilike(pattern, escape="\\"),
+                _version_column(
+                    DocumentVersion.commercial_reference_code,
+                    Document.commercial_reference_code,
                 ).ilike(pattern, escape="\\"),
                 _version_column(DocumentVersion.order_code, Document.order_code).ilike(
                     pattern, escape="\\"
@@ -3391,6 +3678,20 @@ class SqlAlchemyIngestionRepository:
                         "number",
                     )
                 ),
+                external_document_code_suffix=_optional_text(
+                    _first(
+                        semantic,
+                        "external_document_code_suffix",
+                        "document_number_suffix",
+                    )
+                ),
+                commercial_reference_code=_optional_text(
+                    _first(
+                        semantic,
+                        "commercial_reference_code",
+                        "commercial_document_reference",
+                    )
+                ),
                 order_code=_optional_text(
                     _first(semantic, "order_code", "order_reference", "order_number")
                 ),
@@ -3426,6 +3727,16 @@ class SqlAlchemyIngestionRepository:
                 raw_payload_id=request_raw.id if request_raw else None,
                 version_sequence=1,
                 parsed_at=datetime.now(UTC),
+                document_type=document.document_type,
+                subtype=document.subtype,
+                external_document_code=document.external_document_code,
+                external_document_code_suffix=document.external_document_code_suffix,
+                commercial_reference_code=document.commercial_reference_code,
+                order_code=document.order_code,
+                table_code=document.table_code,
+                operator_code=document.operator_code,
+                terminal_code=document.terminal_code,
+                document_timestamp=document.document_timestamp,
                 gross_total=_as_decimal(_first(semantic, "gross_total", "total", "total_amount")),
                 net_total=_as_decimal(_first(semantic, "net_total", "taxable_total")),
                 discount_total=_as_decimal(_first(semantic, "discount_total", "discount")),

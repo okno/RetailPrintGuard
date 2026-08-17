@@ -82,7 +82,7 @@ def test_rch_reconstructs_commercial_and_device_response_from_coalesced_stream()
         )
     )
     responses = b"\x06" + _rch_frame(
-        "s000000RE7001",
+        "s000000RE0042",
         address="01",
         frame_class="N",
         sequence="3",
@@ -106,7 +106,15 @@ def test_rch_reconstructs_commercial_and_device_response_from_coalesced_stream()
     assert commercial.table_code == "T-7"
     assert commercial.order_code == "O-7"
     assert commercial.lines[0].description == "VOCE SINTETICA"
-    assert commercial.raw_metadata["response_counter_suffix"] == "7001"
+    assert commercial.external_document_code is None
+    assert commercial.external_document_code_suffix == "0042"
+    assert commercial.raw_metadata["response_counter_suffix"] == "0042"
+    assert commercial.raw_metadata["response_status_digits"] == "000000"
+    assert (
+        commercial.raw_metadata["external_document_code_suffix_evidence"]
+        == "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+    )
+    assert "0042" not in commercial.normalized_text
     assert documents[1].type is DocumentType.DEVICE_RESPONSE
     assert documents[1].raw_metadata["ack_count"] == 1
 
@@ -153,6 +161,74 @@ def test_rch_management_toggle_multiple_docs_and_malformed_raw_is_never_executed
     )
     assert unknown[0].type is DocumentType.UNKNOWN
     assert unknown[0].warnings
+
+
+def test_rch_rejects_an_unmatched_status_progressive() -> None:
+    requests = b"".join(
+        (
+            _rch_frame("=K", sequence="0"),
+            _rch_frame("=T1/$100", sequence="4"),
+            _rch_frame("<</?s", sequence="5"),
+            _rch_frame("<</?7", sequence="6"),
+        )
+    )
+    unrelated_response = _rch_frame(
+        "s000000RE0044",
+        address="01",
+        frame_class="N",
+        sequence="2",
+    )
+
+    document = parse_rch(
+        requests,
+        unrelated_response,
+        device_id="rch_synthetic",
+        session_id="session-unmatched-progressive",
+        job_id="job-unmatched-progressive",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+
+    assert document.type is DocumentType.COMMERCIAL_DOCUMENT
+    assert document.external_document_code is None
+    assert document.external_document_code_suffix is None
+    assert document.raw_metadata["response_counter_suffix"] is None
+
+
+def test_rch_management_copy_keeps_reference_without_inventing_own_progressive() -> None:
+    management = b"".join(
+        (
+            _rch_frame("=o", sequence="0"),
+            _rch_frame('="/(DOCUMENTO GESTIONALE)', sequence="1"),
+            _rch_frame('="/(DOCUMENTO N. 9901-0042)', sequence="2"),
+            _rch_frame("=o", sequence="3"),
+        )
+    )
+
+    document = parse_rch(
+        management,
+        b"",
+        device_id="rch_synthetic",
+        session_id="session-management-reference",
+        job_id="job-management-reference",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+
+    assert document.type is DocumentType.MANAGEMENT_DOCUMENT
+    assert document.external_document_code is None
+    assert document.external_document_code_suffix is None
+    assert document.commercial_reference_code == "9901-0042"
+    assert (
+        document.raw_metadata["progressive_observation_status"]
+        == "NOT_OBSERVED_IN_CAPTURE"
+    )
+    assert (
+        document.raw_metadata["commercial_reference_code_evidence"]
+        == "RCH_REQUEST_UNQUALIFIED_COMMERCIAL_DOCUMENT_NUMBER"
+    )
 
 
 def test_rch_observed_quantity_management_totals_and_error_status_regression() -> None:
@@ -224,7 +300,8 @@ def test_rch_observed_quantity_management_totals_and_error_status_regression() -
     assert management_document.tax_total == Decimal("0.18")
     assert management_document.table_code == "LAB-9"
     assert management_document.order_code == "ORD-LAB"
-    assert management_document.external_document_code == "9999-0042"
+    assert management_document.external_document_code is None
+    assert management_document.commercial_reference_code == "9999-0042"
     assert management_document.payments[0].method == "CONTANTI"
     assert management_document.payments[0].amount == 2
 

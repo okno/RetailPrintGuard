@@ -227,6 +227,40 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
+def technical_non_sale_line(description: str) -> bool:
+    """Identify fiscal/payment projection rows that are not sold articles."""
+
+    normalized = " ".join(
+        "".join(
+            character if character.isalnum() else " " for character in description.upper()
+        ).split()
+    )
+    labels = {
+        "IVA",
+        "TOT",
+        "TOTALE",
+        "TOTALE COMPLESSIVO",
+        "RESTO",
+        "CONTANTI",
+        "PAGAMENTO CONTANTE",
+        "IMPORTO PAGATO",
+        "IMPONIBILE",
+        "ALIQUOTA IVA",
+    }
+    prefixes = (
+        "IVA ",
+        "TOT ",
+        "TOTALE ",
+        "RESTO ",
+        "CONTANTI ",
+        "PAGAMENTO ",
+        "IMPORTO PAGATO ",
+        "IMPONIBILE ",
+        "ALIQUOTA IVA ",
+    )
+    return normalized in labels or normalized.startswith(prefixes)
+
+
 def _line_total_candidates(
     document: NormalizedDocument, line_sum: Decimal
 ) -> tuple[Decimal, ...] | None:
@@ -413,11 +447,20 @@ class FraudEngine:
                     opened_at=context.evaluated_at,
                 )
             )
-        # One sale-value reduction is one operational incident.  Detailed
-        # removals and price changes are already embedded as evidence in the
-        # primary finding; opening another alert for every symptom inflated
-        # both the dashboard loss and the operator anomaly rate.
-        if any(item.rule_code == "MODIFICA_POST_PRECONTO" for item in findings):
+        # With the primary post-prebill rule enabled, one sale-value reduction
+        # is one operational incident.  Detailed removals and price changes are
+        # embedded as evidence in that primary finding.  Keeping the legacy
+        # symptom rules visible when the materiality threshold is not met made
+        # harmless cent-level corrections look more serious than the configured
+        # loss policy and inflated both dashboard totals and operator rates.
+        #
+        # An administrator can still opt into the legacy behaviour by disabling
+        # MODIFICA_POST_PRECONTO explicitly; this preserves the documented rule
+        # controls without creating auxiliary alerts in the default profile.
+        primary_rule_enabled = any(
+            rule.code == "MODIFICA_POST_PRECONTO" and rule.enabled for rule in self.rules
+        )
+        if primary_rule_enabled and context.transaction.prebill_total is not None:
             findings = [
                 item for item in findings if item.rule_code not in _SECONDARY_ECONOMIC_RULES
             ]
@@ -924,7 +967,16 @@ class FraudEngine:
             for documents in groups.values()
             if len({document.source_job_id for document in documents}) > 1
             and len(documents) > 1
-            and documents[0].type not in {DocumentType.REPRINT, DocumentType.CONFORMING_COPY}
+            and documents[0].type
+            not in {
+                DocumentType.REPRINT,
+                DocumentType.CONFORMING_COPY,
+                DocumentType.DEVICE_RESPONSE,
+            }
+            and not (
+                documents[0].type is DocumentType.MANAGEMENT_DOCUMENT
+                and documents[0].commercial_reference_code is not None
+            )
             and {document.id for document in documents} & transaction_ids
         ]
         if not duplicate_groups:
@@ -961,10 +1013,17 @@ class FraudEngine:
         if not fiscal_times:
             return None
         fiscal_time = min(fiscal_times)
-        fiscal_document_ids = {
+        non_action_document_ids = {
             document.id
             for document in context.transaction.documents
-            if _valid_fiscal_document(document)
+            if document.type
+            in {
+                DocumentType.COMMERCIAL_DOCUMENT,
+                DocumentType.MANAGEMENT_DOCUMENT,
+                DocumentType.CONFORMING_COPY,
+                DocumentType.REPRINT,
+                DocumentType.DEVICE_RESPONSE,
+            }
         }
         window = timedelta(minutes=int(rule.parameters.get("window_minutes", 5)))
         modification_types = {
@@ -980,7 +1039,11 @@ class FraudEngine:
             for event in context.order_events
             if event.type in modification_types
             and fiscal_time < event.occurred_at <= fiscal_time + window
-            and event.source_document_id not in fiscal_document_ids
+            # Printed fiscal/management outputs and their copies are evidence of
+            # an already completed operation, not a POS action.  Treating their
+            # derived line differences as a late operator modification generated
+            # a second false alert next to MODIFICA_POST_PRECONTO.
+            and event.source_document_id not in non_action_document_ids
         ]
         if not events:
             return None
@@ -1028,7 +1091,18 @@ class FraudEngine:
                 values = [
                     value for value in (effective_unit_price, line.line_total) if value is not None
                 ]
-                if values and any(value <= ZERO for value in values):
+                # Zero-valued technical/footer lines (IVA, TOT, resto and
+                # payment projections) are common and are not sold articles.
+                # Zero-priced menu lines remain visible; only a conservatively
+                # recognized technical label is excluded.
+                if (
+                    values
+                    and any(value <= ZERO for value in values)
+                    and not (
+                        all(value >= ZERO for value in values)
+                        and technical_non_sale_line(line.description)
+                    )
+                ):
                     involved.add(document.id)
                     evidence.append(
                         {
@@ -1044,7 +1118,10 @@ class FraudEngine:
             return None
         return _FindingData(
             description="Articolo con valore nullo o negativo",
-            explanation=f"Rilevate {len(evidence)} righe non positive fuori da annulli/rimborsi.",
+            explanation=(
+                f"Rilevate {len(evidence)} righe non positive fuori da annulli, rimborsi "
+                "e proiezioni tecniche riconosciute."
+            ),
             evidence=tuple(evidence),
             score=min(100, 65 + len(evidence) * 8),
             confidence=90,

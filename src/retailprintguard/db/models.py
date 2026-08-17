@@ -276,6 +276,8 @@ class Document(Base):
         UniqueConstraint("job_id", "source_document_key"),
         Index("ix_documents_order_captured", "order_code", "captured_at"),
         Index("ix_documents_external_code", "external_document_code"),
+        Index("ix_documents_external_code_suffix", "external_document_code_suffix"),
+        Index("ix_documents_commercial_reference", "commercial_reference_code"),
         Index("ix_documents_table_captured", "table_code", "captured_at"),
         Index("ix_documents_type_captured", "document_type", "captured_at"),
         Index("ix_documents_captured_cursor", "captured_at", "id"),
@@ -295,6 +297,8 @@ class Document(Base):
     document_type: Mapped[str] = mapped_column(String(48), nullable=False)
     subtype: Mapped[str] = mapped_column(String(128), nullable=False)
     external_document_code: Mapped[str | None] = mapped_column(String(128))
+    external_document_code_suffix: Mapped[str | None] = mapped_column(String(16))
+    commercial_reference_code: Mapped[str | None] = mapped_column(String(128))
     order_code: Mapped[str | None] = mapped_column(String(128))
     table_code: Mapped[str | None] = mapped_column(String(128))
     operator_code: Mapped[str | None] = mapped_column(String(128))
@@ -314,6 +318,16 @@ class DocumentVersion(Base):
         Index("ix_document_versions_parsed_cursor", "parsed_at", "id"),
         Index("ix_document_versions_order_document", "order_code", "document_id"),
         Index("ix_document_versions_external_document", "external_document_code", "document_id"),
+        Index(
+            "ix_document_versions_external_suffix",
+            "external_document_code_suffix",
+            "document_id",
+        ),
+        Index(
+            "ix_document_versions_commercial_reference",
+            "commercial_reference_code",
+            "document_id",
+        ),
         Index("ix_document_versions_table_document", "table_code", "document_id"),
     )
 
@@ -337,6 +351,8 @@ class DocumentVersion(Base):
     document_type: Mapped[str | None] = mapped_column(String(48))
     subtype: Mapped[str | None] = mapped_column(String(128))
     external_document_code: Mapped[str | None] = mapped_column(String(128))
+    external_document_code_suffix: Mapped[str | None] = mapped_column(String(16))
+    commercial_reference_code: Mapped[str | None] = mapped_column(String(128))
     order_code: Mapped[str | None] = mapped_column(String(128))
     table_code: Mapped[str | None] = mapped_column(String(128))
     operator_code: Mapped[str | None] = mapped_column(String(128))

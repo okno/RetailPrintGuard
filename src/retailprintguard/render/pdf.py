@@ -296,8 +296,41 @@ def _generic_lines(document: Any, normalized: str) -> list[_RenderLine]:
         _RenderLine(f"Data: {local_timestamp}"),
         _RenderLine(f"Dispositivo: {_safe_text(document.device_id)}"),
     ]
+    progressive_status = {
+        "FULL_CODE_OBSERVED_IN_CAPTURE": "progressivo completo osservato nel flusso",
+        "SUFFIX_ONLY_OBSERVED_IN_CAPTURE": (
+            "solo suffisso osservato; non e' un codice completo"
+        ),
+        "NOT_OBSERVED_IN_CAPTURE": (
+            "progressivo proprio generato dalla RCH, non presente nel flusso osservato"
+        ),
+    }.get(getattr(document, "progressive_observation_status", None))
+    resolved_code = getattr(document, "resolved_external_document_code", None)
+    resolved_provenance = getattr(
+        document, "resolved_external_document_code_provenance", None
+    )
+    resolved_display = (
+        f"{_safe_text(resolved_code)} (da riferimento gestionale correlato)"
+        if resolved_code
+        and resolved_provenance == "CORRELATED_MANAGEMENT_REFERENCE"
+        else resolved_code
+    )
     for label, value in (
-        ("Documento", document.external_code),
+        (
+            "Documento",
+            getattr(document, "external_document_code", None)
+            or document.external_code,
+        ),
+        ("Documento risolto", resolved_display),
+        (
+            "Suffisso progressivo RCH",
+            getattr(document, "external_document_code_suffix", None),
+        ),
+        ("Osservabilita' progressivo", progressive_status),
+        (
+            "Rif. commerciale",
+            getattr(document, "commercial_reference_code", None),
+        ),
         ("Ordine", document.order_code),
         ("Tavolo", document.table_code),
         ("Operatore", document.operator_code),

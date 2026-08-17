@@ -587,7 +587,7 @@ def test_document_version_semantics_migration_backfills_legacy_projection(
                 "subtype": "TICKET_POS_INFERRED",
                 "external_document_code": "DOC-LEGACY",
                 "order_code": "ORDER-LEGACY",
-                "table_code": "25-B",
+                "table_code": "LAB-25",
                 "operator_code": "OP-LEGACY",
                 "terminal_code": "TERM-LEGACY",
                 "document_timestamp": now,
@@ -633,7 +633,7 @@ def test_document_version_semantics_migration_backfills_legacy_projection(
         assert version.subtype == "TICKET_POS_INFERRED"
         assert version.external_document_code == "DOC-LEGACY"
         assert version.order_code == "ORDER-LEGACY"
-        assert version.table_code == "25-B"
+        assert version.table_code == "LAB-25"
         assert version.operator_code == "OP-LEGACY"
         assert version.terminal_code == "TERM-LEGACY"
         assert version.document_timestamp == datetime(2042, 5, 6, 12, 30, tzinfo=UTC)

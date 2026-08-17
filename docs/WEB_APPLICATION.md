@@ -42,6 +42,8 @@ All'apertura, la webapp seleziona gli ultimi sette giorni di calendario nel fuso
 di visualizzazione, così una vendita conclusa prima di mezzanotte resta
 visibile. L'operatore può scegliere oggi, ieri, tutto o un intervallo
 personalizzato.
+Gli episodi economici del periodo sono elencati in rosso con baseline, totale
+finale, ammanco potenziale, tavolo, confidenza e collegamento alla transazione.
 
 ### Transazioni
 
@@ -56,7 +58,8 @@ alert tecnici non economici.
 
 ### Documenti
 
-Elenco filtrabile per tipo, dispositivo, ordine e periodo. Il dettaglio offre:
+Elenco filtrabile per tipo, dispositivo, ordine, progressivo proprio, suffisso
+RCH, riferimento commerciale e periodo. Il dettaglio offre:
 
 - scontrino ricostruito da `normalized_text`;
 - righe strutturate con rimosso/annullato;
@@ -64,6 +67,12 @@ Elenco filtrabile per tipo, dispositivo, ordine e periodo. Il dettaglio offre:
   confonderli con il valore originale della comanda;
 - vista esadecimale tecnica limitata a 64 KiB;
 - provenienza, hash, parser, confidenza e warning.
+
+Progressivo proprio, suffisso e riferimento commerciale sono campi distinti.
+Un codice completo risolto dalla copia gestionale correlata è marcato come
+derivato con la sua provenienza; un progressivo generato internamente dalla RCH
+ma non transitato nel flusso viene mostrato come “non osservato”, mai ricostruito
+da cifre di stato non probanti.
 
 Un documento monetario incompleto non può fornire un prezzo derivato. Quando
 fonti complete correlate riportano prezzi incompatibili, la colonna mostra
