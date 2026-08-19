@@ -610,6 +610,54 @@ def test_all_sixteen_required_rules_are_versioned_and_registered() -> None:
     }
     assert {rule.code for rule in DEFAULT_RULES} == expected
     assert all(rule.version >= 1 and rule.enabled for rule in DEFAULT_RULES)
+    orphan_rule = next(rule for rule in DEFAULT_RULES if rule.code == "FISCAL_WITHOUT_SOURCE_ORDER")
+    assert orphan_rule.parameters["require_complete_economic_document"] is True
+
+
+def test_orphan_fiscal_requires_a_complete_document_with_observed_total() -> None:
+    complete = _document(
+        "orphan-fiscal-complete",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "12.00",
+        (_line(1, "A", "12.00"),),
+        minute=0,
+        device="rch_1",
+        external_code="DC-ORPHAN-1",
+    )
+    incomplete = complete.model_copy(
+        update={
+            "id": _id("orphan-fiscal-incomplete"),
+            "source_job_id": "job-orphan-fiscal-incomplete",
+            "complete": False,
+            "status": "PARTIAL",
+        }
+    )
+    total_not_observed = complete.model_copy(
+        update={
+            "id": _id("orphan-fiscal-no-total"),
+            "source_job_id": "job-orphan-fiscal-no-total",
+            "gross_total": None,
+            "net_total": None,
+        }
+    )
+
+    engine = FraudEngine()
+
+    def codes_for(document: NormalizedDocument) -> set[str]:
+        transaction = CorrelationEngine().correlate((document,))[0]
+        return {
+            finding.rule_code
+            for finding in engine.evaluate(
+                FraudContext(
+                    transaction=transaction,
+                    evaluated_at=BASE_TIME + timedelta(hours=1),
+                )
+            )
+        }
+
+    assert "FISCAL_WITHOUT_SOURCE_ORDER" in codes_for(complete)
+    assert "FISCAL_WITHOUT_SOURCE_ORDER" not in codes_for(incomplete)
+    assert "FISCAL_WITHOUT_SOURCE_ORDER" not in codes_for(total_not_observed)
 
 
 def test_whitelist_suppresses_only_the_matching_rule_and_keeps_evidence() -> None:

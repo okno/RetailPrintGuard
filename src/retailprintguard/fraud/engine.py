@@ -183,7 +183,11 @@ DEFAULT_RULES: tuple[RuleDefinition, ...] = (
         AlertSeverity.MEDIUM,
         close_minutes=120,
     ),
-    _rule("FISCAL_WITHOUT_SOURCE_ORDER", AlertSeverity.MEDIUM),
+    _rule(
+        "FISCAL_WITHOUT_SOURCE_ORDER",
+        AlertSeverity.MEDIUM,
+        require_complete_economic_document=True,
+    ),
     _rule(
         "EXCESSIVE_VOID_OR_CANCELLATION",
         AlertSeverity.HIGH,
@@ -785,9 +789,19 @@ class FraudEngine:
     def _fiscal_without_source_order(
         self, context: FraudContext, rule: RuleDefinition
     ) -> _FindingData | None:
-        del rule
         documents = context.transaction.documents
-        fiscals = [document for document in documents if document.type in FISCAL_TYPES]
+        require_complete = bool(
+            rule.parameters.get("require_complete_economic_document", True)
+        )
+        fiscals = [
+            document
+            for document in documents
+            if (
+                _valid_fiscal_document(document)
+                if require_complete
+                else document.type in FISCAL_TYPES
+            )
+        ]
         if not fiscals or any(document.type in SOURCE_TYPES for document in documents):
             return None
         return _FindingData(
