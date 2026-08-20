@@ -22,7 +22,7 @@ from retailprintguard.common.domain import (
     PaymentRecord,
 )
 
-ALGORITHM_VERSION = "rpg-correlation-1.4.0"
+ALGORITHM_VERSION = "rpg-correlation-1.5.0"
 ZERO = Decimal("0.0000")
 HUNDRED = Decimal("100")
 _CROSS_DEPARTMENT_WINDOW_SECONDS = 30
@@ -55,6 +55,8 @@ _AUXILIARY_TYPES = {
     DocumentType.REPRINT,
     DocumentType.DEVICE_RESPONSE,
     DocumentType.REFUND,
+    DocumentType.SHIFT_END_REPORT,
+    DocumentType.INVOICE,
 }
 
 _MANAGEMENT_PROGRESSIVE_TYPES = {

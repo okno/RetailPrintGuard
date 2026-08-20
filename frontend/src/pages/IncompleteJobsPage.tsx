@@ -58,9 +58,13 @@ export function IncompleteJobsPage() {
   const limit = Number(params.get('limit') ?? 25)
   const offset = Number(params.get('offset') ?? 0)
   const reviewState = params.get('review_state') ?? 'PENDING'
+  const includeTechnical = params.get('technical') === 'all'
   const apiParams = new URLSearchParams(params)
   apiParams.delete('period')
+  apiParams.delete('technical')
   apiParams.set('incomplete', 'true')
+  if (includeTechnical) apiParams.set('include_technical', 'true')
+  else apiParams.delete('include_technical')
   apiParams.set('review_state', reviewState)
   apiParams.set('limit', String(limit))
   apiParams.set('offset', String(offset))
@@ -131,7 +135,9 @@ export function IncompleteJobsPage() {
       subtitle="Revisione tecnica delle acquisizioni incomplete. Ogni decisione è auditata e non cancella mai RAW, manifest o documenti."
     />
     <Alert severity="info" sx={{ mb: 2 }}>
-      “Escludi dall’analisi” impedisce al job di influenzare correlazione e antifrode, ma conserva integralmente l’evidenza originale e lo storico della decisione.
+      La vista predefinita mostra solo incompleti con dati di vendita/importi o esiti
+      parser ancora incerti. I frammenti tecnici privi di contenuto commerciale restano
+      conservati e sono consultabili selezionando “Tutte le evidenze tecniche”.
     </Alert>
     {downloadError && <Box sx={{ mb: 2 }}><ErrorState error={downloadError} /></Box>}
     <Card sx={{ p: 2, mb: 2 }}>
@@ -142,6 +148,13 @@ export function IncompleteJobsPage() {
             <MenuItem value="PENDING">Da revisionare</MenuItem>
             <MenuItem value="VERIFIED_USABLE">Verificati e utilizzabili</MenuItem>
             <MenuItem value="EXCLUDED">Esclusi dall’analisi</MenuItem>
+          </Select>
+        </FormControl>
+        <FormControl size="small">
+          <InputLabel>Contenuto</InputLabel>
+          <Select label="Contenuto" value={includeTechnical ? 'all' : 'business'} onChange={(event) => setFilter('technical', String(event.target.value) === 'all' ? 'all' : '')}>
+            <MenuItem value="business">Vendite e importi</MenuItem>
+            <MenuItem value="all">Tutte le evidenze tecniche</MenuItem>
           </Select>
         </FormControl>
         <TextField size="small" label="Dispositivo" value={params.get('device_id') ?? ''} onChange={(event) => setFilter('device_id', event.target.value)} />

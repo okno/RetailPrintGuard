@@ -20,7 +20,7 @@ flowchart LR
 
 ## Correlazione spiegabile
 
-La versione correttiva corrente è `rpg-correlation-1.4.0`. Il punteggio usa criteri
+La versione correttiva corrente è `rpg-correlation-1.5.0`. Il punteggio usa criteri
 disponibili senza penalizzare automaticamente un campo assente. Tra i pesi
 massimi:
 

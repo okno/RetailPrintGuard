@@ -76,6 +76,8 @@ class DashboardView(BaseModel):
     pre_bills: int = 0
     management_documents: int = 0
     commercial_documents: int = 0
+    shift_end_reports: int = 0
+    invoices: int = 0
     open_alerts: int = 0
     critical_alerts: int = 0
     economic_difference: Decimal = Decimal("0")
@@ -230,6 +232,15 @@ class DocumentView(BaseModel):
     operator_code: str | None = None
     terminal_code: str | None = None
     covers: int | None = None
+    application_timestamp: datetime | None = None
+    application_timestamp_precision: str | None = None
+    application_timestamp_evidence: str | None = None
+    rch_footer_timestamp: datetime | None = None
+    rch_footer_timestamp_precision: str | None = None
+    rch_footer_timestamp_evidence: str | None = None
+    rch_serial_number: str | None = None
+    rch_serial_number_evidence: str | None = None
+    rch_clock_offset_seconds: int | None = None
     document_timestamp: datetime | None = None
     document_timestamp_precision: str | None = None
     document_timestamp_evidence: str | None = None

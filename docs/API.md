@@ -114,6 +114,14 @@ risolve in modo univoco il codice commerciale completo, l'API espone
 `resolved_external_document_code` e la relativa provenienza senza modificare
 il documento o la versione parser.
 
+I tipi `SHIFT_END_REPORT` e `INVOICE` distinguono rispettivamente il report di
+fine turno e la fattura dai generici documenti gestionali. Il dettaglio espone
+`application_timestamp`, `rch_footer_timestamp`, `rch_serial_number`, le
+relative evidenze/precisioni e `rch_clock_offset_seconds`; valori non osservati
+restano null. Le liste operative nascondono per default soltanto i frammenti
+incompleti privi di contenuto commerciale, conservandoli con
+`include_technical=true`.
+
 ## Revisione dei job incompleti
 
 `POST /jobs/{id}/review` è riservato ad `ADMIN` e accetta:

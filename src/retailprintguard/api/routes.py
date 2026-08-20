@@ -323,6 +323,7 @@ def create_router(context: ApiContext) -> APIRouter:
         device_id: str | None = None,
         job_status: str | None = Query(default=None, alias="status"),
         incomplete: bool | None = None,
+        include_technical: bool = False,
         review_state: str | None = None,
         period_from: Annotated[datetime | None, Query(alias="from")] = None,
         period_to: Annotated[datetime | None, Query(alias="to")] = None,
@@ -335,6 +336,7 @@ def create_router(context: ApiContext) -> APIRouter:
                 "device_id": device_id,
                 "status": job_status,
                 "incomplete": incomplete,
+                "include_technical": include_technical,
                 "review_state": review_state,
                 "from": normalized_from,
                 "to": normalized_to,
@@ -437,6 +439,7 @@ def create_router(context: ApiContext) -> APIRouter:
         offset: Annotated[int, Query(ge=0)] = 0,
         document_type: str | None = Query(default=None, alias="type"),
         exclude_type: str | None = None,
+        include_technical: bool = False,
         device_id: str | None = None,
         order_code: str | None = None,
         external_document_code: str | None = None,
@@ -452,6 +455,7 @@ def create_router(context: ApiContext) -> APIRouter:
             filters={
                 "type": document_type,
                 "exclude_type": exclude_type,
+                "include_technical": include_technical,
                 "device_id": device_id,
                 "order_code": order_code,
                 "external_document_code": external_document_code,
@@ -778,13 +782,18 @@ def create_router(context: ApiContext) -> APIRouter:
         offset: Annotated[int, Query(ge=0)] = 0,
         period_from: Annotated[datetime | None, Query(alias="from")] = None,
         period_to: Annotated[datetime | None, Query(alias="to")] = None,
+        include_technical: bool = False,
     ) -> Page[SearchHit]:
         normalized_from, normalized_to = _utc_period(period_from, period_to)
         items, total = repo.search(
             query=q,
             limit=limit,
             offset=offset,
-            filters={"from": normalized_from, "to": normalized_to},
+            filters={
+                "from": normalized_from,
+                "to": normalized_to,
+                "include_technical": include_technical,
+            },
         )
         return Page(items=items, total=total, limit=limit, offset=offset)
 

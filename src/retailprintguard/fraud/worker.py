@@ -14,7 +14,11 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from retailprintguard.common.domain import AlertSeverity, OrderEventType
+from retailprintguard.common.domain import (
+    NON_SALE_DOCUMENT_TYPES,
+    AlertSeverity,
+    OrderEventType,
+)
 from retailprintguard.common.domain import OrderEvent as DomainOrderEvent
 from retailprintguard.common.hashchain import ZERO_HASH, canonical_json, chained_hash
 from retailprintguard.correlation.engine import ALGORITHM_VERSION, CorrelationEngine
@@ -50,7 +54,7 @@ from retailprintguard.fraud.engine import (
 )
 from retailprintguard.fraud.versioning import rule_configuration_fingerprint
 
-FRAUD_ENGINE_VERSION = "rpg-fraud-1.2.0"
+FRAUD_ENGINE_VERSION = "rpg-fraud-1.3.0"
 _AUXILIARY_ECONOMIC_RULE_CODES = (
     "PREBILL_FISCAL_AMOUNT_DROP",
     "ITEM_REMOVED_AFTER_PREBILL",
@@ -546,7 +550,7 @@ class FraudWorker:
             .join(DocumentCorrelation, DocumentCorrelation.id == FraudAlert.correlation_id)
             .where(
                 DocumentCorrelation.status == "SUPERSEDED",
-                FraudAlert.status == "OPEN",
+                FraudAlert.status.in_(("OPEN", "UNDER_REVIEW", "CONFIRMED")),
             )
             .order_by(FraudAlert.opened_at, FraudAlert.id)
             .with_for_update()
@@ -587,7 +591,18 @@ class FraudWorker:
                 )
                 if old_members & candidate_members:
                     replacements.append(candidate)
-            if not replacements:
+            latest_members = load_latest_documents(
+                session,
+                document_ids=old_members,
+            )
+            retired_as_non_sale = (
+                len(latest_members) == len(old_members)
+                and all(
+                    member.value.type in NON_SALE_DOCUMENT_TYPES
+                    for member in latest_members
+                )
+            )
+            if not replacements and not retired_as_non_sale:
                 continue
 
             previous_status = alert.status
@@ -595,9 +610,15 @@ class FraudWorker:
             alert.closed_at = now
             alert.updated_at = now
             alert.closure_reason = (
-                "Correlazione sostituita da una valutazione corrente di algoritmo, parser "
-                "o insieme documentale; l'alert originario non rappresenta più lo stato "
-                "corrente."
+                "Il parser corrente ha riclassificato tutte le evidenze della correlazione "
+                "come documenti non di vendita; l'alert originario non rappresenta più lo "
+                "stato corrente."
+                if retired_as_non_sale and not replacements
+                else (
+                    "Correlazione sostituita da una valutazione corrente di algoritmo, "
+                    "parser o insieme documentale; l'alert originario non rappresenta più "
+                    "lo stato corrente."
+                )
             )
             evidence_sequence = (
                 session.scalar(
@@ -619,6 +640,10 @@ class FraudWorker:
                         "previous_correlation_id": str(alert.correlation_id),
                         "replacement_correlation_ids": replacement_id_strings,
                         "previous_document_ids": sorted(str(value) for value in old_members),
+                        "retired_as_non_sale": retired_as_non_sale,
+                        "current_document_types": sorted(
+                            member.value.type.value for member in latest_members
+                        ),
                     },
                 )
             )

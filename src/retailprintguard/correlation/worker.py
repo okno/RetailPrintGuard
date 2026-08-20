@@ -21,15 +21,16 @@ from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from retailprintguard.common.domain import (
-    DocumentLine as DomainLine,
-)
-from retailprintguard.common.domain import (
+    NON_SALE_DOCUMENT_TYPES,
     DocumentType,
     EvidenceLevel,
     NormalizedDocument,
     OrderEventType,
     PaymentRecord,
     SourceSpan,
+)
+from retailprintguard.common.domain import (
+    DocumentLine as DomainLine,
 )
 from retailprintguard.common.hashchain import ZERO_HASH, canonical_json, chained_hash
 from retailprintguard.correlation.engine import (
@@ -84,6 +85,9 @@ _VERSION_SEMANTIC_FIELDS = (
     "table_code",
     "operator_code",
     "terminal_code",
+    "application_timestamp",
+    "rch_footer_timestamp",
+    "rch_serial_number",
     "document_timestamp",
 )
 
@@ -466,6 +470,15 @@ def load_latest_documents(
             table_code=_versioned_semantic(version, document, "table_code"),
             operator_code=_versioned_semantic(version, document, "operator_code"),
             terminal_code=_versioned_semantic(version, document, "terminal_code"),
+            application_timestamp=_versioned_semantic(
+                version, document, "application_timestamp"
+            ),
+            rch_footer_timestamp=_versioned_semantic(
+                version, document, "rch_footer_timestamp"
+            ),
+            rch_serial_number=_versioned_semantic(
+                version, document, "rch_serial_number"
+            ),
             document_timestamp=_versioned_semantic(version, document, "document_timestamp"),
             captured_at=document.captured_at,
             gross_total=version.gross_total,
@@ -776,6 +789,46 @@ def correlation_input_fingerprint(
     return hashlib.sha256(canonical_json(evidence)).hexdigest()
 
 
+def _supersede_non_sale_correlations(
+    session: Session,
+    document_ids: set[UUID],
+) -> set[UUID]:
+    """Retire sale projections after an append-only semantic reclassification.
+
+    The document and every historical parser version remain immutable.  Only
+    the derived current-correlation pointer is retired; the fraud worker then
+    closes any operational alert with its normal hash-chained history.
+    """
+
+    if not document_ids:
+        return set()
+    correlations = session.scalars(
+        select(DocumentCorrelation)
+        .join(
+            DocumentCorrelationMember,
+            DocumentCorrelationMember.correlation_id == DocumentCorrelation.id,
+        )
+        .where(
+            DocumentCorrelationMember.document_id.in_(document_ids),
+            DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
+        )
+        .distinct()
+        .with_for_update()
+    ).all()
+    for correlation in correlations:
+        correlation.status = "SUPERSEDED"
+    correlation_ids = {correlation.id for correlation in correlations}
+    if not correlation_ids:
+        return set()
+    return set(
+        session.scalars(
+            select(DocumentCorrelationMember.document_id).where(
+                DocumentCorrelationMember.correlation_id.in_(correlation_ids)
+            )
+        )
+    )
+
+
 def _member_role(document: NormalizedDocument) -> str:
     if document.type in _SOURCE_TYPES:
         return "SOURCE"
@@ -830,10 +883,45 @@ class CorrelationWorker:
                 limit=max_documents,
                 lookback_seconds=self.time_window_seconds,
             )
-            by_id = {item.value.id: item for item in loaded}
+            non_sale_document_ids = {
+                item.value.id
+                for item in loaded
+                if item.value.type in NON_SALE_DOCUMENT_TYPES
+            }
+            retired_member_ids = _supersede_non_sale_correlations(
+                session,
+                non_sale_document_ids,
+            )
+            if retired_member_ids:
+                loaded_by_id = {item.value.id: item for item in loaded}
+                missing_member_ids = retired_member_ids - loaded_by_id.keys()
+                if missing_member_ids:
+                    loaded_by_id.update(
+                        (item.value.id, item)
+                        for item in load_latest_documents(
+                            session,
+                            document_ids=missing_member_ids,
+                        )
+                    )
+                loaded = tuple(
+                    sorted(
+                        loaded_by_id.values(),
+                        key=lambda item: (
+                            _document_time(item.value),
+                            str(item.value.id),
+                        ),
+                    )
+                )
+                seed_ids.update(retired_member_ids)
+            analysis_loaded = [
+                item
+                for item in loaded
+                if item.value.type not in NON_SALE_DOCUMENT_TYPES
+            ]
+            by_id = {item.value.id: item for item in analysis_loaded}
             transactions = self.engine.correlate_candidates(
-                (item.value for item in loaded),
-                _candidate_pairs(loaded, seed_ids, self.time_window_seconds),
+                (item.value for item in analysis_loaded),
+                _candidate_pairs(analysis_loaded, seed_ids, self.time_window_seconds),
             )
             correlations_inserted = 0
             orders_created = 0

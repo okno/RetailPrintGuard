@@ -74,7 +74,7 @@ Sono presenti due parser nativi versionati:
   split su comandi cut osservati, codepage allowlist, controlli resi come marker
   leggibili, quantità firmate, portate, ricomposizione conservativa delle righe
   mandate a capo e OCR raster bounded;
-- `retailprintguard-rch-observed` `1.3.0`: framing incrementale sul flusso ricostruito,
+- `retailprintguard-rch-observed` `1.5.0`: framing incrementale sul flusso ricostruito,
   BCC, ACK e issue bounded; ricostruisce aperture/chiusure gestionali e
   commerciali osservate e produce anche `DEVICE_RESPONSE` per frame reverse
   validi. Data e ora sono assegnate al documento solo se visibili nel testo
@@ -229,7 +229,7 @@ riavvolga per default il watermark di correlazione:
 
 ```bash
 RPG_PARSER_NAME='retailprintguard-escpos'
-RPG_PARSER_VERSION='1.3.0'
+RPG_PARSER_VERSION='1.5.0'
 RPG_PARSER_BUILD_SHA256='incollare-qui-i-64-caratteri-esadecimali-verificati'
 RPG_PARSER_CHANGE_REASON='inserire change-id e motivazione approvata'
 [[ "${RPG_PARSER_BUILD_SHA256}" =~ ^[0-9a-f]{64}$ ]] || exit 1

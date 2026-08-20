@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from retailprintguard.common.domain import (
+    NON_SALE_DOCUMENT_TYPES,
     AlertSeverity,
     DocumentType,
     FraudFinding,
@@ -418,6 +419,11 @@ class FraudEngine:
         return FraudEvaluation(findings=tuple(visible), suppressed=tuple(suppressed))
 
     def _evaluate_candidates(self, context: FraudContext) -> tuple[FraudFinding, ...]:
+        if context.transaction.documents and all(
+            document.type in NON_SALE_DOCUMENT_TYPES
+            for document in context.transaction.documents
+        ):
+            return ()
         findings: list[FraudFinding] = []
         for rule in self.rules:
             if not rule.enabled:

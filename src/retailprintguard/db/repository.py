@@ -132,6 +132,9 @@ _VERSION_SEMANTIC_FIELDS = (
     "table_code",
     "operator_code",
     "terminal_code",
+    "application_timestamp",
+    "rch_footer_timestamp",
+    "rch_serial_number",
     "document_timestamp",
 )
 
@@ -184,6 +187,166 @@ def _version_column(version_column: Any, legacy_column: Any) -> Any:
             legacy_column,
         ),
         else_=version_column,
+    )
+
+
+def _configured_rch_serial_number(device: Device | None) -> str | None:
+    """Return a validated fiscal serial from non-sensitive device metadata.
+
+    The configured value is a control-plane fallback only.  It is deliberately
+    kept out of parser evidence and is accepted solely for RCH devices when it
+    has the same conservative shape as a serial printed by the fiscal device.
+    """
+
+    if device is None or str(device.device_type).lower() != "rch":
+        return None
+    metadata = device.non_sensitive_config
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("fiscal_serial_number")
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().upper()
+    if (
+        not 8 <= len(candidate) <= 32
+        or not candidate.isascii()
+        or not candidate.isalnum()
+        or not any(character.isalpha() for character in candidate)
+        or not any(character.isdigit() for character in candidate)
+    ):
+        return None
+    return candidate
+
+
+def _document_has_business_content() -> Any:
+    """Return the conservative SQL predicate for operator-facing evidence.
+
+    An incomplete parser projection is business-relevant when it contains at
+    least one structured sale identity, monetary observation, payment, or
+    normalized line.  Deliberately do not infer relevance from the RAW byte
+    count: a short payload may still contain a real sale.  Conversely, control
+    bytes and an unclosed RCH fragment with no structured content remain
+    preserved evidence but are technical-only.
+    """
+
+    semantic_identities = (
+        _version_column(
+            DocumentVersion.external_document_code,
+            Document.external_document_code,
+        ),
+        _version_column(
+            DocumentVersion.external_document_code_suffix,
+            Document.external_document_code_suffix,
+        ),
+        _version_column(
+            DocumentVersion.commercial_reference_code,
+            Document.commercial_reference_code,
+        ),
+        _version_column(DocumentVersion.order_code, Document.order_code),
+        _version_column(DocumentVersion.table_code, Document.table_code),
+    )
+    structured_line = (
+        select(DocumentLine.id)
+        .where(
+            DocumentLine.document_version_id == DocumentVersion.id,
+            or_(
+                DocumentLine.item_code.is_not(None),
+                and_(
+                    DocumentLine.description.is_not(None),
+                    func.trim(DocumentLine.description) != "",
+                ),
+                DocumentLine.quantity.is_not(None),
+                DocumentLine.unit_price.is_not(None),
+                DocumentLine.original_unit_price.is_not(None),
+                DocumentLine.modified_unit_price.is_not(None),
+                DocumentLine.discount.is_not(None),
+                DocumentLine.surcharge.is_not(None),
+                DocumentLine.tax_rate.is_not(None),
+                DocumentLine.line_total.is_not(None),
+            ),
+        )
+        .correlate(DocumentVersion)
+        .exists()
+    )
+    payment = (
+        select(Payment.id)
+        .where(Payment.document_version_id == DocumentVersion.id)
+        .correlate(DocumentVersion)
+        .exists()
+    )
+    return or_(
+        *(value.is_not(None) for value in semantic_identities),
+        DocumentVersion.gross_total.is_not(None),
+        DocumentVersion.net_total.is_not(None),
+        DocumentVersion.discount_total.is_not(None),
+        DocumentVersion.tax_total.is_not(None),
+        DocumentVersion.payment_method.is_not(None),
+        structured_line,
+        payment,
+    )
+
+
+def _operator_visible_document() -> Any:
+    """Documents shown outside an explicit technical-evidence view."""
+
+    semantic_type = _version_column(
+        DocumentVersion.document_type,
+        Document.document_type,
+    )
+    return and_(
+        semantic_type != DocumentType.DEVICE_RESPONSE.value,
+        or_(DocumentVersion.complete.is_(True), _document_has_business_content()),
+    )
+
+
+def _job_has_operator_relevant_content() -> Any:
+    """Keep uncertain parse failures visible; suppress only classified noise."""
+
+    relevant_document = (
+        select(Document.id)
+        .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+        .where(
+            Document.job_id == PrintJob.id,
+            DocumentVersion.id == _latest_version_id(),
+            _operator_visible_document(),
+        )
+        .correlate(PrintJob)
+        .exists()
+    )
+    # PARSED/PARSE_EMPTY are terminal parser classifications.  For every other
+    # state the payload is uncertain, so it must stay in the operator review
+    # queue even when no structured document exists yet.
+    return or_(
+        PrintJob.import_status.not_in(("PARSED", "PARSE_EMPTY")),
+        relevant_document,
+    )
+
+
+def _order_has_current_correlation() -> Any:
+    """Keep historical orders immutable but out of the operational projection.
+
+    A parser reclassification can retire every sale correlation that justified
+    an Order.  The Order and its hash-chained events remain auditable; list and
+    search views expose it only while at least one event source still belongs
+    to a current correlation.
+    """
+
+    return (
+        select(OrderEvent.id)
+        .join(
+            DocumentCorrelationMember,
+            DocumentCorrelationMember.document_id == OrderEvent.source_document_id,
+        )
+        .join(
+            DocumentCorrelation,
+            DocumentCorrelation.id == DocumentCorrelationMember.correlation_id,
+        )
+        .where(
+            OrderEvent.order_id == Order.id,
+            DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED")),
+        )
+        .correlate(Order)
+        .exists()
     )
 
 
@@ -593,7 +756,11 @@ class SqlAlchemyApiRepository:
                 select(semantic_type)
                 .select_from(DocumentVersion)
                 .join(Document, Document.id == DocumentVersion.document_id)
-                .where(DocumentVersion.id == _latest_version_id(), *document_period)
+                .where(
+                    DocumentVersion.id == _latest_version_id(),
+                    _operator_visible_document(),
+                    *document_period,
+                )
                 .subquery()
             )
             type_counts = dict(
@@ -756,6 +923,7 @@ class SqlAlchemyApiRepository:
                     .select_from(PrintJob)
                     .where(
                         self._incomplete_job_predicate(),
+                        _job_has_operator_relevant_content(),
                         PrintJob.review_state == "PENDING",
                         *incomplete_period,
                     )
@@ -813,6 +981,8 @@ class SqlAlchemyApiRepository:
                 pre_bills=type_counts.get(DocumentType.PRE_BILL.value, 0),
                 management_documents=type_counts.get(DocumentType.MANAGEMENT_DOCUMENT.value, 0),
                 commercial_documents=type_counts.get(DocumentType.COMMERCIAL_DOCUMENT.value, 0),
+                shift_end_reports=type_counts.get(DocumentType.SHIFT_END_REPORT.value, 0),
+                invoices=type_counts.get(DocumentType.INVOICE.value, 0),
                 open_alerts=open_alerts,
                 critical_alerts=critical,
                 economic_difference=economic,
@@ -1100,6 +1270,8 @@ class SqlAlchemyApiRepository:
             incomplete = self._incomplete_job_predicate()
             if filters.get("incomplete") is True:
                 statement = statement.where(incomplete)
+                if not filters.get("include_technical"):
+                    statement = statement.where(_job_has_operator_relevant_content())
             elif filters.get("incomplete") is False:
                 statement = statement.where(~incomplete)
             if filters.get("from") is not None:
@@ -1436,7 +1608,8 @@ class SqlAlchemyApiRepository:
             for correlations in correlations_by_document.values()
             for _member, correlation in correlations
             if correlation.status == "AUTOMATIC"
-            and correlation.algorithm_version == "rpg-correlation-1.4.0"
+            and correlation.algorithm_version
+            in {"rpg-correlation-1.4.0", "rpg-correlation-1.5.0"}
             and correlation.score == 100
             and required_suffix_criteria.issubset(
                 {str(value) for value in (correlation.matched_criteria or [])}
@@ -1538,6 +1711,31 @@ class SqlAlchemyApiRepository:
             resolved_code, resolved_code_provenance = resolved_external_code(
                 document, version
             )
+            observed_rch_serial_number = _version_value(
+                version, document, "rch_serial_number"
+            )
+            configured_rch_serial_number = _configured_rch_serial_number(device)
+            if observed_rch_serial_number is None:
+                rch_serial_number = configured_rch_serial_number
+                rch_serial_number_evidence = (
+                    "DEVICE_METADATA_CONFIGURED"
+                    if configured_rch_serial_number is not None
+                    else None
+                )
+            else:
+                rch_serial_number = observed_rch_serial_number
+                rch_serial_number_evidence = (
+                    str(
+                        (version.raw_metadata or {}).get(
+                            "rch_serial_number_evidence"
+                        )
+                    )
+                    if isinstance(version.raw_metadata, dict)
+                    and (version.raw_metadata or {}).get(
+                        "rch_serial_number_evidence"
+                    )
+                    else None
+                )
             result.append(
                 DocumentView(
                     id=document.id,
@@ -1568,6 +1766,75 @@ class SqlAlchemyApiRepository:
                     table_code=_version_value(version, document, "table_code"),
                     operator_code=_version_value(version, document, "operator_code"),
                     terminal_code=_version_value(version, document, "terminal_code"),
+                    application_timestamp=_version_value(
+                        version, document, "application_timestamp"
+                    ),
+                    application_timestamp_precision=(
+                        str(
+                            (version.raw_metadata or {}).get(
+                                "application_timestamp_precision"
+                            )
+                        )
+                        if isinstance(version.raw_metadata, dict)
+                        and (version.raw_metadata or {}).get(
+                            "application_timestamp_precision"
+                        )
+                        else None
+                    ),
+                    application_timestamp_evidence=(
+                        str(
+                            (version.raw_metadata or {}).get(
+                                "application_timestamp_evidence"
+                            )
+                        )
+                        if isinstance(version.raw_metadata, dict)
+                        and (version.raw_metadata or {}).get(
+                            "application_timestamp_evidence"
+                        )
+                        else None
+                    ),
+                    rch_footer_timestamp=_version_value(
+                        version, document, "rch_footer_timestamp"
+                    ),
+                    rch_footer_timestamp_precision=(
+                        str(
+                            (version.raw_metadata or {}).get(
+                                "rch_footer_timestamp_precision"
+                            )
+                        )
+                        if isinstance(version.raw_metadata, dict)
+                        and (version.raw_metadata or {}).get(
+                            "rch_footer_timestamp_precision"
+                        )
+                        else None
+                    ),
+                    rch_footer_timestamp_evidence=(
+                        str(
+                            (version.raw_metadata or {}).get(
+                                "rch_footer_timestamp_evidence"
+                            )
+                        )
+                        if isinstance(version.raw_metadata, dict)
+                        and (version.raw_metadata or {}).get(
+                            "rch_footer_timestamp_evidence"
+                        )
+                        else None
+                    ),
+                    rch_serial_number=rch_serial_number,
+                    rch_serial_number_evidence=rch_serial_number_evidence,
+                    rch_clock_offset_seconds=(
+                        int(
+                            (
+                                _version_value(version, document, "rch_footer_timestamp")
+                                - _version_value(version, document, "application_timestamp")
+                            ).total_seconds()
+                        )
+                        if _version_value(version, document, "rch_footer_timestamp")
+                        is not None
+                        and _version_value(version, document, "application_timestamp")
+                        is not None
+                        else None
+                    ),
                     covers=_as_nonnegative_int(
                         (version.raw_metadata or {}).get("covers")
                         if isinstance(version.raw_metadata, dict)
@@ -1775,6 +2042,17 @@ class SqlAlchemyApiRepository:
                 statement = statement.where(semantic_type == str(filters["type"]))
             elif filters.get("exclude_type"):
                 statement = statement.where(semantic_type != str(filters["exclude_type"]))
+            elif not filters.get("include_technical"):
+                statement = statement.where(
+                    semantic_type != DocumentType.DEVICE_RESPONSE.value
+                )
+            if not filters.get("include_technical"):
+                statement = statement.where(
+                    or_(
+                        DocumentVersion.complete.is_(True),
+                        _document_has_business_content(),
+                    )
+                )
             if filters.get("device_id"):
                 statement = statement.where(Device.external_id == str(filters["device_id"]))
             if filters.get("order_code"):
@@ -1921,7 +2199,9 @@ class SqlAlchemyApiRepository:
     ) -> tuple[list[OrderView], int]:
         limit, offset = _page(limit, offset)
         with self._read() as session:
-            statement: Select[Any] = select(Order)
+            statement: Select[Any] = select(Order).where(
+                _order_has_current_correlation()
+            )
             if filters.get("table_code"):
                 statement = statement.where(Order.table_code == str(filters["table_code"]))
             if filters.get("order_code"):
@@ -2208,6 +2488,7 @@ class SqlAlchemyApiRepository:
         ]
         snapshots: dict[UUID, OrderSnapshot] = {}
         if order is not None:
+            current_document_ids = {document.id for document in documents}
             snapshots = {
                 snapshot.order_event_id: snapshot
                 for snapshot in session.scalars(
@@ -2217,7 +2498,13 @@ class SqlAlchemyApiRepository:
             }
             for event in session.scalars(
                 select(OrderEvent)
-                .where(OrderEvent.order_id == order.id)
+                .where(
+                    OrderEvent.order_id == order.id,
+                    or_(
+                        OrderEvent.source_document_id.in_(current_document_ids),
+                        OrderEvent.source_document_id.is_(None),
+                    ),
+                )
                 .order_by(OrderEvent.occurred_at, OrderEvent.sequence)
             ):
                 snapshot = snapshots.get(event.id)
@@ -2956,7 +3243,15 @@ class SqlAlchemyApiRepository:
                 select(Document, DocumentVersion)
                 .join(Device, Device.id == Document.device_id)
                 .join(DocumentVersion, DocumentVersion.id == _latest_version_id())
-                .where(or_(*document_predicates), *document_period)
+                .where(
+                    or_(*document_predicates),
+                    *(
+                        ()
+                        if filters.get("include_technical")
+                        else (_operator_visible_document(),)
+                    ),
+                    *document_period,
+                )
                 .order_by(Document.captured_at.desc())
                 .limit(500)
             ).all()
@@ -3012,6 +3307,7 @@ class SqlAlchemyApiRepository:
             for order in session.scalars(
                 select(Order)
                 .where(
+                    _order_has_current_correlation(),
                     or_(
                         Order.order_code.ilike(pattern, escape="\\"),
                         Order.table_code.ilike(pattern, escape="\\"),

@@ -21,7 +21,9 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen.canvas import Canvas
 
-PDF_RENDERER_VERSION = "rpg-receipt-pdf-1.1.0"
+from retailprintguard.render.text import NOT_OBSERVED_IN_FLOW, rch_identity_text_lines
+
+PDF_RENDERER_VERSION = "rpg-receipt-pdf-1.3.0"
 _ROME = ZoneInfo("Europe/Rome")
 _PAGE_WIDTH = 80 * mm
 _MAX_PAGE_HEIGHT = 297 * mm
@@ -32,6 +34,10 @@ _BODY_WIDTH = _PAGE_WIDTH - 2 * _MARGIN
 _MAX_SOURCE_CHARACTERS = 250_000
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _KITCHEN_TYPES = {"ORDER", "ORDER_CHANGE", "KITCHEN_ORDER"}
+_DOCUMENT_TYPE_LABELS = {
+    "SHIFT_END_REPORT": "REPORT DI FINE TURNO",
+    "INVOICE": "FATTURA",
+}
 _UNSET = object()
 
 
@@ -286,16 +292,53 @@ def _kitchen_lines(document: Any, normalized: str) -> list[_RenderLine]:
 
 
 def _generic_lines(document: Any, normalized: str) -> list[_RenderLine]:
-    timestamp = document.document_timestamp or document.captured_at
-    local_timestamp = timestamp.astimezone(_ROME).strftime("%d/%m/%Y %H:%M:%S")
-    title = _safe_text(document.subtype or document.type).replace("_", " ")
+    document_type = _safe_text(document.type)
+    document_type_label = _DOCUMENT_TYPE_LABELS.get(
+        document_type,
+        document_type.replace("_", " "),
+    )
+    title = _DOCUMENT_TYPE_LABELS.get(
+        document_type,
+        _safe_text(document.subtype or document.type).replace("_", " "),
+    )
     lines: list[_RenderLine] = [
         _RenderLine(title, "title"),
-        _RenderLine(_safe_text(document.type).replace("_", " "), "subtitle"),
+        _RenderLine(document_type_label, "subtitle"),
         _RenderLine(style="rule"),
-        _RenderLine(f"Data: {local_timestamp}"),
-        _RenderLine(f"Dispositivo: {_safe_text(document.device_id)}"),
     ]
+    rch_context = any(
+        (
+            str(getattr(document, "device_id", "")).lower().startswith("rch"),
+            "rch" in str(getattr(document, "parser_name", "")).lower(),
+            getattr(document, "application_timestamp", None) is not None,
+            getattr(document, "rch_footer_timestamp", None) is not None,
+            getattr(document, "rch_serial_number", None) is not None,
+        )
+    )
+    if rch_context:
+        for identity_line in rch_identity_text_lines(document):
+            style = "meta" if identity_line.startswith("  ") else "body"
+            _append_wrapped(lines, identity_line, style)
+    else:
+        document_timestamp = getattr(document, "document_timestamp", None)
+        if document_timestamp is None:
+            document_timestamp_text = NOT_OBSERVED_IN_FLOW
+        else:
+            precision = getattr(document, "document_timestamp_precision", None)
+            pattern = "%d/%m/%Y %H:%M" if precision == "MINUTE" else "%d/%m/%Y %H:%M:%S"
+            document_timestamp_text = document_timestamp.astimezone(_ROME).strftime(pattern)
+        captured_text = document.captured_at.astimezone(_ROME).strftime("%d/%m/%Y %H:%M:%S")
+        lines.extend(
+            (
+                _RenderLine(f"Ora documento: {document_timestamp_text}"),
+                _RenderLine(f"Acquisizione server: {captured_text}"),
+                _RenderLine(
+                    "  Provenienza acquisizione: timestamp del server, non del documento",
+                    "meta",
+                ),
+            )
+        )
+    lines.append(_RenderLine(f"Dispositivo: {_safe_text(document.device_id)}"))
     progressive_status = {
         "FULL_CODE_OBSERVED_IN_CAPTURE": "progressivo completo osservato nel flusso",
         "SUFFIX_ONLY_OBSERVED_IN_CAPTURE": (

@@ -1,5 +1,5 @@
 import { SearchOutlined } from '@mui/icons-material'
-import { Box, Button, Card, InputAdornment, List, ListItemButton, ListItemText, TextField, Typography } from '@mui/material'
+import { Box, Button, Card, FormControl, InputAdornment, InputLabel, List, ListItemButton, ListItemText, MenuItem, Select, TextField, Typography } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { FormEvent, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
@@ -42,6 +42,12 @@ export function SearchPage() {
       setParams(next)
     }
   }
+  function setEvidenceScope(value: string) {
+    const next = new URLSearchParams(params)
+    value === 'technical' ? next.set('include_technical', 'true') : next.delete('include_technical')
+    next.set('offset', '0')
+    setParams(next)
+  }
   return (
     <>
       <PageHeader title="Ricerca globale" subtitle="Documenti, ordini, tavoli, articoli, importi, hash e dispositivi." />
@@ -52,6 +58,13 @@ export function SearchPage() {
         </Box>
         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' }, gap: 2, mt: 2 }}>
           <PeriodPicker params={params} onChange={setParams} />
+          <FormControl size="small">
+            <InputLabel>Ambito evidenze</InputLabel>
+            <Select label="Ambito evidenze" value={params.get('include_technical') === 'true' ? 'technical' : 'business'} onChange={(event) => setEvidenceScope(String(event.target.value))}>
+              <MenuItem value="business">Documenti di vendita</MenuItem>
+              <MenuItem value="technical">Incluse evidenze tecniche</MenuItem>
+            </Select>
+          </FormControl>
         </Box>
       </Card>
       <Card>

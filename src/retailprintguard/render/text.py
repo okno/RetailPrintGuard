@@ -8,10 +8,142 @@ application and PDF renderer; it never reads or changes the immutable RAW.
 from __future__ import annotations
 
 import re
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
 _OCR_BLOCK = re.compile(r"<OCR:[^>]+>(.*?)</OCR:[^>]+>", re.DOTALL)
 _TECHNICAL_TOKEN = re.compile(r"<(?:ESC/POS|BYTE):[^>]*>")
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_ROME = ZoneInfo("Europe/Rome")
+NOT_OBSERVED_IN_FLOW = "Non osservato nel flusso"
+
+
+def _printed_timestamp(value: Any, precision: str | None) -> str:
+    if value is None:
+        return NOT_OBSERVED_IN_FLOW
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return "Timestamp non valido"
+    pattern = "%d/%m/%Y %H:%M" if precision == "MINUTE" else "%d/%m/%Y %H:%M:%S"
+    return value.astimezone(_ROME).strftime(pattern)
+
+
+def _timestamp_evidence(value: Any) -> str:
+    labels = {
+        "RCH_APPLICATION_PRINTED_TEXT": "testo applicativo stampato dalla RCH",
+        "RCH_FOOTER_PRINTED_TEXT": "footer stampato dalla RCH",
+        "ESC_POS_PRINTED_OPERATOR_LINE": "riga operatore stampata dal gestionale POS",
+        "DEVICE_METADATA_CONFIGURED": (
+            "metadato dispositivo configurato (non osservato nel flusso)"
+        ),
+    }
+    if value is None:
+        return NOT_OBSERVED_IN_FLOW
+    return labels.get(str(value), f"evidenza dichiarata: {value}")
+
+
+def _serial_evidence(value: Any) -> str:
+    labels = {
+        "RCH_PRINTED_RT_PREFIX": "prefisso RT stampato dalla RCH",
+        "RCH_PRINTED_BARE_SERIAL_AFTER_FOOTER": (
+            "seriale stampato dopo il footer RCH"
+        ),
+        "DEVICE_METADATA_CONFIGURED": (
+            "metadato dispositivo configurato (non osservato nel flusso)"
+        ),
+    }
+    if value is None:
+        return NOT_OBSERVED_IN_FLOW
+    return labels.get(str(value), f"evidenza dichiarata: {value}")
+
+
+def _clock_offset(value: Any) -> str:
+    if value is None:
+        return (
+            "Non calcolabile: uno o entrambi gli orari non sono stati "
+            "osservati nel flusso"
+        )
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return "Scarto non valido"
+    if seconds == 0:
+        return "0 s (orologi allineati al minuto/secondo osservato)"
+    magnitude = abs(seconds)
+    minutes, remainder = divmod(magnitude, 60)
+    duration = " ".join(
+        part
+        for part in (
+            f"{minutes} min" if minutes else "",
+            f"{remainder} s" if remainder else "",
+        )
+        if part
+    )
+    relation = "indietro" if seconds < 0 else "avanti"
+    return (
+        f"{seconds:+d} s (footer RCH {relation} di {duration} "
+        "rispetto all'ora applicativa)"
+    )
+
+
+def rch_identity_text_lines(document: Any) -> list[str]:
+    """Return truthful, separately sourced RCH timing and identity fields.
+
+    Missing printed values are never substituted with the server capture time.
+    A configured serial may be displayed, but its provenance explicitly states
+    that it was not observed in the captured wire stream.
+    """
+
+    application = getattr(document, "application_timestamp", None)
+    footer = getattr(document, "rch_footer_timestamp", None)
+    serial = getattr(document, "rch_serial_number", None)
+    captured = getattr(document, "captured_at", None)
+    captured_text = _printed_timestamp(captured, "SECOND")
+    if captured is None:
+        captured_text = "Non disponibile"
+    serial_text = (
+        NOT_OBSERVED_IN_FLOW
+        if serial is None
+        else _CONTROL_CHARACTER.sub("", str(serial)).strip() or NOT_OBSERVED_IN_FLOW
+    )
+    return [
+        "Ora applicativa RCH: "
+        + _printed_timestamp(
+            application, getattr(document, "application_timestamp_precision", None)
+        ),
+        "  Provenienza: "
+        + (
+            _timestamp_evidence(
+                getattr(document, "application_timestamp_evidence", None)
+            )
+            if application is not None
+            else NOT_OBSERVED_IN_FLOW
+        ),
+        f"Acquisizione server: {captured_text}",
+        "  Provenienza: timestamp registrato dal server; "
+        "non e' un orario stampato dalla RCH",
+        "Ora footer RCH: "
+        + _printed_timestamp(
+            footer, getattr(document, "rch_footer_timestamp_precision", None)
+        ),
+        "  Provenienza: "
+        + (
+            _timestamp_evidence(
+                getattr(document, "rch_footer_timestamp_evidence", None)
+            )
+            if footer is not None
+            else NOT_OBSERVED_IN_FLOW
+        ),
+        "Scarto orologio (footer - applicativa): "
+        + _clock_offset(getattr(document, "rch_clock_offset_seconds", None)),
+        f"Seriale RCH: {serial_text}",
+        "  Provenienza: "
+        + (
+            _serial_evidence(getattr(document, "rch_serial_number_evidence", None))
+            if serial is not None
+            else NOT_OBSERVED_IN_FLOW
+        ),
+    ]
 
 
 def receipt_text(normalized_text: str, *, maximum_characters: int = 250_000) -> str:
@@ -44,4 +176,4 @@ def receipt_text(normalized_text: str, *, maximum_characters: int = 250_000) -> 
     return "\n".join(output).strip("\n")
 
 
-__all__ = ["receipt_text"]
+__all__ = ["NOT_OBSERVED_IN_FLOW", "rch_identity_text_lines", "receipt_text"]

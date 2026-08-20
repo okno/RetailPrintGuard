@@ -44,11 +44,16 @@ import {
   ALL_EVIDENCE_FILTER,
   deviceLabel,
   documentApiSearchParams,
-  documentTimestampEvidenceLabel,
   documentTypeLabel,
   presentedDocuments,
 } from '../documentPresentation'
 import { formatDocumentDateTime, mediumDateTime as date } from '../format'
+import {
+  NOT_OBSERVED_IN_FLOW,
+  rchClockOffsetLabel,
+  rchSerialEvidenceLabel,
+  rchTimestampEvidenceLabel,
+} from '../rchIdentityPresentation'
 import { documentDetailPath } from '../routes'
 import type { DocumentRecord, Page } from '../types'
 
@@ -60,6 +65,8 @@ const documentTypes = [
   'PRE_BILL',
   'MANAGEMENT_DOCUMENT',
   'COMMERCIAL_DOCUMENT',
+  'SHIFT_END_REPORT',
+  'INVOICE',
   'CONFORMING_COPY',
   'CANCELLATION',
   'REFUND',
@@ -70,7 +77,7 @@ const documentTypes = [
 ] as const
 
 const columnLabels: Record<DocumentColumnId, string> = {
-  document_time: 'Ora cassa',
+  document_time: 'Orari documento',
   captured_at: 'Acquisito',
   type: 'Tipo',
   references: 'Riferimenti',
@@ -128,10 +135,30 @@ export function DocumentsPage() {
   }
 
   function renderColumn(column: DocumentColumnId, doc: DocumentRecord): ReactNode {
-    if (column === 'document_time') return doc.document_timestamp ? <>
-      <strong>{formatDocumentDateTime(doc.document_timestamp, doc.document_timestamp_precision)}</strong>
-      <br /><small>{documentTimestampEvidenceLabel(doc.document_timestamp_evidence)}</small>
-    </> : '—'
+    if (column === 'document_time') {
+      const isRch = doc.device_id.toLowerCase().startsWith('rch')
+        || doc.parser_name.toLowerCase().includes('rch')
+        || doc.application_timestamp != null
+        || doc.rch_footer_timestamp != null
+      if (!isRch) return doc.document_timestamp ? <>
+        <strong>{formatDocumentDateTime(doc.document_timestamp, doc.document_timestamp_precision)}</strong>
+        <br /><small>{rchTimestampEvidenceLabel(doc.document_timestamp_evidence)}</small>
+      </> : '—'
+      return <>
+        {doc.application_timestamp ? <>
+          <strong>Applicativa RCH {formatDocumentDateTime(doc.application_timestamp, doc.application_timestamp_precision ?? undefined)}</strong>
+          <br /><small>{rchTimestampEvidenceLabel(doc.application_timestamp_evidence)}</small>
+        </> : doc.document_timestamp ? <>
+          <strong>Ora documento {formatDocumentDateTime(doc.document_timestamp, doc.document_timestamp_precision)}</strong>
+          <br /><small>{rchTimestampEvidenceLabel(doc.document_timestamp_evidence)}</small>
+        </> : <strong>Applicativa RCH: {NOT_OBSERVED_IN_FLOW}</strong>}
+        <br />
+        {doc.rch_footer_timestamp
+          ? <>Footer RCH {formatDocumentDateTime(doc.rch_footer_timestamp, doc.rch_footer_timestamp_precision ?? undefined)}<br /><small>{rchTimestampEvidenceLabel(doc.rch_footer_timestamp_evidence)}</small></>
+          : <small>Footer RCH: {NOT_OBSERVED_IN_FLOW}</small>}
+        {doc.rch_clock_offset_seconds != null && <><br /><small>{rchClockOffsetLabel(doc.rch_clock_offset_seconds)}</small></>}
+      </>
+    }
     if (column === 'captured_at') return date.format(new Date(doc.captured_at))
     if (column === 'type') return <>
       <strong>{documentTypeLabel(doc.type)}</strong>
@@ -153,6 +180,10 @@ export function DocumentsPage() {
     if (column === 'device') return <>
       <strong>{deviceLabel(doc.device_id)}</strong>
       {deviceLabel(doc.device_id) !== doc.device_id && <><br /><small>{doc.device_id}</small></>}
+      {(doc.device_id.toLowerCase().startsWith('rch') || doc.parser_name.toLowerCase().includes('rch')) && <>
+        <br />Seriale RCH: {doc.rch_serial_number ?? NOT_OBSERVED_IN_FLOW}
+        {doc.rch_serial_number && <><br /><small>{rchSerialEvidenceLabel(doc.rch_serial_number_evidence)}</small></>}
+      </>}
     </>
     if (column === 'total') {
       return doc.gross_total !== undefined && doc.gross_total !== null
@@ -222,9 +253,9 @@ export function DocumentsPage() {
       </Box>
     </Card>
     {!selectedType && <Alert severity="info" sx={{ mb: 2 }}>
-      Le risposte tecniche della stampante RCH sono conservate ma separate dalla vista
-      documentale primaria. Seleziona “Risposte tecniche RCH” o “Tutte le evidenze” per
-      consultarle.
+      Le risposte RCH e i frammenti incompleti senza righe, riferimenti o importi sono
+      conservati come evidenza tecnica ma separati dalla vista primaria. Seleziona
+      “Risposte tecniche RCH” o “Tutte le evidenze” per consultarli.
     </Alert>}
     <Card>
       {query.isLoading ? <LoadingState /> : query.error ? <ErrorState error={query.error} /> : !visibleDocuments.length ? <EmptyState /> : <>

@@ -244,6 +244,73 @@ def _document(
     return document_id
 
 
+def _activate_reclassified_versions(
+    session: object,
+    *,
+    document_ids: tuple[UUID, ...],
+    document_type: str,
+    version: str,
+) -> None:
+    parser = ParserVersion(
+        name="test",
+        version=version,
+        build_sha256=_sha(f"parser-{version}"),
+        protocol="test",
+    )
+    session.add(parser)  # type: ignore[attr-defined]
+    session.flush()  # type: ignore[attr-defined]
+    for document_id in document_ids:
+        previous = session.scalar(  # type: ignore[attr-defined]
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == document_id)
+            .order_by(DocumentVersion.version_sequence.desc())
+        )
+        assert previous is not None
+        session.add(  # type: ignore[attr-defined]
+            DocumentVersion(
+                document_id=document_id,
+                parser_version_id=parser.id,
+                raw_payload_id=previous.raw_payload_id,
+                version_sequence=previous.version_sequence + 1,
+                document_type=document_type,
+                subtype=(
+                    "RCH_REPORT_FINE_TURNO_LITERAL"
+                    if document_type == "SHIFT_END_REPORT"
+                    else "RCH_FATTURA_LITERAL"
+                ),
+                status="COMPLETE",
+                normalized_text=(
+                    "Report di fine turno\nFatture 42,35"
+                    if document_type == "SHIFT_END_REPORT"
+                    else "FATTURA N. FT-0042"
+                ),
+                parse_confidence=98,
+                evidence_level="CONFIRMED",
+                source_manifest_sha256=previous.source_manifest_sha256,
+                source_payload_sha256=previous.source_payload_sha256,
+                source_path=previous.source_path,
+                complete=True,
+                chain_scope=previous.chain_scope,
+                chain_sequence=previous.chain_sequence + 1,
+                previous_record_hash=previous.record_hash,
+                record_hash=_sha(f"{document_type}-{document_id}-{version}"),
+                parsed_at=NOW + timedelta(minutes=10),
+            )
+        )
+    pointer = session.get(ActiveParserVersion, "test")  # type: ignore[attr-defined]
+    if pointer is None:
+        session.add(  # type: ignore[attr-defined]
+            ActiveParserVersion(
+                parser_name="test",
+                parser_version_id=parser.id,
+                activation_reason="taxonomy regression",
+            )
+        )
+    else:
+        pointer.parser_version_id = parser.id
+        pointer.activation_reason = "taxonomy regression"
+
+
 def _seed_scenario(factory: object, *, split: bool) -> None:
     with factory.begin() as session:  # type: ignore[attr-defined]
         pos_id = _device(session, "pos_1", "pos", 9100)
@@ -313,6 +380,42 @@ def _seed_scenario(factory: object, *, split: bool) -> None:
             )
 
 
+def _seed_duplicate_management(factory: object) -> tuple[UUID, UUID]:
+    with factory.begin() as session:  # type: ignore[attr-defined]
+        rch_id = _device(session, "rch_1", "rch", 23)
+        parser = ParserVersion(
+            name="test",
+            version="1.0.0",
+            build_sha256=_sha("parser-management-legacy"),
+            protocol="test",
+        )
+        session.add(parser)
+        session.flush()
+        first = _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="legacy-management-one",
+            document_type="MANAGEMENT_DOCUMENT",
+            total="42.35",
+            when=NOW,
+            lines=(("Servizio sintetico", "42.35"),),
+            external_document_code="MGMT-0042",
+        )
+        second = _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="legacy-management-two",
+            document_type="MANAGEMENT_DOCUMENT",
+            total="42.35",
+            when=NOW + timedelta(seconds=1),
+            lines=(("Servizio sintetico", "42.35"),),
+            external_document_code="MGMT-0042",
+        )
+    return first, second
+
+
 def test_database_workers_persist_scenario_a_idempotently() -> None:
     engine, factory = _database()
     _seed_scenario(factory, split=False)
@@ -349,6 +452,231 @@ def test_database_workers_persist_scenario_a_idempotently() -> None:
     assert {"DOCUMENT", "ORDER_EVENT", "FRAUD_ALERT"} <= kinds
     assert transaction.diff["lines"]["removed"]
     assert transaction.diff["lines"]["price_changed"]
+    engine.dispose()
+
+
+def test_fresh_reports_and_invoices_never_create_sale_projections() -> None:
+    for document_type in ("SHIFT_END_REPORT", "INVOICE"):
+        engine, factory = _database()
+        with factory.begin() as session:
+            rch_id = _device(session, "rch_1", "rch", 23)
+            parser = ParserVersion(
+                name="test",
+                version="1.5.0",
+                build_sha256=_sha(f"parser-{document_type}"),
+                protocol="test",
+            )
+            session.add(parser)
+            session.flush()
+            _document(
+                session,
+                device_id=rch_id,
+                parser_id=parser.id,
+                source=f"fresh-{document_type}",
+                document_type=document_type,
+                total="42.35",
+                when=NOW,
+                lines=(("Riga economica da non usare", "42.35"),),
+                payment="42.35",
+            )
+
+        correlation = CorrelationWorker(factory).run_once()
+        fraud = FraudWorker(factory).run_once()
+
+        assert correlation.transactions_evaluated == 0
+        assert correlation.correlations_inserted == 0
+        assert correlation.orders_created == 0
+        assert correlation.events_inserted == 0
+        assert correlation.price_attributions_inserted == 0
+        assert fraud.correlations_loaded == 0
+        assert fraud.alerts_inserted == 0
+        dashboard = SqlAlchemyApiRepository(factory).dashboard()
+        assert dashboard.shift_end_reports == int(document_type == "SHIFT_END_REPORT")
+        assert dashboard.invoices == int(document_type == "INVOICE")
+        assert dashboard.management_documents == 0
+        with factory() as session:
+            assert session.scalar(select(func.count()).select_from(DocumentCorrelation)) == 0
+            assert session.scalar(select(func.count()).select_from(Order)) == 0
+            assert session.scalar(select(func.count()).select_from(OrderEvent)) == 0
+            assert session.scalar(select(func.count()).select_from(LinePriceAttribution)) == 0
+            assert session.scalar(select(func.count()).select_from(FraudAlert)) == 0
+        engine.dispose()
+
+
+def test_non_sale_reparse_retires_legacy_sale_projection_and_alert_append_only() -> None:
+    for document_type in ("SHIFT_END_REPORT", "INVOICE"):
+        engine, factory = _database()
+        document_ids = _seed_duplicate_management(factory)
+        first_correlation = CorrelationWorker(factory).run_once()
+        first_fraud = FraudWorker(factory).run_once()
+        assert first_correlation.correlations_inserted == 1
+        assert first_fraud.alerts_inserted >= 1
+        with factory() as session:
+            order_count = session.scalar(select(func.count()).select_from(Order))
+            legacy_order_code = session.scalar(select(Order.order_code))
+            event_count = session.scalar(select(func.count()).select_from(OrderEvent))
+            price_count = session.scalar(
+                select(func.count()).select_from(LinePriceAttribution)
+            )
+            open_alert_ids = set(
+                session.scalars(
+                    select(FraudAlert.id).where(FraudAlert.status == "OPEN")
+                )
+            )
+            assert open_alert_ids
+        assert legacy_order_code is not None
+        pre_reparse_hits, _ = SqlAlchemyApiRepository(factory).search(
+            query=legacy_order_code,
+            limit=20,
+            offset=0,
+        )
+        assert any(hit.entity_type == "ORDER" for hit in pre_reparse_hits)
+
+        with factory.begin() as session:
+            _activate_reclassified_versions(
+                session,
+                document_ids=document_ids,
+                document_type=document_type,
+                version=f"2.0.0-{document_type.lower()}",
+            )
+
+        replay = CorrelationWorker(factory).run_once()
+        fraud_replay = FraudWorker(factory).run_once()
+
+        assert replay.correlations_inserted == 0
+        assert replay.orders_created == 0
+        assert replay.events_inserted == 0
+        assert replay.price_attributions_inserted == 0
+        assert fraud_replay.alerts_inserted == 0
+        assert fraud_replay.alerts_superseded >= len(open_alert_ids)
+        with factory() as session:
+            assert set(session.scalars(select(DocumentCorrelation.status))) == {
+                "SUPERSEDED"
+            }
+            assert session.scalar(select(func.count()).select_from(Order)) == order_count
+            assert session.scalar(select(func.count()).select_from(OrderEvent)) == event_count
+            assert (
+                session.scalar(select(func.count()).select_from(LinePriceAttribution))
+                == price_count
+            )
+            for alert_id in open_alert_ids:
+                alert = session.get(FraudAlert, alert_id)
+                assert alert is not None and alert.status == "JUSTIFIED"
+                history = session.scalars(
+                    select(FraudAlertHistory)
+                    .where(FraudAlertHistory.fraud_alert_id == alert_id)
+                    .order_by(FraudAlertHistory.sequence)
+                ).all()
+                assert history[-1].event_type == "ALERT_AUTO_SUPERSEDED"
+                evidence = session.scalar(
+                    select(FraudAlertEvidence).where(
+                        FraudAlertEvidence.fraud_alert_id == alert_id,
+                        FraudAlertEvidence.evidence_type == "CORRELATION_SUPERSEDED",
+                    )
+                )
+                assert evidence is not None
+                assert evidence.evidence["retired_as_non_sale"] is True
+                assert evidence.evidence["replacement_correlation_ids"] == []
+        repository = SqlAlchemyApiRepository(factory)
+        visible_orders, visible_order_count = repository.list_orders(
+            limit=20,
+            offset=0,
+            filters={},
+        )
+        assert visible_order_count == 0
+        assert visible_orders == []
+        search_hits, _ = repository.search(
+            query=legacy_order_code,
+            limit=20,
+            offset=0,
+        )
+        assert all(hit.entity_type != "ORDER" for hit in search_hits)
+        engine.dispose()
+
+
+def test_mixed_reparse_rebuilds_remaining_sale_member_before_closing_alert() -> None:
+    engine, factory = _database()
+    report_id, remaining_sale_id = _seed_duplicate_management(factory)
+    CorrelationWorker(factory).run_once()
+    FraudWorker(factory).run_once()
+    with factory.begin() as session:
+        open_alerts = session.scalars(
+            select(FraudAlert).where(FraudAlert.status == "OPEN")
+        ).all()
+        assert open_alerts
+        # Exercise every operational state handled by automatic retirement.
+        open_alerts[0].status = "UNDER_REVIEW"
+        open_alert_ids = {alert.id for alert in open_alerts}
+        order_count = session.scalar(select(func.count()).select_from(Order))
+        event_count = session.scalar(select(func.count()).select_from(OrderEvent))
+        previous_event_ids = set(session.scalars(select(OrderEvent.id)))
+
+    with factory.begin() as session:
+        _activate_reclassified_versions(
+            session,
+            document_ids=(report_id,),
+            document_type="SHIFT_END_REPORT",
+            version="2.0.0-mixed-report",
+        )
+
+    replay = CorrelationWorker(factory).run_once()
+    fraud_replay = FraudWorker(factory).run_once()
+
+    assert replay.correlations_inserted == 1
+    assert replay.orders_created == 0
+    assert replay.events_inserted == 1
+    assert replay.price_attributions_inserted == 0
+    assert fraud_replay.alerts_superseded >= len(open_alert_ids)
+    current_transaction_id = None
+    with factory() as session:
+        current = session.scalar(
+            select(DocumentCorrelation).where(
+                DocumentCorrelation.status.in_(("AUTOMATIC", "UNCORRELATED"))
+            )
+        )
+        assert current is not None and current.status == "UNCORRELATED"
+        current_transaction_id = current.transaction_id
+        current_members = set(
+            session.scalars(
+                select(DocumentCorrelationMember.document_id).where(
+                    DocumentCorrelationMember.correlation_id == current.id
+                )
+            )
+        )
+        assert current_members == {remaining_sale_id}
+        assert report_id not in current_members
+        assert session.scalar(select(func.count()).select_from(Order)) == order_count
+        assert session.scalar(select(func.count()).select_from(OrderEvent)) == event_count + 1
+        replacement_events = session.scalars(
+            select(OrderEvent).where(OrderEvent.id.not_in(previous_event_ids))
+        ).all()
+        assert len(replacement_events) == 1
+        assert replacement_events[0].source_document_id == remaining_sale_id
+        assert replacement_events[0].source_document_id != report_id
+        assert set(
+            session.scalars(
+                select(FraudAlert.status).where(FraudAlert.id.in_(open_alert_ids))
+            )
+        ) == {"JUSTIFIED"}
+    assert current_transaction_id is not None
+    current_view = SqlAlchemyApiRepository(factory).get_transaction(
+        current_transaction_id
+    )
+    assert current_view is not None
+    current_timeline_document_ids = {
+        item.get("document_id")
+        for item in current_view.timeline
+        if item.get("event_kind") in {"DOCUMENT", "ORDER_EVENT"}
+    }
+    assert str(report_id) not in current_timeline_document_ids
+    assert str(remaining_sale_id) in current_timeline_document_ids
+    visible_orders, visible_order_count = SqlAlchemyApiRepository(factory).list_orders(
+        limit=20,
+        offset=0,
+        filters={},
+    )
+    assert visible_order_count == 1
+    assert len(visible_orders) == 1
     engine.dispose()
 
 

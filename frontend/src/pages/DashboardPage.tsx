@@ -169,6 +169,8 @@ export function DashboardPage() {
               ['Comande e ordini', data.orders, data.documents],
               ['Documenti gestionali', data.management_documents, data.documents],
               ['Documenti commerciali', data.commercial_documents, data.documents],
+              ['Report di fine turno', data.shift_end_reports ?? 0, data.documents],
+              ['Fatture', data.invoices ?? 0, data.documents],
             ].map(([label, value, total]) => <Box key={String(label)} sx={{ mb: 2 }}><Box sx={{ display: 'flex', justifyContent: 'space-between', mb: .75 }}><Typography>{label}</Typography><Typography fontWeight={700}>{value}</Typography></Box><LinearProgress variant="determinate" value={Number(total) ? Math.min(100, Number(value) / Number(total) * 100) : 0} sx={{ height: 8, borderRadius: 4 }} /></Box>)}
             <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mt: 3, color: data.parse_errors ? 'warning.main' : 'success.main' }}><WarningAmberOutlined fontSize="small" /><Typography variant="body2">{data.parse_errors ? `${data.parse_errors} job richiedono verifica tecnica` : 'Nessun errore di parsing aperto'}</Typography></Box>
           </CardContent></Card>

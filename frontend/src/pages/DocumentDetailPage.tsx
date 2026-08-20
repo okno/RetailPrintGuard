@@ -2,7 +2,7 @@ import { ArrowBack, CodeOutlined, DownloadOutlined } from '@mui/icons-material'
 import { Alert, Box, Button, Card, CardContent, Chip, Grid, Paper, Tab, Table, TableBody, TableCell, TableHead, TableRow, Tabs, Typography } from '@mui/material'
 import { alpha } from '@mui/material/styles'
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, downloadApi, rawDocument, scopedQueryKey, session } from '../api/client'
 import { ErrorState, LoadingState } from '../components/State'
@@ -11,9 +11,14 @@ import { StatusChip } from '../components/StatusChip'
 import { formatDateTime, formatDocumentDateTime } from '../format'
 import { DOCUMENT_DETAIL_PARAM } from '../routes'
 import {
+  NOT_OBSERVED_IN_FLOW,
+  rchClockOffsetLabel,
+  rchSerialEvidenceLabel,
+  rchTimestampEvidenceLabel,
+} from '../rchIdentityPresentation'
+import {
   confidencePercent,
   deviceLabel,
-  documentTimestampEvidenceLabel,
   documentTypeLabel,
 } from '../documentPresentation'
 import type { DocumentRecord } from '../types'
@@ -25,6 +30,14 @@ function progressiveObservationLabel(value: string | undefined) {
   if (value === 'SUFFIX_ONLY_OBSERVED_IN_CAPTURE') return 'Solo suffisso osservato; non è un codice completo'
   if (value === 'NOT_OBSERVED_IN_CAPTURE') return 'Progressivo proprio generato dalla RCH, non presente nel flusso osservato'
   return 'Non applicabile'
+}
+
+function ProvenanceValue({ label, value, provenance }: { label: string, value: ReactNode, provenance?: string }) {
+  return <Box sx={{ mt: 2 }}>
+    <Typography variant="caption" color="text.secondary">{label}</Typography>
+    <Typography sx={{ wordBreak: 'break-word' }}>{value}</Typography>
+    {provenance && <Typography variant="caption" color="text.secondary">Provenienza: {provenance}</Typography>}
+  </Box>
 }
 
 function LinePrice({ line }: { line: DocumentRecord['lines'][number] }) {
@@ -89,6 +102,11 @@ export function DocumentDetailPage() {
   const doc = query.data
   const roles = session().user?.roles ?? []
   const canDownloadEvidence = roles.includes('ADMIN') || roles.includes('AUDITOR')
+  const hasRchIdentity = doc.device_id.toLowerCase().startsWith('rch')
+    || doc.parser_name.toLowerCase().includes('rch')
+    || doc.application_timestamp != null
+    || doc.rch_footer_timestamp != null
+    || doc.rch_serial_number != null
 
   async function runArtifact(action: () => Promise<unknown>) {
     setArtifactError(undefined)
@@ -140,7 +158,49 @@ export function DocumentDetailPage() {
         </Card>
       </Grid>
       <Grid size={{ xs: 12, lg: 4 }}>
-        <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />{[['Ora cassa', doc.document_timestamp ? `${formatDocumentDateTime(doc.document_timestamp, doc.document_timestamp_precision)} · ${documentTimestampEvidenceLabel(doc.document_timestamp_evidence) ?? 'osservata nel documento'}` : undefined], ['Acquisito', formatDateTime(doc.captured_at)], ['Progressivo documento', doc.external_document_code ?? doc.external_code ?? (doc.resolved_external_document_code ? `${doc.resolved_external_document_code} (da riferimento gestionale correlato)` : undefined) ?? (doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE' ? 'Non osservato nel flusso catturato' : undefined)], ['Suffisso progressivo RCH', doc.external_document_code_suffix], ['Osservabilità progressivo', progressiveObservationLabel(doc.progressive_observation_status)], ['Provenienza risoluzione', doc.resolved_external_document_code_provenance === 'CORRELATED_MANAGEMENT_REFERENCE' ? 'Riferimento commerciale in documento gestionale correlato' : undefined], ['Riferimento commerciale', doc.commercial_reference_code], ['Codice ordine', doc.order_code], ['Tavolo', doc.table_code], ['Coperti', doc.covers], ['Operatore', doc.operator_code], ['Hash SHA-256', doc.sha256], ['Confidenza', `${doc.confidence}%`]].map(([label, value]) => <Box key={label} sx={{ mt: 2 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography sx={{ wordBreak: 'break-all' }}>{value ?? '—'}</Typography></Box>)}</CardContent></Card>
+        <Card><CardContent>
+          <Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography>
+          <StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />
+          <ProvenanceValue
+            label="Ora documento"
+            value={doc.document_timestamp ? formatDocumentDateTime(doc.document_timestamp, doc.document_timestamp_precision) : NOT_OBSERVED_IN_FLOW}
+            provenance={doc.document_timestamp ? rchTimestampEvidenceLabel(doc.document_timestamp_evidence) : NOT_OBSERVED_IN_FLOW}
+          />
+          {hasRchIdentity && <ProvenanceValue
+            label="Ora applicativa RCH"
+            value={doc.application_timestamp ? formatDocumentDateTime(doc.application_timestamp, doc.application_timestamp_precision ?? undefined) : NOT_OBSERVED_IN_FLOW}
+            provenance={doc.application_timestamp ? rchTimestampEvidenceLabel(doc.application_timestamp_evidence) : NOT_OBSERVED_IN_FLOW}
+          />}
+          <ProvenanceValue
+            label="Acquisizione server"
+            value={formatDateTime(doc.captured_at)}
+            provenance="Timestamp registrato dal server; non è un orario stampato dalla RCH"
+          />
+          {hasRchIdentity && <ProvenanceValue
+            label="Ora footer RCH"
+            value={doc.rch_footer_timestamp ? formatDocumentDateTime(doc.rch_footer_timestamp, doc.rch_footer_timestamp_precision ?? undefined) : NOT_OBSERVED_IN_FLOW}
+            provenance={doc.rch_footer_timestamp ? rchTimestampEvidenceLabel(doc.rch_footer_timestamp_evidence) : NOT_OBSERVED_IN_FLOW}
+          />}
+          {hasRchIdentity && <ProvenanceValue label="Scarto orologio (footer − applicativa)" value={rchClockOffsetLabel(doc.rch_clock_offset_seconds)} />}
+          {hasRchIdentity && <ProvenanceValue
+            label="Seriale RCH"
+            value={doc.rch_serial_number ?? NOT_OBSERVED_IN_FLOW}
+            provenance={doc.rch_serial_number ? rchSerialEvidenceLabel(doc.rch_serial_number_evidence) : NOT_OBSERVED_IN_FLOW}
+          />}
+          {[
+            ['Progressivo documento', doc.external_document_code ?? doc.external_code ?? (doc.resolved_external_document_code ? `${doc.resolved_external_document_code} (da riferimento gestionale correlato)` : undefined) ?? (doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE' ? 'Non osservato nel flusso catturato' : undefined)],
+            ['Suffisso progressivo RCH', doc.external_document_code_suffix],
+            ['Osservabilità progressivo', progressiveObservationLabel(doc.progressive_observation_status)],
+            ['Provenienza risoluzione', doc.resolved_external_document_code_provenance === 'CORRELATED_MANAGEMENT_REFERENCE' ? 'Riferimento commerciale in documento gestionale correlato' : undefined],
+            ['Riferimento commerciale', doc.commercial_reference_code],
+            ['Codice ordine', doc.order_code],
+            ['Tavolo', doc.table_code],
+            ['Coperti', doc.covers],
+            ['Operatore', doc.operator_code],
+            ['Hash SHA-256', doc.sha256],
+            ['Confidenza', `${doc.confidence}%`],
+          ].map(([label, value]) => <ProvenanceValue key={label} label={String(label)} value={value ?? '—'} />)}
+        </CardContent></Card>
         {doc.warnings.length > 0 && <Alert severity="warning" sx={{ mt: 2 }}>{doc.warnings.join(' · ')}</Alert>}
       </Grid>
     </Grid>

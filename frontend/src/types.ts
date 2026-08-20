@@ -20,6 +20,8 @@ export interface Dashboard {
   pre_bills: number
   management_documents: number
   commercial_documents: number
+  shift_end_reports?: number
+  invoices?: number
   open_alerts: number
   critical_alerts: number
   economic_difference: string
@@ -149,6 +151,16 @@ export interface DocumentRecord {
   document_timestamp?: string
   document_timestamp_precision?: 'MINUTE' | 'SECOND' | string
   document_timestamp_evidence?: string
+  application_timestamp?: string | null
+  application_timestamp_precision?: 'MINUTE' | 'SECOND' | string | null
+  application_timestamp_evidence?: string | null
+  rch_footer_timestamp?: string | null
+  rch_footer_timestamp_precision?: 'MINUTE' | 'SECOND' | string | null
+  rch_footer_timestamp_evidence?: string | null
+  rch_serial_number?: string | null
+  rch_serial_number_evidence?: string | null
+  /** Footer RCH minus application timestamp. Negative means the RCH clock lags. */
+  rch_clock_offset_seconds?: number | null
   captured_at: string
   gross_total?: string
   net_total?: string

@@ -5,6 +5,42 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.4.7] — 2026-08-21
+
+### Added
+
+- tipi documentali autonomi `SHIFT_END_REPORT` (“REPORT DI FINE TURNO”) e
+  `INVOICE` (“FATTURA”), disponibili in parser RCH, filtri, dashboard, WebUI e
+  PDF; il riconoscimento fattura richiede un'intestazione o un numero documento
+  forte e non scatta sulla riga aggregata “Fatture” di un report;
+- campi versionati separati per ora applicativa, ora del footer e seriale RCH,
+  con precisione/provenienza, scarto fra i due orologi e acquisizione server
+  mantenuta distinta; un seriale configurato è dichiarato esplicitamente come
+  metadato non osservato sul flusso;
+- contatori dashboard per report di fine turno e fatture, e identità RCH
+  completa anche nella tabella Documenti.
+
+### Changed
+
+- parser RCH `1.5.0`, correlatore `rpg-correlation-1.5.0`, motore antifrode
+  `rpg-fraud-1.3.0` e renderer PDF `1.3.0`;
+- report di fine turno e fatture restano evidenze amministrative ma sono
+  esclusi da ordini, attribuzione prezzi e alert di vendita; un reparse che
+  corregge una precedente classificazione gestionale ritira correlazioni e
+  alert derivati in modo append-only, senza eliminare documenti o cronologia;
+- i frammenti `INCOMPLETE` privi di righe, identità vendita, importi o pagamenti
+  non compaiono più nelle viste operative predefinite; restano nel database,
+  nel RAW e nelle viste tecniche esplicite per audit.
+
+### Fixed
+
+- evitata la sovrapposizione fra ora applicativa stampata e orologio interno
+  della RCH: quando il footer non transita nel flusso viene mostrato come non
+  osservato, senza sostituirlo con l'ora server;
+- timeline, ordini e ricerca operativi non mostrano più proiezioni vendita
+  obsolete appartenenti a report/fatture riclassificati; lo storico rimane
+  consultabile e tamper-evident.
+
 ## [0.4.6] — 2026-08-20
 
 ### Fixed

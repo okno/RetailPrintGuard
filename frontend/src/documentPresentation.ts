@@ -8,6 +8,8 @@ const DOCUMENT_TYPE_LABELS: Record<string, string> = {
   PRE_BILL: 'PRECONTO',
   MANAGEMENT_DOCUMENT: 'DOCUMENTO GESTIONALE',
   COMMERCIAL_DOCUMENT: 'DOCUMENTO COMMERCIALE',
+  SHIFT_END_REPORT: 'REPORT DI FINE TURNO',
+  INVOICE: 'FATTURA',
   CONFORMING_COPY: 'COPIA CONFORME',
   CANCELLATION: 'ANNULLAMENTO',
   REFUND: 'RIMBORSO',
@@ -49,11 +51,17 @@ export function documentApiSearchParams(uiParams: URLSearchParams) {
   if (selectedType === ALL_EVIDENCE_FILTER) {
     apiParams.delete('type')
     apiParams.delete('exclude_type')
+    apiParams.set('include_technical', 'true')
   } else if (!selectedType) {
     apiParams.delete('type')
     apiParams.set('exclude_type', TECHNICAL_DOCUMENT_TYPE)
+    apiParams.delete('include_technical')
+  } else if (selectedType === TECHNICAL_DOCUMENT_TYPE) {
+    apiParams.delete('exclude_type')
+    apiParams.set('include_technical', 'true')
   } else {
     apiParams.delete('exclude_type')
+    apiParams.delete('include_technical')
   }
   return apiParams
 }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -250,6 +250,9 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
                 "table_code": "TABLE-V2",
                 "operator_code": "OP-V2",
                 "terminal_code": "TERM-V2",
+                "application_timestamp": NOW,
+                "rch_footer_timestamp": NOW - timedelta(minutes=2),
+                "rch_serial_number": "99LAB123456",
                 "document_timestamp": NOW,
                 "lines": (
                     DomainLine(
@@ -285,6 +288,9 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         assert versions[1].table_code == "TABLE-V2"
         assert versions[1].operator_code == "OP-V2"
         assert versions[1].terminal_code == "TERM-V2"
+        assert versions[1].application_timestamp == NOW
+        assert versions[1].rch_footer_timestamp == NOW - timedelta(minutes=2)
+        assert versions[1].rch_serial_number == "99LAB123456"
         projection = session.scalar(select(Document))
         assert projection is not None
         assert projection.document_type == DocumentType.ORDER_CHANGE.value
@@ -292,6 +298,9 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         assert projection.external_document_code_suffix == "0042"
         assert projection.commercial_reference_code == "FISCAL-V1"
         assert projection.table_code == "TABLE-V2"
+        assert projection.application_timestamp == NOW
+        assert projection.rch_footer_timestamp == NOW - timedelta(minutes=2)
+        assert projection.rch_serial_number == "99LAB123456"
         revised_line = session.scalar(
             select(DocumentLine).where(DocumentLine.document_version_id == versions[1].id)
         )

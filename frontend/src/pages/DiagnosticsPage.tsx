@@ -25,7 +25,7 @@ export function DiagnosticsPage() {
     <Grid container spacing={2} sx={{ mb: 2 }}>
       <Grid size={{ xs: 12, md: 4 }}><Card><CardContent><StorageOutlined color="primary" /><Typography variant="overline">Database / spool</Typography><Box sx={{ display: 'flex', gap: 1, mt: 1 }}><StatusChip value={data.database.toUpperCase()} /><StatusChip value={data.spool.toUpperCase()} /></Box></CardContent></Card></Grid>
       <Grid size={{ xs: 12, md: 4 }}><Card><CardContent><DataObjectOutlined color="primary" /><Typography variant="overline">Errori parser</Typography><Typography variant="h2">{data.parser_errors}</Typography></CardContent></Card></Grid>
-      <Grid size={{ xs: 12, md: 4 }}><Card><CardActionArea component={Link} to="/incompleti"><CardContent><BugReportOutlined color="primary" /><Typography variant="overline">Job incompleti</Typography><Typography variant="h2">{data.incomplete_jobs}</Typography><Typography variant="caption">Apri la revisione auditata</Typography></CardContent></CardActionArea></Card></Grid>
+      <Grid size={{ xs: 12, md: 4 }}><Card><CardActionArea component={Link} to="/incompleti?technical=all"><CardContent><BugReportOutlined color="primary" /><Typography variant="overline">Job incompleti tecnici</Typography><Typography variant="h2">{data.incomplete_jobs}</Typography><Typography variant="caption">Apri tutte le evidenze, inclusi i frammenti senza vendita</Typography></CardContent></CardActionArea></Card></Grid>
     </Grid>
     <Card>
       {!data.recent_events.length ? <EmptyState label="Nessun evento tecnico recente." /> : <Table>

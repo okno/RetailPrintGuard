@@ -14,7 +14,7 @@ costituiscono da sole prova di frode.
 
 ## Algoritmo dell'episodio
 
-La correlazione `rpg-correlation-1.4.0` ordina deterministicamente i documenti
+La correlazione `rpg-correlation-1.5.0` ordina deterministicamente i documenti
 della versione parser attiva e considera soltanto job non esclusi dall'analisi.
 La selezione dei candidati è bounded per chiavi operative e finestra temporale;
 non assume che una connessione TCP corrisponda a una singola vendita.

@@ -33,6 +33,18 @@ def _document() -> DocumentView:
         external_code="LAB-0001",
         order_code="ORDER-LAB",
         table_code="TABLE-LAB",
+        document_timestamp=datetime(2042, 5, 6, 10, 13, tzinfo=UTC),
+        document_timestamp_precision="MINUTE",
+        document_timestamp_evidence="RCH_APPLICATION_PRINTED_TEXT",
+        application_timestamp=datetime(2042, 5, 6, 10, 13, tzinfo=UTC),
+        application_timestamp_precision="MINUTE",
+        application_timestamp_evidence="RCH_APPLICATION_PRINTED_TEXT",
+        rch_footer_timestamp=datetime(2042, 5, 6, 10, 11, tzinfo=UTC),
+        rch_footer_timestamp_precision="MINUTE",
+        rch_footer_timestamp_evidence="RCH_FOOTER_PRINTED_TEXT",
+        rch_serial_number="99SYN123456",
+        rch_serial_number_evidence="RCH_PRINTED_RT_PREFIX",
+        rch_clock_offset_seconds=-120,
         captured_at=datetime(2042, 5, 6, 10, 11, 12, tzinfo=UTC),
         gross_total=Decimal("5.00"),
         net_total=Decimal("5.00"),
@@ -68,10 +80,17 @@ def _document() -> DocumentView:
 
 def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> None:
     text = "\n".join(line.text for line in _document_lines(_document()))
+    compact_text = " ".join(text.split())
     assert "Documento: 9901-0043" in text
     assert "Suffisso progressivo RCH: 0043" in text
     assert "progressivo completo osservato nel flusso" in text
     assert "Rif. commerciale: 9901-0042" in text
+    assert "Ora applicativa RCH: 06/05/2042 12:13" in compact_text
+    assert "Acquisizione server: 06/05/2042 12:11:12" in compact_text
+    assert "Ora footer RCH: 06/05/2042 12:11" in compact_text
+    assert "-120 s (footer RCH indietro di 2 min" in compact_text
+    assert "Seriale RCH: 99SYN123456" in compact_text
+    assert "prefisso RT stampato dalla RCH" in compact_text
 
     suffix_only = _document().model_copy(
         update={
@@ -102,6 +121,27 @@ def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> N
         line.text for line in _document_lines(own_not_observed)
     )
     assert "progressivo proprio generato dalla RCH" in unavailable_text
+
+    wire_identity_not_observed = own_not_observed.model_copy(
+        update={
+            "application_timestamp": None,
+            "application_timestamp_precision": None,
+            "application_timestamp_evidence": None,
+            "rch_footer_timestamp": None,
+            "rch_footer_timestamp_precision": None,
+            "rch_footer_timestamp_evidence": None,
+            "rch_serial_number": None,
+            "rch_serial_number_evidence": None,
+            "rch_clock_offset_seconds": None,
+        }
+    )
+    missing_identity_text = " ".join(
+        line.text for line in _document_lines(wire_identity_not_observed)
+    )
+    assert "Ora applicativa RCH: Non osservato nel flusso" in missing_identity_text
+    assert "Ora footer RCH: Non osservato nel flusso" in missing_identity_text
+    assert "Seriale RCH: Non osservato nel flusso" in missing_identity_text
+    assert "Ora footer RCH: 06/05/2042 12:11:12" not in missing_identity_text
 
     first = render_document_pdf(_document())
     second = render_document_pdf(_document())

@@ -337,6 +337,153 @@ def _seed_api(factory):
     return ids
 
 
+def _add_empty_incomplete_evidence(factory, ids):
+    """Add a parsed RCH fragment with no structured sale observation."""
+
+    job_id = uuid4()
+    document_id = uuid4()
+    with factory.begin() as session:
+        session.add(
+            PrintJob(
+                id=job_id,
+                device_id=ids["device"],
+                session_id=ids["session"],
+                source_key=f"test:one:{job_id}",
+                source_system="test",
+                source_instance="one",
+                source_scope="192.0.2.20:9100",
+                source_job_id=str(job_id),
+                source_schema="test.v1",
+                manifest_sha256=hashlib.sha256(str(job_id).encode()).hexdigest(),
+                manifest_path=f"/spool/{job_id}/manifest.json",
+                started_at=NOW + timedelta(seconds=1),
+                captured_at=NOW + timedelta(seconds=1),
+                status="INCOMPLETE",
+                capture_complete=False,
+                timeline_complete=False,
+                import_status="PARSED",
+            )
+        )
+        session.flush()
+        session.add(
+            Document(
+                id=document_id,
+                device_id=ids["device"],
+                session_id=ids["session"],
+                job_id=job_id,
+                source_document_key=f"empty-{document_id}",
+                document_type="COMMERCIAL_DOCUMENT",
+                subtype="RCH_COMMERCIAL_INFERRED",
+                captured_at=NOW + timedelta(seconds=1),
+            )
+        )
+        session.flush()
+        version = DocumentVersion(
+            document_id=document_id,
+            parser_version_id=ids["parser"],
+            version_sequence=1,
+            document_type="COMMERCIAL_DOCUMENT",
+            subtype="RCH_COMMERCIAL_INFERRED",
+            status="PARTIAL",
+            normalized_text="document_close_not_observed protocol fragment",
+            parse_confidence=52,
+            evidence_level="INFERRED",
+            source_manifest_sha256=hashlib.sha256(str(job_id).encode()).hexdigest(),
+            source_payload_sha256=hashlib.sha256(str(document_id).encode()).hexdigest(),
+            source_path=f"/spool/{job_id}/client.raw",
+            complete=False,
+            warnings=["document_close_not_observed"],
+            chain_scope=f"document:{document_id}",
+            chain_sequence=1,
+            previous_record_hash="0" * 64,
+            record_hash=hashlib.sha256(f"record:{document_id}".encode()).hexdigest(),
+        )
+        session.add(version)
+        session.flush()
+        version_id = version.id
+    return job_id, document_id, version_id
+
+
+def test_empty_incomplete_evidence_is_technical_only_without_byte_threshold() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    noise_job_id, noise_document_id, noise_version_id = _add_empty_incomplete_evidence(
+        factory, ids
+    )
+    repository = SqlAlchemyApiRepository(factory)
+
+    primary, primary_total = repository.list_documents(
+        limit=20, offset=0, filters={}
+    )
+    assert primary_total == 1
+    assert [item.id for item in primary] == [ids["document"]]
+    technical, technical_total = repository.list_documents(
+        limit=20, offset=0, filters={"include_technical": True}
+    )
+    assert technical_total == 2
+    assert noise_document_id in {item.id for item in technical}
+
+    hidden_hits, hidden_total = repository.search(
+        query="protocol fragment", limit=20, offset=0
+    )
+    assert hidden_total == 0
+    assert hidden_hits == []
+    technical_hits, technical_hit_total = repository.search(
+        query="protocol fragment",
+        limit=20,
+        offset=0,
+        filters={"include_technical": True},
+    )
+    assert technical_hit_total == 1
+    assert [item.entity_id for item in technical_hits] == [noise_document_id]
+
+    actionable_jobs, actionable_total = repository.list_jobs(
+        limit=20,
+        offset=0,
+        filters={"incomplete": True, "review_state": "PENDING"},
+    )
+    assert actionable_total == 0
+    assert actionable_jobs == []
+    all_jobs, all_total = repository.list_jobs(
+        limit=20,
+        offset=0,
+        filters={
+            "incomplete": True,
+            "review_state": "PENDING",
+            "include_technical": True,
+        },
+    )
+    assert all_total == 1
+    assert [item.id for item in all_jobs] == [noise_job_id]
+    assert repository.dashboard().incomplete_jobs == 0
+    assert repository.dashboard().documents == 1
+    assert repository.diagnostics().incomplete_jobs == 1
+
+    # A line without an amount is still observed sale content (for example a
+    # kitchen order).  It must become operator-visible regardless of byte size.
+    with factory.begin() as session:
+        session.add(
+            DocumentLine(
+                document_version_id=noise_version_id,
+                sequence=1,
+                description="Espresso",
+                quantity=Decimal("1"),
+            )
+        )
+    visible, visible_total = repository.list_documents(
+        limit=20, offset=0, filters={"type": "COMMERCIAL_DOCUMENT"}
+    )
+    assert visible_total == 1
+    assert [item.id for item in visible] == [noise_document_id]
+    actionable_jobs, actionable_total = repository.list_jobs(
+        limit=20, offset=0, filters={"incomplete": True}
+    )
+    assert actionable_total == 1
+    assert [item.id for item in actionable_jobs] == [noise_job_id]
+    assert repository.dashboard().incomplete_jobs == 1
+    engine.dispose()
+
+
 def _add_correlated_document(
     session,
     ids,
@@ -1315,9 +1462,17 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
         active_version.commercial_reference_code = "COMM-0007"
         active_version.order_code = None
         active_version.table_code = "LAB-25"
+        active_version.application_timestamp = NOW
+        active_version.rch_footer_timestamp = NOW - timedelta(minutes=2)
+        active_version.rch_serial_number = "99LAB123456"
         active_version.raw_metadata = {
             "document_timestamp_precision": "MINUTE",
             "document_timestamp_evidence": "ESC_POS_PRINTED_OPERATOR_LINE",
+            "application_timestamp_precision": "MINUTE",
+            "application_timestamp_evidence": "RCH_APPLICATION_PRINTED_TEXT",
+            "rch_footer_timestamp_precision": "MINUTE",
+            "rch_footer_timestamp_evidence": "RCH_FOOTER_PRINTED_TEXT",
+            "rch_serial_number_evidence": "RCH_PRINTED_RT_PREFIX",
         }
         document.document_type = "KITCHEN_ORDER"
         document.subtype = "SHADOW_NEW"
@@ -1413,6 +1568,15 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
     assert selected.external_document_code_suffix == "0001"
     assert selected.external_code == "PB-0001"
     assert selected.commercial_reference_code == "COMM-0007"
+    assert selected.application_timestamp == NOW
+    assert selected.application_timestamp_precision == "MINUTE"
+    assert selected.application_timestamp_evidence == "RCH_APPLICATION_PRINTED_TEXT"
+    assert selected.rch_footer_timestamp == NOW - timedelta(minutes=2)
+    assert selected.rch_footer_timestamp_precision == "MINUTE"
+    assert selected.rch_footer_timestamp_evidence == "RCH_FOOTER_PRINTED_TEXT"
+    assert selected.rch_serial_number == "99LAB123456"
+    assert selected.rch_serial_number_evidence == "RCH_PRINTED_RT_PREFIX"
+    assert selected.rch_clock_offset_seconds == -120
     assert selected.document_timestamp_precision == "MINUTE"
     assert selected.document_timestamp_evidence == "ESC_POS_PRINTED_OPERATOR_LINE"
     assert selected.progressive_observation_status == "FULL_CODE_OBSERVED_IN_CAPTURE"
@@ -1474,6 +1638,82 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
         assert job is not None
         job.import_status = "PARSE_FAILED"
     assert repository.diagnostics().parser_errors == 1
+    engine.dispose()
+
+
+def test_document_view_uses_configured_rch_serial_only_as_parser_fallback() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        device = session.get(Device, ids["device"])
+        assert device is not None
+        device.device_type = "rch"
+        device.non_sensitive_config = {
+            "fiscal_serial_number": " 99cfg123456 ",
+        }
+
+    repository = SqlAlchemyApiRepository(factory)
+    configured = repository.get_document(ids["document"])
+    assert configured is not None
+    assert configured.rch_serial_number == "99CFG123456"
+    assert configured.rch_serial_number_evidence == "DEVICE_METADATA_CONFIGURED"
+    listed, total = repository.list_documents(limit=20, offset=0, filters={})
+    assert total == 1
+    assert listed[0].rch_serial_number == "99CFG123456"
+    assert listed[0].rch_serial_number_evidence == "DEVICE_METADATA_CONFIGURED"
+
+    with factory.begin() as session:
+        version = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == ids["document"]
+            )
+        )
+        assert version is not None
+        version.document_type = "PRE_BILL"
+        version.subtype = "PRECONTO"
+        version.rch_serial_number = "99OBS123456"
+        version.raw_metadata = {
+            "rch_serial_number_evidence": "RCH_PRINTED_RT_PREFIX",
+        }
+
+    observed = repository.get_document(ids["document"])
+    assert observed is not None
+    assert observed.rch_serial_number == "99OBS123456"
+    assert observed.rch_serial_number_evidence == "RCH_PRINTED_RT_PREFIX"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("device_type", "configured_value"),
+    [
+        ("rch", None),
+        ("rch", 99123456),
+        ("rch", "12345678"),
+        ("rch", "ABCDEFGH"),
+        ("rch", "99BAD-123"),
+        ("rch", "99\u00c0123456"),
+        ("rch", "99" + "A" * 31),
+        ("pos", "99POS123456"),
+    ],
+)
+def test_document_view_ignores_invalid_or_non_rch_configured_serial(
+    device_type: str,
+    configured_value: object,
+) -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        device = session.get(Device, ids["device"])
+        assert device is not None
+        device.device_type = device_type
+        device.non_sensitive_config = {
+            "fiscal_serial_number": configured_value,
+        }
+
+    selected = SqlAlchemyApiRepository(factory).get_document(ids["document"])
+    assert selected is not None
+    assert selected.rch_serial_number is None
+    assert selected.rch_serial_number_evidence is None
     engine.dispose()
 
 

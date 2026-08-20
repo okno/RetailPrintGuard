@@ -251,6 +251,9 @@ class SqlAlchemyParserRepository:
                             table_code=parsed.table_code,
                             operator_code=parsed.operator_code,
                             terminal_code=parsed.terminal_code,
+                            application_timestamp=parsed.application_timestamp,
+                            rch_footer_timestamp=parsed.rch_footer_timestamp,
+                            rch_serial_number=parsed.rch_serial_number,
                             document_timestamp=parsed.document_timestamp,
                             captured_at=parsed.captured_at,
                         )
@@ -343,6 +346,9 @@ class SqlAlchemyParserRepository:
                         table_code=parsed.table_code,
                         operator_code=parsed.operator_code,
                         terminal_code=parsed.terminal_code,
+                        application_timestamp=parsed.application_timestamp,
+                        rch_footer_timestamp=parsed.rch_footer_timestamp,
+                        rch_serial_number=parsed.rch_serial_number,
                         document_timestamp=parsed.document_timestamp,
                         gross_total=parsed.gross_total,
                         net_total=parsed.net_total,
@@ -382,6 +388,9 @@ class SqlAlchemyParserRepository:
                     document.table_code = parsed.table_code
                     document.operator_code = parsed.operator_code
                     document.terminal_code = parsed.terminal_code
+                    document.application_timestamp = parsed.application_timestamp
+                    document.rch_footer_timestamp = parsed.rch_footer_timestamp
+                    document.rch_serial_number = parsed.rch_serial_number
                     document.document_timestamp = parsed.document_timestamp
                     for line in parsed.lines:
                         source = line.source

@@ -108,6 +108,9 @@ def test_rch_reconstructs_commercial_and_device_response_from_coalesced_stream()
     assert commercial.lines[0].description == "VOCE SINTETICA"
     assert commercial.external_document_code is None
     assert commercial.external_document_code_suffix == "0042"
+    assert commercial.application_timestamp is None
+    assert commercial.rch_footer_timestamp is None
+    assert commercial.rch_serial_number is None
     assert commercial.raw_metadata["response_counter_suffix"] == "0042"
     assert commercial.raw_metadata["response_status_digits"] == "000000"
     assert (
@@ -305,12 +308,110 @@ def test_rch_observed_quantity_management_totals_and_error_status_regression() -
     assert management_document.document_timestamp == datetime(
         2042, 1, 1, 11, 34, tzinfo=UTC
     )
+    assert management_document.application_timestamp == management_document.document_timestamp
+    assert management_document.rch_footer_timestamp is None
+    assert management_document.rch_serial_number is None
     assert management_document.raw_metadata["document_timestamp_evidence"] == (
         "RCH_PRINTED_TEXT"
     )
     assert management_document.raw_metadata["document_timestamp_precision"] == "MINUTE"
     assert management_document.payments[0].method == "CONTANTI"
     assert management_document.payments[0].amount == 2
+
+
+def test_rch_keeps_application_and_fiscal_footer_identity_distinct() -> None:
+    management = b"".join(
+        (
+            _rch_frame("=o", sequence="0"),
+            _rch_frame('="/(DOCUMENTO GESTIONALE)', sequence="1"),
+            _rch_frame('="/(Espresso                              2,00)', sequence="2"),
+            _rch_frame('="/(Sconto 30%                          -0,60)', sequence="3"),
+            _rch_frame('="/(TOT                                   1,40)', sequence="4"),
+            _rch_frame('="/(Ordine: SYN-35)', sequence="5"),
+            _rch_frame('="/(18/09/42 16:23              N. LAB9-0042)', sequence="6"),
+            _rch_frame('="/(18-09-2042 16:21)', sequence="7"),
+            _rch_frame('="/(DOC. GESTIONALE N. LAB9-0046)', sequence="8"),
+            _rch_frame('="/(99LAB123456)', sequence="9"),
+            _rch_frame("=o", sequence="0"),
+        )
+    )
+
+    document = parse_rch(
+        management,
+        b"",
+        device_id="rch_synthetic",
+        session_id="session-rch-clock",
+        job_id="job-rch-clock",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+
+    assert document.type is DocumentType.MANAGEMENT_DOCUMENT
+    assert document.order_code == "SYN-35"
+    assert document.external_document_code == "LAB9-0046"
+    assert document.commercial_reference_code == "LAB9-0042"
+    assert document.rch_serial_number == "99LAB123456"
+    assert document.application_timestamp == datetime(2042, 9, 18, 14, 23, tzinfo=UTC)
+    assert document.rch_footer_timestamp == datetime(2042, 9, 18, 14, 21, tzinfo=UTC)
+    assert document.document_timestamp == document.application_timestamp
+    assert document.raw_metadata["rch_clock_offset_seconds"] == -120
+    assert (
+        document.raw_metadata["external_document_code_evidence"]
+        == "RCH_PRINTED_MANAGEMENT_FOOTER"
+    )
+    assert (
+        document.raw_metadata["commercial_reference_code_evidence"]
+        == "RCH_PRINTED_UNQUALIFIED_COMMERCIAL_DOCUMENT_NUMBER"
+    )
+    assert (
+        document.raw_metadata["rch_serial_number_evidence"]
+        == "RCH_PRINTED_BARE_SERIAL_AFTER_FOOTER"
+    )
+    assert "rch_clock_offset_exceeds_one_minute" in document.warnings
+
+
+def test_rch_commercial_footer_exposes_progressive_clock_serial_and_hash_order() -> None:
+    commercial = b"".join(
+        (
+            _rch_frame("=K", sequence="0"),
+            _rch_frame("=R7/$200/*1/(ESPRESSO)", sequence="1"),
+            _rch_frame('="/?A/(#Ordine: SYN-35)', sequence="2"),
+            _rch_frame('="/?A/(18-09-2042 16:21)', sequence="3"),
+            _rch_frame('="/?A/(DOCUMENTO N. LAB9-0042)', sequence="4"),
+            _rch_frame('="/?A/(RT 99LAB123456)', sequence="5"),
+            _rch_frame("=T1/$200", sequence="6"),
+            _rch_frame("<</?7", sequence="7"),
+        )
+    )
+
+    document = parse_rch(
+        commercial,
+        b"",
+        device_id="rch_synthetic",
+        session_id="session-rch-commercial-footer",
+        job_id="job-rch-commercial-footer",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+
+    assert document.type is DocumentType.COMMERCIAL_DOCUMENT
+    assert document.order_code == "SYN-35"
+    assert document.external_document_code == "LAB9-0042"
+    assert document.commercial_reference_code is None
+    assert document.application_timestamp is None
+    assert document.rch_footer_timestamp == datetime(2042, 9, 18, 14, 21, tzinfo=UTC)
+    assert document.document_timestamp == document.rch_footer_timestamp
+    assert document.rch_serial_number == "99LAB123456"
+    assert document.raw_metadata["rch_clock_offset_seconds"] is None
+    assert (
+        document.raw_metadata["external_document_code_evidence"]
+        == "RCH_PRINTED_COMMERCIAL_FOOTER"
+    )
+    assert document.raw_metadata["progressive_observation_status"] == (
+        "FULL_CODE_OBSERVED_IN_CAPTURE"
+    )
 
 
 def test_escpos_legacy_cut_marks_document_complete_and_visible() -> None:

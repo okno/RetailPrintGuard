@@ -126,7 +126,7 @@ righe, importi, pagamenti, confidenza, warning e span nel payload. Ogni nuova
 elaborazione crea una `document_version`.
 
 I parser nativi `retailprintguard-escpos` `1.3.0` e
-`retailprintguard-rch-observed` `1.3.0` operano nel control plane:
+`retailprintguard-rch-observed` `1.5.0` operano nel control plane:
 ricevono byte e metadati già acquisiti e restituiscono documenti immutabili.
 I decoder non aprono socket, non modificano lo spool e non importano il relay.
 La segmentazione applicativa avviene sul flusso ricostruito, mai sui confini
@@ -155,7 +155,7 @@ append-only.
 
 ## Correlazione
 
-L'algoritmo correttivo `rpg-correlation-1.4.0` usa, quando disponibili, codice
+L'algoritmo correttivo `rpg-correlation-1.5.0` usa, quando disponibili, codice
 ordine, codice documento, riferimenti embedded, tavolo, operatore, terminale,
 data operativa, prossimità temporale, totale, similarità righe,
 sequenza e dispositivo. I gruppi sono deterministici e il punteggio è limitato

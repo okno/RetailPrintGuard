@@ -375,6 +375,32 @@ def test_documents_route_forwards_server_side_technical_exclusion() -> None:
     assert response.status_code == 200
     assert repository.last_document_filters["exclude_type"] == "DEVICE_RESPONSE"
 
+    technical = client.get(
+        "/api/v1/documents?include_technical=true",
+        headers=_login(client),
+    )
+    assert technical.status_code == 200
+    assert repository.last_document_filters["include_technical"] is True
+
+
+def test_technical_evidence_scope_is_explicit_for_jobs_and_search() -> None:
+    client, repository = _client()
+    headers = _login(client)
+
+    jobs = client.get(
+        "/api/v1/jobs?incomplete=true&include_technical=true",
+        headers=headers,
+    )
+    search = client.get(
+        "/api/v1/search?q=ack&include_technical=true",
+        headers=headers,
+    )
+
+    assert jobs.status_code == 200
+    assert repository.last_job_filters["include_technical"] is True
+    assert search.status_code == 200
+    assert repository.last_search_filters["include_technical"] is True
+
 
 def test_utc_period_is_validated_and_forwarded_to_filtered_routes() -> None:
     client, repository = _client()

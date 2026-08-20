@@ -18,6 +18,8 @@ class DocumentType(StrEnum):
     PRE_BILL = "PRE_BILL"
     MANAGEMENT_DOCUMENT = "MANAGEMENT_DOCUMENT"
     COMMERCIAL_DOCUMENT = "COMMERCIAL_DOCUMENT"
+    SHIFT_END_REPORT = "SHIFT_END_REPORT"
+    INVOICE = "INVOICE"
     CONFORMING_COPY = "CONFORMING_COPY"
     CANCELLATION = "CANCELLATION"
     REFUND = "REFUND"
@@ -25,6 +27,14 @@ class DocumentType(StrEnum):
     PAYMENT = "PAYMENT"
     DEVICE_RESPONSE = "DEVICE_RESPONSE"
     UNKNOWN = "UNKNOWN"
+
+
+NON_SALE_DOCUMENT_TYPES: frozenset[DocumentType] = frozenset(
+    {
+        DocumentType.SHIFT_END_REPORT,
+        DocumentType.INVOICE,
+    }
+)
 
 
 class OrderEventType(StrEnum):
@@ -133,6 +143,13 @@ class NormalizedDocument(BaseModel):
     table_code: str | None = None
     operator_code: str | None = None
     terminal_code: str | None = None
+    # Keep the application-authored business time separate from the fiscal
+    # printer clock.  On RCH output both can be visible on the same document
+    # and a clock skew must remain auditable rather than being silently
+    # collapsed into one timestamp.
+    application_timestamp: datetime | None = None
+    rch_footer_timestamp: datetime | None = None
+    rch_serial_number: str | None = None
     document_timestamp: datetime | None = None
     captured_at: datetime
     gross_total: Money | None = None
@@ -155,7 +172,12 @@ class NormalizedDocument(BaseModel):
     payments: tuple[PaymentRecord, ...] = ()
     raw_metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("captured_at", "document_timestamp")
+    @field_validator(
+        "captured_at",
+        "application_timestamp",
+        "rch_footer_timestamp",
+        "document_timestamp",
+    )
     @classmethod
     def timezone_aware(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:

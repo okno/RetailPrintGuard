@@ -21,7 +21,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.3.0"
+PARSER_VERSION = "1.5.0"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -37,22 +37,30 @@ _TOTAL_RE = re.compile(r"^=T(?P<code>[^/]+)/\$(?P<amount>[+-]?\d+)$")
 _COMMERCIAL_TEXT_RE = re.compile(r'^="/\?A/\((?P<text>.*)\)(?:/\*(?P<style>\d+))?$')
 _MANAGEMENT_TEXT_RE = re.compile(r'^="/\((?P<text>.*)\)(?:/\*(?P<style>\d+))?$')
 _COUNTER_RE = re.compile(r"^s(?P<status_digits>\d{6})RE(?P<counter>\d{4})$")
-_ORDER_RE = re.compile(r"^\s*(?:ORDINE|ORDER)\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
+_ORDER_RE = re.compile(
+    r"^\s*#?\s*(?:ORDINE|ORDER)\s*:\s*(?P<value>.*?)\s*$",
+    re.IGNORECASE,
+)
 _TABLE_RE = re.compile(r"^\s*TAVOLO\s*:\s*(?P<value>.*?)\s*$", re.IGNORECASE)
 _DOCUMENT_CODE_RE = re.compile(
-    r"\b(?:DOC(?:UMENTO)?\.?\s*(?:GESTIONALE)?\s*N\.?|N\.?)\s*"
+    r"\b(?:DOC(?:UMENTO)?\.?\s*(?:GESTIONALE)?\s*N(?:\.|°|º)?|N(?:\.|°|º)?)\s*"
     r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
     re.IGNORECASE,
 )
 _MANAGEMENT_DOCUMENT_CODE_RE = re.compile(
-    r"\bDOC(?:UMENTO)?\.?\s*GESTIONALE\s*N\.?\s*"
+    r"\bDOC(?:UMENTO)?\.?\s*GESTIONALE\s*N(?:\.|°|º)?\s*"
+    r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
+    re.IGNORECASE,
+)
+_COMMERCIAL_DOCUMENT_CODE_RE = re.compile(
+    r"\bDOCUMENTO(?:\s+COMMERCIALE)?\s+N(?:\.|°|º)?\s*"
     r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
     re.IGNORECASE,
 )
 _COMMERCIAL_REFERENCE_CODE_RE = re.compile(
     r"\b(?:RIF(?:ERIMENTO)?\.?\s*(?:AL\s+)?(?:DOCUMENTO\s+COMMERCIALE|DOCUMENTO)"
     r"|DOCUMENTO\s+COMMERCIALE(?:\s+DI\s+RIFERIMENTO)?"
-    r"|COPIA\s+CONFORME(?:\s+DEL)?\s+DOCUMENTO)\s*N\.?\s*"
+    r"|COPIA\s+CONFORME(?:\s+DEL)?\s+DOCUMENTO)\s*N(?:\.|°|º)?\s*"
     r"(?P<value>[A-Z0-9]+(?:[-/][A-Z0-9]+)+)\b",
     re.IGNORECASE,
 )
@@ -71,6 +79,26 @@ _PRINTED_TIMESTAMP_RE = re.compile(
     r"(?<!\d)(?P<day>\d{2})[/\\.\-](?P<month>\d{2})[/\\.\-]"
     r"(?P<year>\d{2}|\d{4})\s+(?P<hour>\d{2}):(?P<minute>\d{2})"
     r"(?::(?P<second>\d{2}))?(?!\d)"
+)
+_EXPLICIT_RCH_SERIAL_RE = re.compile(
+    r"^\s*RT\s*[:#-]?\s*(?P<value>[A-Z0-9]{8,32})\s*$",
+    re.IGNORECASE,
+)
+_BARE_RCH_SERIAL_RE = re.compile(r"^\s*(?P<value>[A-Z0-9]{8,32})\s*$", re.IGNORECASE)
+_SHIFT_END_REPORT_HEADER_RE = re.compile(
+    r"^\s*REPORT\s+DI\s+FINE\s+TURNO\b",
+    re.IGNORECASE,
+)
+_INVOICE_HEADER_RE = re.compile(
+    r"^\s*FATTURA(?:\s+ELETTRONICA)?\s*$",
+    re.IGNORECASE,
+)
+_INVOICE_NUMBER_RE = re.compile(
+    r"^\s*(?:"
+    r"FATTURA(?:\s+ELETTRONICA)?\s+(?:N(?:R)?(?:\.|°|º)?|NUMERO)"
+    r"|(?:N(?:R)?(?:\.|°|º)?|NUMERO)\s+FATTURA"
+    r")\s*[:#-]?\s*(?P<value>(?=[A-Z0-9./-]*\d)[A-Z0-9][A-Z0-9./-]{0,63})\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -123,6 +151,28 @@ class _Draft:
     end_offset: int = 0
     complete: bool = False
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedTimestamp:
+    line_index: int
+    value: datetime
+    precision: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PrintedRchIdentity:
+    application_timestamp: datetime | None
+    application_timestamp_precision: str | None
+    footer_timestamp: datetime | None
+    footer_timestamp_precision: str | None
+    serial_number: str | None
+    serial_number_evidence: str | None
+    own_document_code: str | None
+    own_document_code_evidence: str | None
+    commercial_reference_code: str | None
+    commercial_reference_code_evidence: str | None
+    warnings: tuple[str, ...]
 
 
 def _bcc(prefix: bytes) -> int:
@@ -236,17 +286,39 @@ def _document_code(value: str) -> str:
     return value.strip().upper().replace("/", "-")
 
 
-def _printed_timestamp(
+def _management_document_classification(
     text: str,
+) -> tuple[DocumentType, str, int] | None:
+    """Recognize non-sale management output only from document-level wording.
+
+    A shift report contains an aggregate row such as ``Fatture 42,35``.  The
+    invoice signatures deliberately require the singular document heading or
+    an explicit invoice number, so that aggregate never becomes an invoice.
+    """
+
+    lines = tuple(line.strip() for line in text.splitlines() if line.strip())
+    if lines and _SHIFT_END_REPORT_HEADER_RE.match(lines[0]):
+        return (
+            DocumentType.SHIFT_END_REPORT,
+            "RCH_REPORT_FINE_TURNO_LITERAL",
+            98,
+        )
+    if any(
+        _INVOICE_HEADER_RE.fullmatch(line) or _INVOICE_NUMBER_RE.fullmatch(line)
+        for line in lines
+    ):
+        return DocumentType.INVOICE, "RCH_FATTURA_LITERAL", 96
+    return None
+
+
+def _timestamp_from_match(
+    match: re.Match[str],
     *,
     captured_at: datetime,
     timezone_name: str,
 ) -> tuple[datetime | None, str | None, tuple[str, ...]]:
-    """Return a timestamp only when date and time are visible in captured text."""
+    """Convert one observed local timestamp without inventing missing fields."""
 
-    match = _PRINTED_TIMESTAMP_RE.search(text)
-    if match is None:
-        return None, None, ()
     warnings: list[str] = []
     try:
         zone = ZoneInfo(timezone_name)
@@ -286,6 +358,174 @@ def _printed_timestamp(
     )
     precision = "SECOND" if match.group("second") is not None else "MINUTE"
     return timestamp, precision, tuple(warnings)
+
+
+def _is_serial_token(value: str) -> bool:
+    return any(character.isalpha() for character in value) and any(
+        character.isdigit() for character in value
+    )
+
+
+def _printed_rch_identity(
+    draft: _Draft,
+    *,
+    captured_at: datetime,
+    timezone_name: str,
+) -> _PrintedRchIdentity:
+    """Classify observed application and fiscal-printer footer metadata.
+
+    The application can print its own time and a commercial reference inside a
+    management document.  The RCH then adds a second footer with its clock,
+    the document's own progressive and the RT serial.  Their proximity is
+    evidence; neither a capture timestamp nor a status counter is promoted to
+    one of these printed fields.
+    """
+
+    warnings: list[str] = []
+    observed_timestamps: list[_ObservedTimestamp] = []
+    for line_index, line in enumerate(draft.texts):
+        for match in _PRINTED_TIMESTAMP_RE.finditer(line):
+            value, precision, timestamp_warnings = _timestamp_from_match(
+                match,
+                captured_at=captured_at,
+                timezone_name=timezone_name,
+            )
+            warnings.extend(timestamp_warnings)
+            if value is not None and precision is not None:
+                observed_timestamps.append(
+                    _ObservedTimestamp(
+                        line_index=line_index,
+                        value=value,
+                        precision=precision,
+                    )
+                )
+
+    own_markers: list[tuple[int, str, str]] = []
+    for line_index, line in enumerate(draft.texts):
+        pattern = (
+            _COMMERCIAL_DOCUMENT_CODE_RE
+            if draft.kind == "commercial"
+            else _MANAGEMENT_DOCUMENT_CODE_RE
+        )
+        if match := pattern.search(line):
+            own_markers.append(
+                (
+                    line_index,
+                    _document_code(match.group("value")),
+                    (
+                        "RCH_PRINTED_COMMERCIAL_FOOTER"
+                        if draft.kind == "commercial"
+                        else "RCH_PRINTED_MANAGEMENT_FOOTER"
+                    ),
+                )
+            )
+    own_marker = own_markers[-1] if own_markers else None
+
+    serial_number: str | None = None
+    serial_evidence: str | None = None
+    serial_line_index: int | None = None
+    for line_index, line in enumerate(draft.texts):
+        if match := _EXPLICIT_RCH_SERIAL_RE.fullmatch(line):
+            candidate = match.group("value").upper()
+            if _is_serial_token(candidate):
+                serial_number = candidate
+                serial_evidence = "RCH_PRINTED_RT_PREFIX"
+                serial_line_index = line_index
+                break
+    if serial_number is None and own_marker is not None:
+        own_line_index = own_marker[0]
+        for line_index in range(own_line_index + 1, min(len(draft.texts), own_line_index + 3)):
+            match = _BARE_RCH_SERIAL_RE.fullmatch(draft.texts[line_index])
+            if match is None:
+                continue
+            candidate = match.group("value").upper()
+            if _is_serial_token(candidate):
+                serial_number = candidate
+                serial_evidence = "RCH_PRINTED_BARE_SERIAL_AFTER_FOOTER"
+                serial_line_index = line_index
+                break
+
+    footer_anchors = [marker[0] for marker in own_markers]
+    if serial_line_index is not None:
+        footer_anchors.append(serial_line_index)
+    footer_timestamp: _ObservedTimestamp | None = None
+    footer_score: tuple[int, int, int] | None = None
+    for timestamp_index, observed in enumerate(observed_timestamps):
+        line = draft.texts[observed.line_index]
+        contains_non_footer_document_code = (
+            _DOCUMENT_CODE_RE.search(line) is not None
+            and not any(marker[0] == observed.line_index for marker in own_markers)
+        )
+        if contains_non_footer_document_code:
+            continue
+        for anchor in footer_anchors:
+            distance = abs(anchor - observed.line_index)
+            if distance > 2:
+                continue
+            # Printed layouts place the time on/before the progressive.  Keep
+            # support for the inverse order but rank it after the observed one.
+            score = (
+                distance,
+                0 if observed.line_index <= anchor else 1,
+                -timestamp_index,
+            )
+            if footer_score is None or score < footer_score:
+                footer_timestamp = observed
+                footer_score = score
+
+    application_timestamp = next(
+        (
+            observed
+            for observed in observed_timestamps
+            if footer_timestamp is None or observed is not footer_timestamp
+        ),
+        None,
+    )
+    if application_timestamp is not None and footer_timestamp is not None:
+        offset_seconds = int(
+            (footer_timestamp.value - application_timestamp.value).total_seconds()
+        )
+        # Minute-only values each have a rounding uncertainty.  A displayed
+        # difference greater than one minute is unambiguously material.
+        if abs(offset_seconds) > 60:
+            warnings.append("rch_clock_offset_exceeds_one_minute")
+
+    commercial_reference: str | None = None
+    commercial_reference_evidence: str | None = None
+    if draft.kind == "management":
+        for line_index, line in enumerate(draft.texts):
+            if match := _COMMERCIAL_REFERENCE_CODE_RE.search(line):
+                commercial_reference = _document_code(match.group("value"))
+                commercial_reference_evidence = "RCH_PRINTED_COMMERCIAL_REFERENCE"
+                break
+            if own_marker is not None and line_index == own_marker[0]:
+                continue
+            if match := _DOCUMENT_CODE_RE.search(line):
+                commercial_reference = _document_code(match.group("value"))
+                commercial_reference_evidence = (
+                    "RCH_PRINTED_UNQUALIFIED_COMMERCIAL_DOCUMENT_NUMBER"
+                )
+                break
+
+    return _PrintedRchIdentity(
+        application_timestamp=(
+            application_timestamp.value if application_timestamp is not None else None
+        ),
+        application_timestamp_precision=(
+            application_timestamp.precision if application_timestamp is not None else None
+        ),
+        footer_timestamp=footer_timestamp.value if footer_timestamp is not None else None,
+        footer_timestamp_precision=(
+            footer_timestamp.precision if footer_timestamp is not None else None
+        ),
+        serial_number=serial_number,
+        serial_number_evidence=serial_evidence,
+        own_document_code=own_marker[1] if own_marker is not None else None,
+        own_document_code_evidence=own_marker[2] if own_marker is not None else None,
+        commercial_reference_code=commercial_reference,
+        commercial_reference_code_evidence=commercial_reference_evidence,
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
 
 
 def _source(frame: Frame) -> SourceSpan:
@@ -421,10 +661,30 @@ def _draft_document(
     timezone_name: str,
 ) -> NormalizedDocument:
     text = "\n".join(draft.texts).strip()
-    document_timestamp, timestamp_precision, timestamp_warnings = _printed_timestamp(
-        text,
+    printed_identity = _printed_rch_identity(
+        draft,
         captured_at=captured_at,
         timezone_name=timezone_name,
+    )
+    if printed_identity.own_document_code is not None:
+        draft.external_document_code = printed_identity.own_document_code
+        draft.external_document_code_evidence = (
+            printed_identity.own_document_code_evidence
+        )
+    if printed_identity.commercial_reference_code is not None and (
+        draft.commercial_reference_code is None
+        or printed_identity.own_document_code is not None
+    ):
+        draft.commercial_reference_code = printed_identity.commercial_reference_code
+        draft.commercial_reference_code_evidence = (
+            printed_identity.commercial_reference_code_evidence
+        )
+    document_timestamp = (
+        printed_identity.application_timestamp or printed_identity.footer_timestamp
+    )
+    timestamp_precision = (
+        printed_identity.application_timestamp_precision
+        or printed_identity.footer_timestamp_precision
     )
     if draft.kind == "commercial":
         document_type = DocumentType.COMMERCIAL_DOCUMENT
@@ -443,7 +703,10 @@ def _draft_document(
         )
     else:
         upper = text.upper()
-        if "COPIA CONFORME" in upper:
+        specialized_classification = _management_document_classification(text)
+        if specialized_classification is not None:
+            document_type, subtype, confidence = specialized_classification
+        elif "COPIA CONFORME" in upper:
             document_type = DocumentType.CONFORMING_COPY
             subtype = "COPIA_CONFORME_LITERAL"
             confidence = 90
@@ -474,7 +737,26 @@ def _draft_document(
         NAMESPACE_URL,
         f"retailprintguard:rch:{job_id}:{draft.kind}:{draft.start_offset}:{source_hash}",
     )
-    warnings = tuple(dict.fromkeys((*draft.warnings, *timestamp_warnings)))
+    identity_warnings = list(printed_identity.warnings)
+    if (
+        draft.external_document_code
+        and draft.external_document_code_suffix
+        and draft.external_document_code.replace("/", "-").rsplit("-", 1)[-1]
+        != draft.external_document_code_suffix
+    ):
+        identity_warnings.append("rch_progressive_suffix_mismatch")
+    warnings = tuple(dict.fromkeys((*draft.warnings, *identity_warnings)))
+    clock_offset_seconds = (
+        int(
+            (
+                printed_identity.footer_timestamp
+                - printed_identity.application_timestamp
+            ).total_seconds()
+        )
+        if printed_identity.application_timestamp is not None
+        and printed_identity.footer_timestamp is not None
+        else None
+    )
     return NormalizedDocument(
         id=identifier,
         source_device_id=device_id,
@@ -487,6 +769,9 @@ def _draft_document(
         commercial_reference_code=draft.commercial_reference_code,
         order_code=draft.order_code,
         table_code=draft.table_code,
+        application_timestamp=printed_identity.application_timestamp,
+        rch_footer_timestamp=printed_identity.footer_timestamp,
+        rch_serial_number=printed_identity.serial_number,
         document_timestamp=document_timestamp,
         captured_at=captured_at,
         gross_total=draft.total,
@@ -524,6 +809,24 @@ def _draft_document(
                 "RCH_PRINTED_TEXT" if document_timestamp is not None else None
             ),
             "document_timestamp_precision": timestamp_precision,
+            "application_timestamp_evidence": (
+                "RCH_APPLICATION_PRINTED_TEXT"
+                if printed_identity.application_timestamp is not None
+                else None
+            ),
+            "application_timestamp_precision": (
+                printed_identity.application_timestamp_precision
+            ),
+            "rch_footer_timestamp_evidence": (
+                "RCH_FOOTER_PRINTED_TEXT"
+                if printed_identity.footer_timestamp is not None
+                else None
+            ),
+            "rch_footer_timestamp_precision": (
+                printed_identity.footer_timestamp_precision
+            ),
+            "rch_serial_number_evidence": printed_identity.serial_number_evidence,
+            "rch_clock_offset_seconds": clock_offset_seconds,
             "progressive_observation_status": (
                 "FULL_CODE_OBSERVED_IN_CAPTURE"
                 if draft.external_document_code

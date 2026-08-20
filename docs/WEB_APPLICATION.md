@@ -69,10 +69,18 @@ RCH, riferimento commerciale e periodo. Il dettaglio offre:
 - provenienza, hash, parser, confidenza e warning.
 
 Nella presentazione italiana il valore interno `KITCHEN_ORDER` è mostrato come
-“COMANDA”. I device `pos_1`, `pos_2` e `pos_3` sono mostrati rispettivamente
-come BAR, CUCINA e PIZZERIA, mantenendo visibile anche l’ID tecnico. La tabella
-espone separatamente “Ora cassa” e “Acquisito”: l’ora cassa compare solo quando
-stampata nel documento catturato e rispetta la precisione realmente osservata.
+“COMANDA”, `SHIFT_END_REPORT` come “REPORT DI FINE TURNO” e `INVOICE` come
+“FATTURA”. Il parser richiede una firma documentale forte per una fattura: la
+sola voce aggregata “Fatture” dentro un report non basta. Report e fatture sono
+consultabili e conteggiati separatamente ma non alimentano ordini, prezzi o
+alert di vendita.
+
+I device `pos_1`, `pos_2` e `pos_3` sono mostrati rispettivamente come BAR,
+CUCINA e PIZZERIA, mantenendo visibile anche l’ID tecnico. La tabella espone
+separatamente ora applicativa RCH, ora footer RCH, scarto fra gli orologi,
+acquisizione server e seriale con provenienza. Un campo generato internamente
+dalla stampante ma assente dai byte catturati resta “Non osservato nel flusso”:
+non viene ricostruito dall’ora server o da contatori tecnici.
 Le colonne possono essere trascinate o spostate con i comandi accessibili; la
 preferenza resta nel browser e può essere ripristinata all’ordine predefinito.
 
@@ -86,6 +94,11 @@ Un documento monetario incompleto non può fornire un prezzo derivato. Quando
 fonti complete correlate riportano prezzi incompatibili, la colonna mostra
 “Prezzi in conflitto” e rende consultabili i candidati; non espone un valore
 derivato scelto arbitrariamente.
+
+I documenti incompleti semanticamente vuoti — senza righe, codici vendita,
+importi o pagamenti — sono esclusi dalle viste operative predefinite. Non sono
+cancellati: restano disponibili scegliendo “Tutte le evidenze”, includendo le
+evidenze tecniche nella ricerca o aprendo la vista tecnica degli incompleti.
 
 La richiesta RAW completa usa l'endpoint auditato. La schermata visualizza solo
 il prefisso per evitare blocchi del browser; il byte array restituito dall'API
