@@ -115,6 +115,32 @@ esponenziale da 5 secondi fino a un'ora; all'ottavo errore il job passa a
 copertura del dialetto fisico: fixture/PCAP autorizzati e collaudo hardware
 restano necessari.
 
+### Buzzer POS dopo una COMANDA
+
+Il worker può inviare il comando buzzer documentato POS80K dopo che una nuova
+`KITCHEN_ORDER` completa, proveniente da un device POS/ESC-POS, è stata salvata
+con successo. Il decoder resta puro e l'invio è post-commit, best-effort e su
+una coda bounded distinta per POS. Non viene eseguito per RCH, preconti,
+documenti incompleti, retry già persistiti o `--reparse-all`.
+
+La configurazione è intenzionalmente separata dal YAML condiviso con i proxy:
+
+```ini
+RPG_POS_BEEPER_ENABLED=true
+RPG_POS_BEEPER_COUNT=3
+RPG_POS_BEEPER_ON_MS=300
+RPG_POS_BEEPER_OFF_MS=200
+RPG_POS_BEEPER_CONNECT_TIMEOUT_SECONDS=1.0
+RPG_POS_BEEPER_QUEUE_SIZE_PER_DEVICE=64
+```
+
+Salvarla in `/etc/retailprintguard/parser.env` con proprietario
+`root:retailprintguard-config` e modo `0640`. Conteggio ammesso: 1..63; tempi
+ON/OFF: 0..25.500 ms in multipli di 100 ms. Host e porta non si duplicano nel
+file: derivano dal target del device POS già validato. Il comando non modifica
+frequenza/altezza del tono. Un invio TCP riuscito prova soltanto l'accettazione
+dei byte da parte dello stack remoto, non che il buzzer sia stato udito.
+
 La repository registra in `parser_versions.build_sha256` un digest del modulo
 che implementa il parser. Per ESC/POS il digest include inoltre l'identità del
 runtime Tesseract e la lingua configurata; una modifica del codice o del runtime

@@ -7,6 +7,10 @@ la struttura di Keep a Changelog.
 
 ### Added
 
+- notifica opzionale con buzzer POS80 dopo il commit di una nuova `COMANDA`
+  POS completa: conteggio, durata e pausa sono configurabili nel solo ambiente
+  parser; invio best-effort su code bounded separate per device, mai su RCH e
+  mai durante reparse storici;
 - correlazione `rpg-correlation-1.4.0` della sequenza di vendita composta da
   comanda, baseline gestionale/preconto, Documento Commerciale e copia
   gestionale, con vincoli congiunti su tavolo, articolo, direzione temporale e

@@ -13,8 +13,13 @@ from pathlib import Path
 from threading import Event
 
 from retailprintguard import __version__
-from retailprintguard.common.config import load_settings
+from retailprintguard.common.config import DeviceType, load_settings
 from retailprintguard.common.logging import StructuredLoggingRuntime, configure_structured_logging
+from retailprintguard.parser.beeper import (
+    PosBeeperConfiguration,
+    PosBeeperDispatcher,
+    PosBeeperTarget,
+)
 from retailprintguard.parser.repository import ParserRepositoryError, create_parser_repository
 from retailprintguard.parser.worker import ParserRunReport, ParserWorker
 
@@ -83,18 +88,39 @@ def cli(argv: Sequence[str] | None = None) -> int:
     os.umask(0o027)
     args = _parser().parse_args(argv)
     runtime: StructuredLoggingRuntime | None = None
+    beeper: PosBeeperDispatcher | None = None
     if args.json_logs:
         runtime = configure_structured_logging("parser")
     try:
         if args.reparse_all and not args.once:
             raise ValueError("--reparse-all requires --once")
         settings = load_settings(args.config)
+        beeper_configuration = PosBeeperConfiguration.from_environment()
+        if beeper_configuration.enabled:
+            beeper = PosBeeperDispatcher(
+                beeper_configuration,
+                tuple(
+                    PosBeeperTarget(
+                        device_id=device.id,
+                        host=str(device.target_ip),
+                        port=device.target_port,
+                    )
+                    for device in settings.devices
+                    if device.enabled and device.type is DeviceType.POS
+                ),
+            )
         worker = ParserWorker(
             create_parser_repository(settings),
             timezone_name=settings.timezone,
+            beeper=beeper,
         )
         if args.once:
             report = worker.run_once(limit=args.limit, reparse=args.reparse_all)
+            if beeper is not None and not beeper.drain(timeout=30):
+                LOGGER.warning(
+                    "POS beeper drain timed out; parser output remains valid",
+                    extra={"event": "pos_beeper_drain_timeout"},
+                )
             _report(report, as_json=args.json)
             return 1 if report.failed else 0
         stop = Event()
@@ -137,6 +163,8 @@ def cli(argv: Sequence[str] | None = None) -> int:
             )
         return 2
     finally:
+        if beeper is not None:
+            beeper.close()
         if runtime is not None:
             runtime.stop()
 
