@@ -1,6 +1,42 @@
 export const TECHNICAL_DOCUMENT_TYPE = 'DEVICE_RESPONSE'
 export const ALL_EVIDENCE_FILTER = '__ALL__'
 
+const DOCUMENT_TYPE_LABELS: Record<string, string> = {
+  KITCHEN_ORDER: 'COMANDA',
+  ORDER_CHANGE: 'VARIAZIONE COMANDA',
+  ORDER: 'ORDINE',
+  PRE_BILL: 'PRECONTO',
+  MANAGEMENT_DOCUMENT: 'DOCUMENTO GESTIONALE',
+  COMMERCIAL_DOCUMENT: 'DOCUMENTO COMMERCIALE',
+  CONFORMING_COPY: 'COPIA CONFORME',
+  CANCELLATION: 'ANNULLAMENTO',
+  REFUND: 'RIMBORSO',
+  REPRINT: 'RISTAMPA',
+  PAYMENT: 'PAGAMENTO',
+  DEVICE_RESPONSE: 'RISPOSTA TECNICA RCH',
+  UNKNOWN: 'SCONOSCIUTO',
+}
+
+const POS_DEVICE_LABELS: Record<string, string> = {
+  pos_1: 'BAR',
+  pos_2: 'CUCINA',
+  pos_3: 'PIZZERIA',
+}
+
+export function documentTypeLabel(value: string) {
+  return DOCUMENT_TYPE_LABELS[value] ?? value.replaceAll('_', ' ')
+}
+
+export function deviceLabel(value: string) {
+  return POS_DEVICE_LABELS[value.toLowerCase()] ?? value
+}
+
+export function documentTimestampEvidenceLabel(value?: string) {
+  if (value === 'RCH_PRINTED_TEXT') return 'Stampata dalla cassa RCH'
+  if (value === 'ESC_POS_PRINTED_OPERATOR_LINE') return 'Stampata sulla comanda POS'
+  return value ? 'Osservata nel documento' : undefined
+}
+
 /**
  * Keep the UI-only "all evidence" value out of the backend query. During a
  * rolling update the client also applies this filter, so an older API cannot

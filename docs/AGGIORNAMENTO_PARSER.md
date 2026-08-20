@@ -55,25 +55,30 @@ feed, cut, drawer e status realtime. Un decoder deve:
 - non trasformare preview reverse printproxy in risposta completa;
 - marcare `UNKNOWN` quando la semantica business non è sufficiente.
 
-Il parser ESC/POS `1.2.0` ricostruisce esclusivamente gruppi coerenti di bande
+Il parser ESC/POS `1.3.0` ricostruisce esclusivamente gruppi coerenti di bande
 `ESC *` osservate e usa Tesseract con lingua configurata dall'ambiente protetto
 del servizio. Accetta il tavolo soltanto con pattern stretto e confidenza almeno
 80. Testo OCR, confidenza, bounding box, dimensioni, offset e hash del bitmap
-derivato restano nei metadati; il payload originale non viene modificato.
+derivato restano nei metadati; il payload originale non viene modificato. Se la
+sola parte numerica del codice tavolo contiene la tipica confusione OCR `O/0`,
+il derivato viene normalizzato (`O1-R` → `01-R`) e conserva nei metadati valore
+osservato, valore normalizzato, regola applicata e warning. Codici alfanumerici
+come `LAB-22` o `OVEST-1` non sono corretti automaticamente.
 L'OCR non è importato né eseguito dai proxy POS/RCH.
 
 ## Parser nativi correnti
 
 Sono presenti due parser nativi versionati:
 
-- `retailprintguard-escpos` `1.2.0`: input massimo 16 MiB, massimo 1.024 documenti,
+- `retailprintguard-escpos` `1.3.0`: input massimo 16 MiB, massimo 1.024 documenti,
   split su comandi cut osservati, codepage allowlist, controlli resi come marker
   leggibili, quantità firmate, portate, ricomposizione conservativa delle righe
   mandate a capo e OCR raster bounded;
-- `retailprintguard-rch-observed` `1.1.0`: framing incrementale sul flusso ricostruito,
+- `retailprintguard-rch-observed` `1.3.0`: framing incrementale sul flusso ricostruito,
   BCC, ACK e issue bounded; ricostruisce aperture/chiusure gestionali e
   commerciali osservate e produce anche `DEVICE_RESPONSE` per frame reverse
-  validi.
+  validi. Data e ora sono assegnate al documento solo se visibili nel testo
+  catturato; precisione al minuto/secondo e provenienza restano nei metadati.
 
 Entrambi conservano SHA-256, span/direzione/offset, parser/versione, confidenza,
 warning e documento `UNKNOWN` quando l'evidenza non basta. Il parser RCH etichetta
@@ -207,7 +212,7 @@ riavvolga per default il watermark di correlazione:
 
 ```bash
 RPG_PARSER_NAME='retailprintguard-escpos'
-RPG_PARSER_VERSION='1.2.0'
+RPG_PARSER_VERSION='1.3.0'
 RPG_PARSER_BUILD_SHA256='incollare-qui-i-64-caratteri-esadecimali-verificati'
 RPG_PARSER_CHANGE_REASON='inserire change-id e motivazione approvata'
 [[ "${RPG_PARSER_BUILD_SHA256}" =~ ^[0-9a-f]{64}$ ]] || exit 1

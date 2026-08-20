@@ -8,9 +8,14 @@ import { api, downloadApi, rawDocument, scopedQueryKey, session } from '../api/c
 import { ErrorState, LoadingState } from '../components/State'
 import { PageHeader } from '../components/PageHeader'
 import { StatusChip } from '../components/StatusChip'
-import { formatDateTime } from '../format'
+import { formatDateTime, formatDocumentDateTime } from '../format'
 import { DOCUMENT_DETAIL_PARAM } from '../routes'
-import { confidencePercent } from '../documentPresentation'
+import {
+  confidencePercent,
+  deviceLabel,
+  documentTimestampEvidenceLabel,
+  documentTypeLabel,
+} from '../documentPresentation'
 import type { DocumentRecord } from '../types'
 
 const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
@@ -114,7 +119,7 @@ export function DocumentDetailPage() {
   </Box>
 
   return <>
-    <PageHeader title={doc.subtype} subtitle={`${doc.type} · ${doc.device_id} · parser ${doc.parser_name} ${doc.parser_version}`} actions={actions} />
+    <PageHeader title={documentTypeLabel(doc.type)} subtitle={`${doc.subtype.replaceAll('_', ' ')} · ${deviceLabel(doc.device_id)} (${doc.device_id}) · parser ${doc.parser_name} ${doc.parser_version}`} actions={actions} />
     {artifactError && <Box sx={{ mb: 2 }}><ErrorState error={artifactError} /></Box>}
     {!canDownloadEvidence && <Alert severity="info" sx={{ mb: 2 }}>Il download delle evidenze RAW e derivate richiede il ruolo AUDITOR o ADMIN.</Alert>}
     <Grid container spacing={2.5}>
@@ -135,7 +140,7 @@ export function DocumentDetailPage() {
         </Card>
       </Grid>
       <Grid size={{ xs: 12, lg: 4 }}>
-        <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />{[['Acquisito', formatDateTime(doc.captured_at)], ['Progressivo documento', doc.external_document_code ?? doc.external_code ?? (doc.resolved_external_document_code ? `${doc.resolved_external_document_code} (da riferimento gestionale correlato)` : undefined) ?? (doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE' ? 'Non osservato nel flusso catturato' : undefined)], ['Suffisso progressivo RCH', doc.external_document_code_suffix], ['Osservabilità progressivo', progressiveObservationLabel(doc.progressive_observation_status)], ['Provenienza risoluzione', doc.resolved_external_document_code_provenance === 'CORRELATED_MANAGEMENT_REFERENCE' ? 'Riferimento commerciale in documento gestionale correlato' : undefined], ['Riferimento commerciale', doc.commercial_reference_code], ['Codice ordine', doc.order_code], ['Tavolo', doc.table_code], ['Coperti', doc.covers], ['Operatore', doc.operator_code], ['Hash SHA-256', doc.sha256], ['Confidenza', `${doc.confidence}%`]].map(([label, value]) => <Box key={label} sx={{ mt: 2 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography sx={{ wordBreak: 'break-all' }}>{value ?? '—'}</Typography></Box>)}</CardContent></Card>
+        <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography><StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />{[['Ora cassa', doc.document_timestamp ? `${formatDocumentDateTime(doc.document_timestamp, doc.document_timestamp_precision)} · ${documentTimestampEvidenceLabel(doc.document_timestamp_evidence) ?? 'osservata nel documento'}` : undefined], ['Acquisito', formatDateTime(doc.captured_at)], ['Progressivo documento', doc.external_document_code ?? doc.external_code ?? (doc.resolved_external_document_code ? `${doc.resolved_external_document_code} (da riferimento gestionale correlato)` : undefined) ?? (doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE' ? 'Non osservato nel flusso catturato' : undefined)], ['Suffisso progressivo RCH', doc.external_document_code_suffix], ['Osservabilità progressivo', progressiveObservationLabel(doc.progressive_observation_status)], ['Provenienza risoluzione', doc.resolved_external_document_code_provenance === 'CORRELATED_MANAGEMENT_REFERENCE' ? 'Riferimento commerciale in documento gestionale correlato' : undefined], ['Riferimento commerciale', doc.commercial_reference_code], ['Codice ordine', doc.order_code], ['Tavolo', doc.table_code], ['Coperti', doc.covers], ['Operatore', doc.operator_code], ['Hash SHA-256', doc.sha256], ['Confidenza', `${doc.confidence}%`]].map(([label, value]) => <Box key={label} sx={{ mt: 2 }}><Typography variant="caption" color="text.secondary">{label}</Typography><Typography sx={{ wordBreak: 'break-all' }}>{value ?? '—'}</Typography></Box>)}</CardContent></Card>
         {doc.warnings.length > 0 && <Alert severity="warning" sx={{ mt: 2 }}>{doc.warnings.join(' · ')}</Alert>}
       </Grid>
     </Grid>

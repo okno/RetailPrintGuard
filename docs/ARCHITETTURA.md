@@ -125,8 +125,8 @@ Rappresenta il risultato di un parser specifico e versionato: tipo, riferimenti,
 righe, importi, pagamenti, confidenza, warning e span nel payload. Ogni nuova
 elaborazione crea una `document_version`.
 
-I parser nativi `retailprintguard-escpos` `1.2.0` e
-`retailprintguard-rch-observed` `1.1.0` operano nel control plane:
+I parser nativi `retailprintguard-escpos` `1.3.0` e
+`retailprintguard-rch-observed` `1.3.0` operano nel control plane:
 ricevono byte e metadati già acquisiti e restituiscono documenti immutabili.
 I decoder non aprono socket, non modificano lo spool e non importano il relay.
 La segmentazione applicativa avviene sul flusso ricostruito, mai sui confini
@@ -138,7 +138,8 @@ non parte per RCH/reparse e un errore di consegna non cambia l'esito del parser.
 L'OCR opzionale del tavolo ESC/POS viene eseguito soltanto dal worker parser
 con risorse bounded e isolamento systemd. Versione/lingua del backend entrano
 nel fingerprint della build; un errore OCR non cambia la disponibilità del
-proxy né i byte acquisiti.
+proxy né i byte acquisiti. La normalizzazione contestuale `O` → `0` si applica
+soltanto al prefisso numerico del tavolo e conserva sempre l’osservazione OCR.
 
 ### Correlated transaction
 

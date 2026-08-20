@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   ALL_EVIDENCE_FILTER,
   confidencePercent,
+  deviceLabel,
   documentApiSearchParams,
+  documentTypeLabel,
   presentedDocuments,
 } from './documentPresentation'
 
@@ -37,5 +39,13 @@ describe('primary document presentation', () => {
     expect(confidencePercent(0.96)).toBe(96)
     expect(confidencePercent(96)).toBe(96)
     expect(confidencePercent(undefined)).toBeUndefined()
+  })
+
+  it('uses operational Italian labels without changing persisted identifiers', () => {
+    expect(documentTypeLabel('KITCHEN_ORDER')).toBe('COMANDA')
+    expect(deviceLabel('pos_1')).toBe('BAR')
+    expect(deviceLabel('pos_2')).toBe('CUCINA')
+    expect(deviceLabel('pos_3')).toBe('PIZZERIA')
+    expect(deviceLabel('rch_1')).toBe('rch_1')
   })
 })

@@ -145,6 +145,8 @@ export interface DocumentRecord {
   operator_code?: string
   terminal_code?: string
   document_timestamp?: string
+  document_timestamp_precision?: 'MINUTE' | 'SECOND' | string
+  document_timestamp_evidence?: string
   captured_at: string
   gross_total?: string
   net_total?: string

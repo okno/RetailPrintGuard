@@ -302,6 +302,13 @@ def test_rch_observed_quantity_management_totals_and_error_status_regression() -
     assert management_document.order_code == "ORD-LAB"
     assert management_document.external_document_code is None
     assert management_document.commercial_reference_code == "9999-0042"
+    assert management_document.document_timestamp == datetime(
+        2042, 1, 1, 11, 34, tzinfo=UTC
+    )
+    assert management_document.raw_metadata["document_timestamp_evidence"] == (
+        "RCH_PRINTED_TEXT"
+    )
+    assert management_document.raw_metadata["document_timestamp_precision"] == "MINUTE"
     assert management_document.payments[0].method == "CONTANTI"
     assert management_document.payments[0].amount == 2
 
@@ -368,6 +375,10 @@ def test_escpos_pos_ticket_recovers_table_quantity_course_and_wrapped_item() -> 
     assert document.table_code == "LAB-22"
     assert document.operator_code is None
     assert document.document_timestamp == CAPTURED_AT
+    assert document.raw_metadata["document_timestamp_evidence"] == (
+        "ESC_POS_PRINTED_OPERATOR_LINE"
+    )
+    assert document.raw_metadata["document_timestamp_precision"] == "MINUTE"
     assert document.gross_total is None
     assert document.raw_metadata["covers"] == 1
     assert document.raw_metadata["table_code_evidence"] == "ESC_POS_RASTER_OCR_INFERRED"
@@ -381,6 +392,44 @@ def test_escpos_pos_ticket_recovers_table_quantity_course_and_wrapped_item() -> 
     assert document.lines[0].source is not None
     assert document.lines[0].source.offset >= 0
     assert document.lines[0].source.offset + document.lines[0].source.length <= len(payload)
+
+
+def test_escpos_numeric_table_ocr_corrects_letter_o_but_preserves_raw_evidence() -> None:
+    payload = b"\x1b@" + _synthetic_table_raster() + b"\nPortata: 1\n1x Voce\n\x1bm"
+
+    corrected = parse_escpos(
+        payload,
+        device_id="pos_synthetic",
+        session_id="session-table-ocr",
+        job_id="job-table-ocr",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=lambda _image: RasterOcrResult("Tavolo: O1-R", 91.7619),
+    )[0]
+    unchanged = parse_escpos(
+        payload,
+        device_id="pos_synthetic",
+        session_id="session-table-alpha",
+        job_id="job-table-alpha",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=lambda _image: RasterOcrResult("Tavolo: OVEST-1", 99.0),
+    )[0]
+
+    observation = corrected.raw_metadata["raster_ocr"]["observations"][0]
+    assert corrected.table_code == "01-R"
+    assert corrected.raw_metadata["table_code_evidence"] == (
+        "ESC_POS_RASTER_OCR_NUMERIC_NORMALIZED"
+    )
+    assert observation["text"] == "Tavolo: O1-R"
+    assert observation["table_code_observed"] == "O1-R"
+    assert observation["table_code_normalized"] == "01-R"
+    assert observation["table_code_normalization"] == "OCR_NUMERIC_O_TO_ZERO"
+    assert "raster_table_code_normalized_numeric" in corrected.warnings
+    assert unchanged.table_code == "OVEST-1"
+    assert "raster_table_code_normalized_numeric" not in unchanged.warnings
 
 
 def test_escpos_quantity_decrease_is_a_signed_delta_not_an_invented_removal() -> None:
@@ -462,6 +511,16 @@ def test_escpos_raster_ocr_failure_and_low_confidence_are_non_fatal() -> None:
         source_path="synthetic/client.raw",
         ocr_engine=failing_ocr,
     )[0]
+    no_result = parse_escpos(
+        payload,
+        device_id="pos_synthetic",
+        session_id="session-no-result-ocr",
+        job_id="job-no-result-ocr",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+        ocr_engine=lambda _image: None,
+    )[0]
 
     assert low.table_code is None
     assert "raster_table_ocr_below_confidence_threshold" in low.warnings
@@ -469,3 +528,4 @@ def test_escpos_raster_ocr_failure_and_low_confidence_are_non_fatal() -> None:
     assert failed.table_code is None
     assert "raster_ocr_backend_error" in failed.warnings
     assert failed.complete is True
+    assert "raster_ocr_no_result" in no_result.warnings

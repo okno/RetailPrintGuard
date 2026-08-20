@@ -1315,6 +1315,10 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
         active_version.commercial_reference_code = "COMM-0007"
         active_version.order_code = None
         active_version.table_code = "LAB-25"
+        active_version.raw_metadata = {
+            "document_timestamp_precision": "MINUTE",
+            "document_timestamp_evidence": "ESC_POS_PRINTED_OPERATOR_LINE",
+        }
         document.document_type = "KITCHEN_ORDER"
         document.subtype = "SHADOW_NEW"
         document.commercial_reference_code = "SHADOW-REF"
@@ -1409,6 +1413,8 @@ def test_document_views_honor_active_parser_and_exclude_technical_responses() ->
     assert selected.external_document_code_suffix == "0001"
     assert selected.external_code == "PB-0001"
     assert selected.commercial_reference_code == "COMM-0007"
+    assert selected.document_timestamp_precision == "MINUTE"
+    assert selected.document_timestamp_evidence == "ESC_POS_PRINTED_OPERATOR_LINE"
     assert selected.progressive_observation_status == "FULL_CODE_OBSERVED_IN_CAPTURE"
     by_reference, reference_total = repository.list_documents(
         limit=20,

@@ -229,6 +229,8 @@ class DocumentView(BaseModel):
     terminal_code: str | None = None
     covers: int | None = None
     document_timestamp: datetime | None = None
+    document_timestamp_precision: str | None = None
+    document_timestamp_evidence: str | None = None
     captured_at: datetime
     gross_total: Decimal | None = None
     net_total: Decimal | None = None

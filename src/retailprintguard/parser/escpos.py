@@ -31,7 +31,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-escpos"
-PARSER_VERSION = "1.2.0"
+PARSER_VERSION = "1.3.0"
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_OUTPUT_CHARS = 4_000_000
 _MAX_DOCUMENTS = 1_024
@@ -46,6 +46,10 @@ _CODEPAGES = {0: "cp437", 2: "cp850", 16: "cp1252", 19: "cp858"}
 _ALLOWED_ENCODINGS = frozenset({"cp437", "cp850", "cp858", "cp1252", "latin-1", "utf-8"})
 _MONEY_RE = re.compile(r"(?<!\d)(?P<value>[+-]?\d{1,9}(?:\.\d{3})*,\d{2})(?!\d)")
 _TABLE_RE = re.compile(r"\bTAVOLO\s*[:#-]?\s*(?P<value>[A-Z0-9._/-]+)", re.IGNORECASE)
+_NUMERIC_OCR_TABLE_RE = re.compile(
+    r"(?P<numeric>[O0-9]{1,8})(?P<suffix>(?:[-/][A-Z0-9]{1,16})?)",
+    re.IGNORECASE,
+)
 _ORDER_RE = re.compile(r"\b(?:ORDINE|COMANDA)\s*[:#-]?\s*(?P<value>[A-Z0-9._/-]+)", re.IGNORECASE)
 _OPERATOR_LINE_RE = re.compile(
     r"\bOPERATORE\s*[:#-]?\s*(?P<value>[^\r\n]*)",
@@ -289,6 +293,25 @@ def _normalize_ocr_word(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = "".join(character for character in normalized if character.isprintable())
     return " ".join(normalized.split())[:256]
+
+
+def _normalize_ocr_table_code(value: str) -> tuple[str, str | None]:
+    """Correct only an OCR-confused ``O`` inside a numeric table prefix.
+
+    The unmodified OCR text remains in the observation metadata.  Restricting
+    the correction to a bounded numeric prefix avoids changing legitimate
+    alphanumeric identifiers such as ``LAB-22`` or ``OVEST-1``.
+    """
+
+    observed = value.strip().upper()[:128]
+    match = _NUMERIC_OCR_TABLE_RE.fullmatch(observed)
+    if match is None:
+        return observed, None
+    numeric = match.group("numeric")
+    if "O" not in numeric or not any(character.isdigit() for character in numeric):
+        return observed, None
+    normalized = f"{numeric.replace('O', '0')}{match.group('suffix')}"
+    return normalized, "OCR_NUMERIC_O_TO_ZERO"
 
 
 def _parse_tesseract_tsv(
@@ -547,6 +570,11 @@ def _raster_table_evidence(
         if result is None:
             observation["status"] = "NO_RESULT"
             observations.append(observation)
+            warnings.append(
+                "raster_ocr_backend_unavailable"
+                if backend in {"tesseract:none", "tesseract:unavailable"}
+                else "raster_ocr_no_result"
+            )
             continue
         normalized = "\n".join(" ".join(line.split()) for line in result.text.splitlines())[:2048]
         observation.update(
@@ -568,7 +596,14 @@ def _raster_table_evidence(
         if result.confidence < _OCR_MINIMUM_CONFIDENCE:
             warnings.append("raster_table_ocr_below_confidence_threshold")
             continue
-        accepted.append((match.group("value").upper(), result.confidence))
+        observed_table = match.group("value").upper()[:128]
+        normalized_table, normalization = _normalize_ocr_table_code(observed_table)
+        observation["table_code_observed"] = observed_table
+        observation["table_code_normalized"] = normalized_table
+        if normalization is not None:
+            observation["table_code_normalization"] = normalization
+            warnings.append("raster_table_code_normalized_numeric")
+        accepted.append((normalized_table, result.confidence))
     distinct = {value for value, _confidence in accepted}
     if len(distinct) > 1:
         warnings.append("raster_table_ocr_conflict")
@@ -802,14 +837,15 @@ def _operator_and_timestamp(
     *,
     captured_at: datetime,
     timezone_name: str,
-) -> tuple[str | None, datetime | None, tuple[str, ...]]:
+) -> tuple[str | None, datetime | None, str | None, tuple[str, ...]]:
     match = _OPERATOR_LINE_RE.search(text)
     if match is None:
-        return None, None, ()
+        return None, None, None, ()
     value = " ".join(match.group("value").split())
     timestamp_match = _LOCAL_TIMESTAMP_RE.search(value)
     operator = value
     document_timestamp = None
+    timestamp_precision = None
     warnings: list[str] = []
     if timestamp_match is not None:
         operator = (value[: timestamp_match.start()] + value[timestamp_match.end() :]).strip(" -:;")
@@ -846,11 +882,14 @@ def _operator_and_timestamp(
                         candidates,
                         key=lambda item: abs((item - captured_at.astimezone(zone)).total_seconds()),
                     )
+                    timestamp_precision = (
+                        "SECOND" if timestamp_match.group("time").count(":") == 2 else "MINUTE"
+                    )
                 else:
                     warnings.append("document_local_time_nonexistent")
         else:
             warnings.append("document_timestamp_invalid")
-    return operator[:128] or None, document_timestamp, tuple(warnings)
+    return operator[:128] or None, document_timestamp, timestamp_precision, tuple(warnings)
 
 
 def _join_wrapped_description(left: str, right: str, *, force_space: bool = False) -> str:
@@ -1058,11 +1097,12 @@ def parse_escpos(
             doc_type = DocumentType.ORDER_CHANGE
             subtype = "VARIAZIONE_QUANTITA_POS_INFERRED"
         gross_total = _document_total(lines)
-        operator_code, document_timestamp, timestamp_warnings = _operator_and_timestamp(
-            text,
-            captured_at=captured_at,
-            timezone_name=timezone_name,
-        )
+        (
+            operator_code,
+            document_timestamp,
+            timestamp_precision,
+            timestamp_warnings,
+        ) = _operator_and_timestamp(text, captured_at=captured_at, timezone_name=timezone_name)
         raster_table, raster_observations, raster_warnings, raster_text = (
             _raster_table_evidence(
                 segment.payload,
@@ -1131,7 +1171,14 @@ def parse_escpos(
                     if doc_type is not DocumentType.UNKNOWN
                     else "UNKNOWN",
                     "table_code_evidence": (
-                        "ESC_POS_RASTER_OCR_INFERRED"
+                        "ESC_POS_RASTER_OCR_NUMERIC_NORMALIZED"
+                        if raster_table is not None
+                        and plain_table is None
+                        and any(
+                            observation.get("table_code_normalization")
+                            for observation in raster_observations
+                        )
+                        else "ESC_POS_RASTER_OCR_INFERRED"
                         if raster_table is not None and plain_table is None
                         else "PLAIN_TEXT"
                         if table_code is not None
@@ -1144,6 +1191,12 @@ def parse_escpos(
                         "minimum_confidence": _OCR_MINIMUM_CONFIDENCE,
                         "observations": list(raster_observations),
                     },
+                    "document_timestamp_evidence": (
+                        "ESC_POS_PRINTED_OPERATOR_LINE"
+                        if document_timestamp is not None
+                        else None
+                    ),
+                    "document_timestamp_precision": timestamp_precision,
                     **line_metadata,
                 },
             )

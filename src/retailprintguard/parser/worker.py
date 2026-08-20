@@ -71,6 +71,7 @@ class ParserWorker:
                         source["request"],
                         source["response"],
                         response_source_path=source["response_path"],
+                        timezone_name=self.timezone_name,
                         **common,
                     )
                 else:

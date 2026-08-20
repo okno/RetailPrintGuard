@@ -41,7 +41,7 @@ Classificazioni minime: comanda, modifica comanda, preconto e documento non
 fiscale sconosciuto. Quantità negative/rimozioni devono diventare eventi
 espliciti e mantenere la riga sorgente.
 
-Il parser ESC/POS `1.2.0` interpreta una riga articolo soltanto in presenza di
+Il parser ESC/POS `1.3.0` interpreta una riga articolo soltanto in presenza di
 un prefisso quantità esplicito, esclude intestazioni/separatori e conserva
 frammenti e span quando una descrizione viene mandata a capo. `Portata` viene
 associata alle righe successive. Una quantità negativa è un delta osservato:
@@ -54,6 +54,11 @@ milioni di pixel, con timeout e output limitati; il tavolo viene accettato solo
 da un match stretto sopra la soglia di confidenza. Backend assente, timeout,
 output eccessivo o bassa confidenza degradano a metadato/warning. Nessuna di
 queste condizioni modifica il RAW o il forwarding.
+
+Una `O` letta al posto dello zero viene corretta soltanto in un prefisso tavolo
+numeric-like che contenga anche almeno una cifra. Il testo OCR originale,
+la trasformazione applicata e il valore risultante restano verificabili nei
+metadati della versione; nessuna regola modifica identificativi alfanumerici.
 
 ## RCH osservato
 
@@ -71,6 +76,9 @@ Per i frame osservati:
 - in una copia, il totale documento non deve essere sostituito dal valore IVA
   stampato più in basso;
 - tavolo, codice ordine e codice documento sono estratti solo quando presenti;
+- data e ora sono estratte solo se entrambe visibili nel testo RCH catturato;
+  l’assenza di secondi resta precisione `MINUTE` e non viene presentata come
+  un’osservazione al secondo;
 - un documento camera/non riscosso è una chiusura economica gestionale distinta
   da un Documento Commerciale.
 

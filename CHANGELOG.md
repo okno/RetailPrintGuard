@@ -7,6 +7,9 @@ la struttura di Keep a Changelog.
 
 ### Added
 
+- colonna Web “Ora cassa” distinta dall’ora di acquisizione, con precisione e
+  provenienza osservate; intestazioni della tabella Documenti riordinabili via
+  trascinamento o tastiera e ordine persistito nel browser;
 - notifica opzionale con buzzer POS80 dopo il commit di una nuova `COMANDA`
   POS completa: conteggio, durata e pausa sono configurabili nel solo ambiente
   parser; invio best-effort su code bounded separate per device, mai su RCH e
@@ -24,6 +27,13 @@ la struttura di Keep a Changelog.
 
 ### Changed
 
+- parser ESC/POS `1.3.0`: normalizzazione dichiarata della sola `O` scambiata
+  dall’OCR per zero nel prefisso numerico del tavolo (`O1-R` → `01-R`), con
+  valore OCR originale conservato; parser RCH `1.3.0`: data/ora estratta solo
+  quando visibile nel testo stampato catturato;
+- la WebUI presenta `KITCHEN_ORDER` come “COMANDA” e i device `pos_1`, `pos_2`
+  e `pos_3` come BAR, CUCINA e PIZZERIA, mantenendo invariati gli identificatori
+  persistiti e i contratti API;
 - motore antifrode `rpg-fraud-1.2.0`: una riduzione materiale tra baseline e
   chiusura genera un solo `MODIFICA_POST_PRECONTO`, includendo importi,
   percentuale, differenze di riga e riferimenti documentali append-only;

@@ -1576,6 +1576,18 @@ class SqlAlchemyApiRepository:
                     document_timestamp=_version_value(
                         version, document, "document_timestamp"
                     ),
+                    document_timestamp_precision=(
+                        str((version.raw_metadata or {}).get("document_timestamp_precision"))
+                        if isinstance(version.raw_metadata, dict)
+                        and (version.raw_metadata or {}).get("document_timestamp_precision")
+                        else None
+                    ),
+                    document_timestamp_evidence=(
+                        str((version.raw_metadata or {}).get("document_timestamp_evidence"))
+                        if isinstance(version.raw_metadata, dict)
+                        and (version.raw_metadata or {}).get("document_timestamp_evidence")
+                        else None
+                    ),
                     captured_at=document.captured_at,
                     gross_total=version.gross_total,
                     net_total=version.net_total,

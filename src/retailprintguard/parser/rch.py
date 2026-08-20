@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from retailprintguard.common.domain import (
     DocumentLine,
@@ -20,7 +21,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.2.0"
+PARSER_VERSION = "1.3.0"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -66,6 +67,11 @@ _PAYMENT_RE = re.compile(
 )
 _ERROR_RESPONSE_RE = re.compile(r"^ES(?P<code>\d{8})$")
 _SUCCESS_RESPONSE_RE = re.compile(r"^(?:ON\d{8}|s\d{6}RE\d{4}|\d{4})$")
+_PRINTED_TIMESTAMP_RE = re.compile(
+    r"(?<!\d)(?P<day>\d{2})[/\\.\-](?P<month>\d{2})[/\\.\-]"
+    r"(?P<year>\d{2}|\d{4})\s+(?P<hour>\d{2}):(?P<minute>\d{2})"
+    r"(?::(?P<second>\d{2}))?(?!\d)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +236,58 @@ def _document_code(value: str) -> str:
     return value.strip().upper().replace("/", "-")
 
 
+def _printed_timestamp(
+    text: str,
+    *,
+    captured_at: datetime,
+    timezone_name: str,
+) -> tuple[datetime | None, str | None, tuple[str, ...]]:
+    """Return a timestamp only when date and time are visible in captured text."""
+
+    match = _PRINTED_TIMESTAMP_RE.search(text)
+    if match is None:
+        return None, None, ()
+    warnings: list[str] = []
+    try:
+        zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return None, None, ("document_timezone_unknown",)
+    try:
+        year = int(match.group("year"))
+        if year < 100:
+            captured_year = captured_at.astimezone(zone).year
+            century = (captured_year // 100) * 100
+            year = min(
+                (century - 100 + year, century + year, century + 100 + year),
+                key=lambda candidate: abs(candidate - captured_year),
+            )
+        naive = datetime(
+            year,
+            int(match.group("month")),
+            int(match.group("day")),
+            int(match.group("hour")),
+            int(match.group("minute")),
+            int(match.group("second") or 0),
+        )
+    except ValueError:
+        return None, None, ("document_timestamp_invalid",)
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        aware = naive.replace(tzinfo=zone, fold=fold)
+        roundtrip = aware.astimezone(UTC).astimezone(zone)
+        if roundtrip.replace(tzinfo=None) == naive:
+            candidates.append(aware)
+    if not candidates:
+        warnings.append("document_local_time_nonexistent")
+        return None, None, tuple(warnings)
+    timestamp = min(
+        candidates,
+        key=lambda item: abs((item - captured_at.astimezone(zone)).total_seconds()),
+    )
+    precision = "SECOND" if match.group("second") is not None else "MINUTE"
+    return timestamp, precision, tuple(warnings)
+
+
 def _source(frame: Frame) -> SourceSpan:
     return SourceSpan(
         direction="CLIENT_TO_DEVICE",
@@ -360,8 +418,14 @@ def _draft_document(
     source_hash: str,
     source_path: str,
     response_counter: str | None,
+    timezone_name: str,
 ) -> NormalizedDocument:
     text = "\n".join(draft.texts).strip()
+    document_timestamp, timestamp_precision, timestamp_warnings = _printed_timestamp(
+        text,
+        captured_at=captured_at,
+        timezone_name=timezone_name,
+    )
     if draft.kind == "commercial":
         document_type = DocumentType.COMMERCIAL_DOCUMENT
         subtype = "RCH_COMMERCIALE_INFERRED"
@@ -410,7 +474,7 @@ def _draft_document(
         NAMESPACE_URL,
         f"retailprintguard:rch:{job_id}:{draft.kind}:{draft.start_offset}:{source_hash}",
     )
-    warnings = tuple(dict.fromkeys(draft.warnings))
+    warnings = tuple(dict.fromkeys((*draft.warnings, *timestamp_warnings)))
     return NormalizedDocument(
         id=identifier,
         source_device_id=device_id,
@@ -423,6 +487,7 @@ def _draft_document(
         commercial_reference_code=draft.commercial_reference_code,
         order_code=draft.order_code,
         table_code=draft.table_code,
+        document_timestamp=document_timestamp,
         captured_at=captured_at,
         gross_total=draft.total,
         net_total=draft.total,
@@ -455,6 +520,10 @@ def _draft_document(
             "commercial_reference_code_evidence": (
                 draft.commercial_reference_code_evidence
             ),
+            "document_timestamp_evidence": (
+                "RCH_PRINTED_TEXT" if document_timestamp is not None else None
+            ),
+            "document_timestamp_precision": timestamp_precision,
             "progressive_observation_status": (
                 "FULL_CODE_OBSERVED_IN_CAPTURE"
                 if draft.external_document_code
@@ -617,6 +686,7 @@ def parse_rch(
     manifest_sha256: str,
     source_path: str | Path,
     response_source_path: str | Path | None = None,
+    timezone_name: str = "Europe/Rome",
 ) -> tuple[NormalizedDocument, ...]:
     """Parse capture-confirmed frames and label all business roles as inferred."""
 
@@ -721,6 +791,7 @@ def parse_rch(
                     if active.frame_ids
                     else None
                 ),
+                timezone_name=timezone_name,
             )
         )
         active = None

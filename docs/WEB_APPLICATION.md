@@ -68,6 +68,14 @@ RCH, riferimento commerciale e periodo. Il dettaglio offre:
 - vista esadecimale tecnica limitata a 64 KiB;
 - provenienza, hash, parser, confidenza e warning.
 
+Nella presentazione italiana il valore interno `KITCHEN_ORDER` è mostrato come
+“COMANDA”. I device `pos_1`, `pos_2` e `pos_3` sono mostrati rispettivamente
+come BAR, CUCINA e PIZZERIA, mantenendo visibile anche l’ID tecnico. La tabella
+espone separatamente “Ora cassa” e “Acquisito”: l’ora cassa compare solo quando
+stampata nel documento catturato e rispetta la precisione realmente osservata.
+Le colonne possono essere trascinate o spostate con i comandi accessibili; la
+preferenza resta nel browser e può essere ripristinata all’ordine predefinito.
+
 Progressivo proprio, suffisso e riferimento commerciale sono campi distinti.
 Un codice completo risolto dalla copia gestionale correlata è marcato come
 derivato con la sua provenienza; un progressivo generato internamente dalla RCH
