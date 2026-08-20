@@ -139,6 +139,13 @@ def test_parser_ocr_is_control_plane_only_and_has_a_reproducible_language() -> N
     parser = (SYSTEMD / "retailprintguard-parser.service").read_text(encoding="utf-8")
     assert "Environment=RPG_POS_OCR_LANG=ita+eng" in parser
     assert "EnvironmentFile=-/etc/retailprintguard/parser.env" in parser
+    assert "--interval-seconds 0.25" in parser
+    correlation = (SYSTEMD / "retailprintguard-correlation.service").read_text(
+        encoding="utf-8"
+    )
+    fraud = (SYSTEMD / "retailprintguard-fraud.service").read_text(encoding="utf-8")
+    assert "--poll-interval 3" in correlation
+    assert "--poll-interval 3" in fraud
     beeper_environment = (ROOT / "deploy/parser.env.example").read_text(encoding="utf-8")
     assert "RPG_POS_BEEPER_ENABLED=false" in beeper_environment
     assert "RPG_POS_BEEPER_COUNT=3" in beeper_environment

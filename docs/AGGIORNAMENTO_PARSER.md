@@ -122,11 +122,20 @@ restano necessari.
 
 ### Buzzer POS dopo una COMANDA
 
-Il worker può inviare il comando buzzer documentato POS80K dopo che una nuova
-`KITCHEN_ORDER` completa, proveniente da un device POS/ESC-POS, è stata salvata
-con successo. Il decoder resta puro e l'invio è post-commit, best-effort e su
-una coda bounded distinta per POS. Non viene eseguito per RCH, preconti,
-documenti incompleti, retry già persistiti o `--reparse-all`.
+Il worker può inviare il comando buzzer documentato POS80K non appena una nuova
+`KITCHEN_ORDER` completa, proveniente da un device POS/ESC-POS, viene
+riconosciuta dalla preclassificazione testuale bounded. Il controllo avviene
+prima di OCR, normalizzazione completa e commit: il decoder resta puro e
+l'invio è best-effort su una coda bounded distinta per POS. Non viene eseguito
+per RCH, preconti, documenti incompleti, retry già persistiti o
+`--reparse-all`.
+
+Ingestion e parser eseguono il polling ogni 250 ms; correlazione e antifrode
+mantengono il polling a 3 secondi. Il journal espone `capture_to_queue_ms` e
+`queue_delay_ms`; oltre 2.000 ms viene registrato
+`pos_beeper_latency_budget_missed`. Il limite è un budget operativo misurato
+dalla disponibilità del RAW: una sessione di stampa che non ha ancora prodotto
+un RAW importabile, scheduler e rete non costituiscono una garanzia real-time.
 
 La configurazione è intenzionalmente separata dal YAML condiviso con i proxy:
 

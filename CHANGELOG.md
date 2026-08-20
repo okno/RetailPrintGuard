@@ -10,10 +10,10 @@ la struttura di Keep a Changelog.
 - colonna Web “Ora cassa” distinta dall’ora di acquisizione, con precisione e
   provenienza osservate; intestazioni della tabella Documenti riordinabili via
   trascinamento o tastiera e ordine persistito nel browser;
-- notifica opzionale con buzzer POS80 dopo il commit di una nuova `COMANDA`
-  POS completa: conteggio, durata e pausa sono configurabili nel solo ambiente
-  parser; invio best-effort su code bounded separate per device, mai su RCH e
-  mai durante reparse storici;
+- notifica opzionale con buzzer POS80 non appena la preclassificazione bounded e
+  senza OCR riconosce una nuova `COMANDA` POS completa, prima di OCR e commit:
+  polling ingestion/parser a 250 ms, budget osservabile di 2 secondi e code
+  separate per device, mai su RCH o durante reparse storici;
 - correlazione `rpg-correlation-1.4.0` della sequenza di vendita composta da
   comanda, baseline gestionale/preconto, Documento Commerciale e copia
   gestionale, con vincoli congiunti su tavolo, articolo, direzione temporale e

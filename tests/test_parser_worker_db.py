@@ -22,6 +22,7 @@ from retailprintguard.db.models import (
 )
 from retailprintguard.parser import escpos as escpos_parser
 from retailprintguard.parser import repository as parser_repository
+from retailprintguard.parser import worker as parser_worker
 from retailprintguard.parser.escpos import parse_escpos
 from retailprintguard.parser.repository import SqlAlchemyParserRepository
 from retailprintguard.parser.worker import ParserWorker
@@ -30,11 +31,14 @@ NOW = datetime(2042, 7, 8, 12, 0, tzinfo=UTC)
 
 
 class _RecordingBeeper:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.device_ids: list[str] = []
+        self.events = events
 
     def enqueue(self, device_id: str) -> bool:
         self.device_ids.append(device_id)
+        if self.events is not None:
+            self.events.append("beep")
         return True
 
 
@@ -337,7 +341,7 @@ def test_parser_build_identity_includes_optional_runtime_fingerprint(monkeypatch
     assert len(first) == len(second) == 64
 
 
-def test_new_complete_pos_command_queues_one_beeper_pattern_after_store() -> None:
+def test_new_complete_pos_command_queues_before_full_parse_and_store(monkeypatch) -> None:
     payload = (
         b"\x1b@COMANDA N. C-78\nTavolo: T-9\n"
         b"Piatto sintetico 50,00\nTOTALE 50,00\n\x1dV\x00"
@@ -345,8 +349,16 @@ def test_new_complete_pos_command_queues_one_beeper_pattern_after_store() -> Non
     engine, factory, _job_id, _request_id, _response_id = _database(
         parser_kind="escpos", request=payload
     )
-    beeper = _RecordingBeeper()
+    events: list[str] = []
+    beeper = _RecordingBeeper(events)
     repository = SqlAlchemyParserRepository(factory)
+    parse = parser_worker.parse_escpos
+
+    def tracked_parse(*args, **kwargs):
+        events.append("parse")
+        return parse(*args, **kwargs)
+
+    monkeypatch.setattr(parser_worker, "parse_escpos", tracked_parse)
 
     first = ParserWorker(repository, beeper=beeper).run_once()
     second = ParserWorker(repository, beeper=beeper).run_once()
@@ -354,6 +366,7 @@ def test_new_complete_pos_command_queues_one_beeper_pattern_after_store() -> Non
     assert (first.parsed_jobs, first.parsed_documents, first.failed) == (1, 1, 0)
     assert second.discovered == 0
     assert beeper.device_ids == ["device_synthetic"]
+    assert events == ["beep", "parse"]
     engine.dispose()
 
 
@@ -380,6 +393,16 @@ def test_pos_prebill_and_explicit_reparse_never_queue_beeper() -> None:
         parser_kind="escpos", request=command
     )
     ParserWorker(SqlAlchemyParserRepository(factory), beeper=beeper).run_once(reparse=True)
+    assert beeper.device_ids == []
+    engine.dispose()
+
+    retry = b"\x1b@COMANDA N. C-RETRY\nPiatto 10,00\n\x1dV\x00"
+    engine, factory, job_id, _request_id, _response_id = _database(
+        parser_kind="escpos", request=retry
+    )
+    with factory.begin() as session:
+        session.get(PrintJob, job_id).import_status = "PARSE_RETRY"
+    ParserWorker(SqlAlchemyParserRepository(factory), beeper=beeper).run_once()
     assert beeper.device_ids == []
     engine.dispose()
 

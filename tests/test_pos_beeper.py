@@ -9,6 +9,7 @@ from retailprintguard.parser.beeper import (
     PosBeeperDispatcher,
     PosBeeperTarget,
     build_pos80_beep_command,
+    is_complete_pos_command,
 )
 
 
@@ -64,6 +65,48 @@ def test_dispatcher_sends_on_the_matching_device_queue_without_network() -> None
     assert calls == [
         (target, bytes.fromhex("1b 28 41 05 00 61 64 02 00 00"), 0.5)
     ]
+
+
+def test_complete_command_preclassification_is_ocr_free(monkeypatch) -> None:
+    def forbidden_ocr(_image):
+        raise AssertionError("fast beeper classification must not invoke OCR")
+
+    monkeypatch.setattr(
+        "retailprintguard.parser.escpos._run_tesseract_ocr", forbidden_ocr
+    )
+    assert is_complete_pos_command(
+        b"\x1b@COMANDA N. C-FAST\nTavolo: 01\n1x Pizza\n\x1dV\x00"
+    )
+    assert not is_complete_pos_command(b"\x1b@PRECONTO N. P-1\nTOTALE 10,00\n\x1dV\x00")
+    assert not is_complete_pos_command(b"\x1b@COMANDA N. C-PARTIAL\n1x Pizza\n")
+    assert not is_complete_pos_command(
+        b"\x1b@COMANDA N. C-CHANGE\n-1x Pizza\n\x1dV\x00"
+    )
+
+
+def test_back_to_back_notifications_do_not_wait_for_previous_pattern() -> None:
+    delivered = Event()
+    calls: list[float] = []
+
+    def sender(_target: PosBeeperTarget, _payload: bytes, _timeout: float) -> None:
+        calls.append(len(calls))
+        if len(calls) == 2:
+            delivered.set()
+
+    dispatcher = PosBeeperDispatcher(
+        PosBeeperConfiguration(enabled=True, count=3, on_ms=300, off_ms=200),
+        (PosBeeperTarget("pos_synthetic", "192.0.2.20", 9100),),
+        sender=sender,
+    )
+    try:
+        assert dispatcher.enqueue("pos_synthetic") is True
+        assert dispatcher.enqueue("pos_synthetic") is True
+        assert delivered.wait(0.5)
+        assert dispatcher.drain(0.5) is True
+    finally:
+        dispatcher.close()
+
+    assert len(calls) == 2
 
 
 def test_dispatch_failure_isolated_from_the_dispatcher() -> None:

@@ -14,7 +14,7 @@ Environment=RPG_CONFIG=/etc/retailprintguard/config.yaml
 Environment=RPG_POS_OCR_LANG=ita+eng
 EnvironmentFile=/etc/retailprintguard/database.env
 EnvironmentFile=-/etc/retailprintguard/parser.env
-ExecStart=/opt/retailprintguard/current/.venv/bin/retailprintguard-parser --config /etc/retailprintguard/config.yaml --json-logs
+ExecStart=/opt/retailprintguard/current/.venv/bin/retailprintguard-parser --config /etc/retailprintguard/config.yaml --interval-seconds 0.25 --json-logs
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=45s

@@ -194,6 +194,7 @@ class SqlAlchemyParserRepository:
                 "request": bytes(request.payload),
                 "response": b"" if response is None else bytes(response.payload),
                 "request_payload_id": request.id,
+                "import_status": job.import_status,
             }
         except SQLAlchemyError as exc:
             raise ParserRepositoryError("cannot load parser job") from exc

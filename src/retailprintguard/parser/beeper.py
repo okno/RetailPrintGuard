@@ -1,7 +1,8 @@
 """Bounded, parser-side POS80 command beeper dispatch.
 
-The ESC/POS decoder remains pure. This module is an optional post-commit
-notification adapter used only by the parser worker for POS kitchen orders.
+The ESC/POS decoder remains pure. This module provides a fast, OCR-free
+classification pass plus an optional notification adapter used only by the
+parser worker for POS kitchen orders.
 """
 
 from __future__ import annotations
@@ -16,11 +17,47 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 
+from retailprintguard.common.domain import DocumentType
+from retailprintguard.parser import escpos as escpos_parser
+
 LOGGER = logging.getLogger("retailprintguard.parser.beeper")
 
 # ESC ( A, payload length 5, function 97, fixed parameter n=100.
 _BEEP_PREFIX = bytes((0x1B, 0x28, 0x41, 0x05, 0x00, 0x61, 0x64))
-_TRIGGER = object()
+
+@dataclass(frozen=True, slots=True)
+class _BeeperTrigger:
+    enqueued_at: float
+
+
+def is_complete_pos_command(payload: bytes, *, encoding: str = "cp858") -> bool:
+    """Classify a complete POS command without invoking raster OCR.
+
+    Reusing the bounded text/framing stages keeps notification semantics in
+    lockstep with the versioned parser. Raster OCR is irrelevant to document
+    type and must not delay the audible notification.
+    """
+
+    bounded = payload[: escpos_parser._MAX_INPUT_BYTES]
+    for segment in escpos_parser._segments(bounded):
+        if not segment.payload or not segment.cut_observed:
+            continue
+        lines, text, _warnings = escpos_parser._extract_lines(
+            segment.payload,
+            base_offset=segment.base_offset,
+            default_encoding=encoding,
+        )
+        document_type, _evidence = escpos_parser._classify(text)
+        semantic_lines, _metadata = escpos_parser._semantic_lines(
+            lines, segment.base_offset
+        )
+        if any(
+            line.quantity is not None and line.quantity < 0 for line in semantic_lines
+        ):
+            document_type = DocumentType.ORDER_CHANGE
+        if document_type is DocumentType.KITCHEN_ORDER:
+            return True
+    return False
 
 
 def _environment_bool(environ: Mapping[str, str], name: str, default: bool) -> bool:
@@ -184,7 +221,7 @@ class PosBeeperDispatcher:
         self._sender = sender
         self._stop = threading.Event()
         self._targets: dict[str, PosBeeperTarget] = {}
-        self._queues: dict[str, queue.Queue[object]] = {}
+        self._queues: dict[str, queue.Queue[_BeeperTrigger]] = {}
         self._threads: list[threading.Thread] = []
         if len(targets) > 256:
             raise ValueError("POS beeper supports at most 256 targets")
@@ -221,7 +258,7 @@ class PosBeeperDispatcher:
             )
             return False
         try:
-            target_queue.put_nowait(_TRIGGER)
+            target_queue.put_nowait(_BeeperTrigger(time.monotonic()))
         except queue.Full:
             LOGGER.warning(
                 "POS beeper queue is full; parser output remains valid",
@@ -255,27 +292,31 @@ class PosBeeperDispatcher:
             thread.join(max(0.0, deadline - time.monotonic()))
 
     def _run_device(
-        self, target: PosBeeperTarget, target_queue: queue.Queue[object]
+        self, target: PosBeeperTarget, target_queue: queue.Queue[_BeeperTrigger]
     ) -> None:
         while not self._stop.is_set():
             try:
-                target_queue.get(timeout=0.25)
+                trigger = target_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
-            delivered = False
             try:
                 self._sender(
                     target,
                     self.configuration.command,
                     self.configuration.connect_timeout_seconds,
                 )
-                delivered = True
                 LOGGER.info(
                     "POS command beeper sent",
                     extra={
                         "event": "pos_beeper_sent",
                         "device_id": target.device_id,
-                        "metrics": {"bytes": len(self.configuration.command)},
+                        "metrics": {
+                            "bytes": len(self.configuration.command),
+                            "queue_delay_ms": round(
+                                max(0.0, time.monotonic() - trigger.enqueued_at) * 1000,
+                                3,
+                            ),
+                        },
                     },
                 )
             except Exception as exc:  # noqa: BLE001 - isolated notification boundary
@@ -289,10 +330,6 @@ class PosBeeperDispatcher:
                 )
             finally:
                 target_queue.task_done()
-            # The POS80K manual states that a new command interrupts the
-            # current pattern, so pace independently for each target.
-            if delivered and self.configuration.pattern_seconds:
-                self._stop.wait(self.configuration.pattern_seconds)
 
 
 __all__ = [
@@ -300,5 +337,6 @@ __all__ = [
     "PosBeeperDispatcher",
     "PosBeeperTarget",
     "build_pos80_beep_command",
+    "is_complete_pos_command",
     "send_pos80_beep",
 ]

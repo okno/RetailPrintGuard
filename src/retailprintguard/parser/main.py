@@ -46,7 +46,7 @@ def _parser() -> argparse.ArgumentParser:
         help="append outputs for the current parser build to historical jobs",
     )
     parser.add_argument("--limit", type=_limit, default=100)
-    parser.add_argument("--interval-seconds", type=float, default=3.0)
+    parser.add_argument("--interval-seconds", type=float, default=0.25)
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--json-logs",
