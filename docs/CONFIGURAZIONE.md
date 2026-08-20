@@ -148,9 +148,9 @@ La scelta va documentata nell'analisi del rischio.
 
 ### `ingestion`
 
-- `scan_interval_seconds`: intervallo del worker ingestion continuo; il valore
-  operativo consigliato è `0.25` secondi per il budget buzzer, mentre
-  correlazione e antifrode fissano separatamente 3 secondi nelle proprie unit;
+- `scan_interval_seconds`: intervallo generale del worker ingestion continuo;
+  la unit di produzione applica l'override dedicato a `0.25` secondi per il
+  budget buzzer, mentre correlazione e antifrode mantengono 3 secondi;
 - `retry_initial_seconds` e `retry_max_seconds`: backoff esponenziale limitato;
 - `max_batch_jobs`: candidati massimi per adapter e scansione;
 - `spool_warning_bytes`: soglia informativa per gli allarmi di crescita.

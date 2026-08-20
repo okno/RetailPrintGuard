@@ -12,6 +12,7 @@ SupplementaryGroups=retailprintguard-spool
 UMask=0027
 Environment=PYTHONUNBUFFERED=1
 Environment=RPG_CONFIG=/etc/retailprintguard/config.yaml
+Environment=RPG_INGESTION_SCAN_INTERVAL_SECONDS=0.25
 EnvironmentFile=/etc/retailprintguard/database.env
 EnvironmentFile=-/etc/retailprintguard/ingestion.env
 ExecStart=/opt/retailprintguard/current/scripts/run_ingestion.sh

@@ -44,6 +44,18 @@ def _positive_job_limit(value: str) -> int:
     return parsed
 
 
+def _positive_scan_interval(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("scan interval must be numeric") from exc
+    if not 0.05 <= parsed <= 3600:
+        raise argparse.ArgumentTypeError(
+            "scan interval must be between 0.05 and 3600 seconds"
+        )
+    return parsed
+
+
 def _parser(*, historical: bool = False) -> argparse.ArgumentParser:
     description = "Import historical proxy evidence once" if historical else "Ingest proxy evidence"
     parser = argparse.ArgumentParser(description=description)
@@ -75,6 +87,11 @@ def _parser(*, historical: bool = False) -> argparse.ArgumentParser:
         help="validate in memory without writing MariaDB or source spool",
     )
     parser.add_argument("--once", action="store_true", default=historical)
+    parser.add_argument(
+        "--scan-interval-seconds",
+        type=_positive_scan_interval,
+        help="continuous scan interval override; ignored by one-shot runs",
+    )
     parser.add_argument(
         "--max-jobs",
         type=_positive_job_limit,
@@ -306,7 +323,9 @@ def run_cli(argv: Sequence[str] | None = None, *, historical: bool = False) -> i
         signal.signal(signal.SIGTERM, request_stop)
         worker.run_forever(
             stop,
-            scan_interval_seconds=settings.ingestion.scan_interval_seconds,
+            scan_interval_seconds=(
+                args.scan_interval_seconds or settings.ingestion.scan_interval_seconds
+            ),
             maximum_per_adapter=maximum,
             on_report=(
                 _log_report

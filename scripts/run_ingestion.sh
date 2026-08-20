@@ -16,6 +16,10 @@ args=(
     --json-logs
 )
 
+if [[ -n "${RPG_INGESTION_SCAN_INTERVAL_SECONDS:-}" ]]; then
+    args+=(--scan-interval-seconds "${RPG_INGESTION_SCAN_INTERVAL_SECONDS}")
+fi
+
 help_text="$(${RPG_BIN} --help 2>&1)"
 source_count=0
 if grep -q -- '--canonical-root' <<<"${help_text}"; then

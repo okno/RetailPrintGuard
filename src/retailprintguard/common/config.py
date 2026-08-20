@@ -96,7 +96,7 @@ class DeviceConfig(BaseModel):
 class IngestionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    scan_interval_seconds: Annotated[float, Field(gt=0, le=3600)] = 0.25
+    scan_interval_seconds: Annotated[float, Field(gt=0, le=3600)] = 3
     retry_initial_seconds: Annotated[float, Field(gt=0, le=3600)] = 2
     retry_max_seconds: Annotated[float, Field(gt=0, le=86400)] = 300
     max_batch_jobs: Annotated[int, Field(ge=1, le=10_000)] = 100

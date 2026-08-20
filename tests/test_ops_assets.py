@@ -140,6 +140,12 @@ def test_parser_ocr_is_control_plane_only_and_has_a_reproducible_language() -> N
     assert "Environment=RPG_POS_OCR_LANG=ita+eng" in parser
     assert "EnvironmentFile=-/etc/retailprintguard/parser.env" in parser
     assert "--interval-seconds 0.25" in parser
+    ingestion = (SYSTEMD / "retailprintguard-ingestion.service").read_text(
+        encoding="utf-8"
+    )
+    assert "RPG_INGESTION_SCAN_INTERVAL_SECONDS=0.25" in ingestion
+    run_ingestion = (SCRIPTS / "run_ingestion.sh").read_text(encoding="utf-8")
+    assert '--scan-interval-seconds "${RPG_INGESTION_SCAN_INTERVAL_SECONDS}"' in run_ingestion
     correlation = (SYSTEMD / "retailprintguard-correlation.service").read_text(
         encoding="utf-8"
     )

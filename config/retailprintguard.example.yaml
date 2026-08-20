@@ -75,7 +75,7 @@ devices:
     enabled: true
     allowed_networks: [192.0.2.0/24]
 ingestion:
-  scan_interval_seconds: 0.25
+  scan_interval_seconds: 3
   retry_initial_seconds: 2
   retry_max_seconds: 300
   max_batch_jobs: 100
