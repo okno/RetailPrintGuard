@@ -362,6 +362,10 @@ if [[ ! -e "${RPG_ETC_DIR}/ingestion.env" ]]; then
     install -m 0640 -o root -g retailprintguard-config -- \
         "${SOURCE_ROOT}/deploy/ingestion.env.example" "${RPG_ETC_DIR}/ingestion.env"
 fi
+if [[ ! -e "${RPG_ETC_DIR}/parser.env" ]]; then
+    install -m 0640 -o root -g retailprintguard-config -- \
+        "${SOURCE_ROOT}/deploy/parser.env.example" "${RPG_ETC_DIR}/parser.env"
+fi
 
 rpg_note "Applying versioned database migrations with an ephemeral DDL account"
 migration_password="$(openssl rand -hex 32)"

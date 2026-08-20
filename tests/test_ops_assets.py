@@ -138,6 +138,12 @@ def test_installer_never_mutates_host_networking_and_requires_site_validation() 
 def test_parser_ocr_is_control_plane_only_and_has_a_reproducible_language() -> None:
     parser = (SYSTEMD / "retailprintguard-parser.service").read_text(encoding="utf-8")
     assert "Environment=RPG_POS_OCR_LANG=ita+eng" in parser
+    assert "EnvironmentFile=-/etc/retailprintguard/parser.env" in parser
+    beeper_environment = (ROOT / "deploy/parser.env.example").read_text(encoding="utf-8")
+    assert "RPG_POS_BEEPER_ENABLED=false" in beeper_environment
+    assert "RPG_POS_BEEPER_COUNT=3" in beeper_environment
+    install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
+    assert '"${SOURCE_ROOT}/deploy/parser.env.example"' in install
     for proxy_name in (
         "retailprintguard-pos-proxy.service",
         "retailprintguard-rch-proxy.service",
@@ -145,6 +151,7 @@ def test_parser_ocr_is_control_plane_only_and_has_a_reproducible_language() -> N
         proxy = (SYSTEMD / proxy_name).read_text(encoding="utf-8")
         assert "tesseract" not in proxy.lower()
         assert "RPG_POS_OCR" not in proxy
+        assert "BEEPER" not in proxy
 
 
 def test_virtualenv_is_built_at_final_path_and_entrypoints_are_verified() -> None:

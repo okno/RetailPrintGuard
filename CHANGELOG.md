@@ -5,6 +5,13 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+
+- notifica opzionale con buzzer POS80 dopo il commit di una nuova `COMANDA`
+  POS completa: conteggio, durata e pausa sono configurabili nel solo ambiente
+  parser; invio best-effort su code bounded separate per device, mai su RCH e
+  mai durante reparse storici;
+
 ## [0.4.1] — 2026-08-16
 
 ### Added

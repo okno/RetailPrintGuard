@@ -128,9 +128,12 @@ elaborazione crea una `document_version`.
 I parser nativi `retailprintguard-escpos` `1.2.0` e
 `retailprintguard-rch-observed` `1.1.0` operano nel control plane:
 ricevono byte e metadati già acquisiti e restituiscono documenti immutabili.
-Non aprono socket, non modificano lo spool e non importano il relay. La
-segmentazione applicativa avviene sul flusso ricostruito, mai sui confini delle
-letture TCP.
+I decoder non aprono socket, non modificano lo spool e non importano il relay.
+La segmentazione applicativa avviene sul flusso ricostruito, mai sui confini
+delle letture TCP. L'adapter opzionale buzzer è una conseguenza post-commit del
+worker: apre una connessione diretta bounded soltanto al target del POS che ha
+prodotto una nuova `KITCHEN_ORDER` completa. Non attraversa né importa il proxy,
+non parte per RCH/reparse e un errore di consegna non cambia l'esito del parser.
 
 L'OCR opzionale del tavolo ESC/POS viene eseguito soltanto dal worker parser
 con risorse bounded e isolamento systemd. Versione/lingua del backend entrano

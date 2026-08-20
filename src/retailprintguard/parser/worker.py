@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from dataclasses import dataclass
 from threading import Event
+from typing import Protocol
 
+from retailprintguard.common.domain import DocumentType
 from retailprintguard.parser.escpos import parse_escpos
 from retailprintguard.parser.rch import parse_rch
 from retailprintguard.parser.repository import ParserRepositoryError, SqlAlchemyParserRepository
+
+LOGGER = logging.getLogger("retailprintguard.parser")
+
+
+class PosCommandBeeper(Protocol):
+    def enqueue(self, device_id: str) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,9 +35,11 @@ class ParserWorker:
         repository: SqlAlchemyParserRepository,
         *,
         timezone_name: str = "Europe/Rome",
+        beeper: PosCommandBeeper | None = None,
     ) -> None:
         self.repository = repository
         self.timezone_name = timezone_name
+        self.beeper = beeper
 
     def run_once(self, *, limit: int = 100, reparse: bool = False) -> ParserRunReport:
         job_ids = self.repository.pending_jobs(limit=limit, reparse=reparse)
@@ -64,7 +75,30 @@ class ParserWorker:
                     )
                 else:
                     raise ValueError(f"unsupported parser kind: {parser_kind}")
-                parsed_documents += self.repository.store_documents(job_id, documents)
+                inserted = self.repository.store_documents(job_id, documents)
+                parsed_documents += inserted
+                should_beep = (
+                    self.beeper is not None
+                    and not reparse
+                    and inserted > 0
+                    and parser_kind == "escpos"
+                    and any(
+                        document.type is DocumentType.KITCHEN_ORDER and document.complete
+                        for document in documents
+                    )
+                )
+                if should_beep:
+                    try:
+                        self.beeper.enqueue(str(source["device_id"]))
+                    except Exception as exc:  # noqa: BLE001 - notification must not fail parsing
+                        LOGGER.warning(
+                            "POS beeper enqueue failed; parser output remains valid",
+                            extra={
+                                "event": "pos_beeper_enqueue_failed",
+                                "device_id": str(source["device_id"]),
+                                "error": type(exc).__name__,
+                            },
+                        )
                 parsed_jobs += 1
             except (ParserRepositoryError, RuntimeError, TypeError, ValueError) as exc:
                 failed += 1
