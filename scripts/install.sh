@@ -138,7 +138,7 @@ else
     apt-get install -y --no-install-recommends "${required_packages[@]}"
 fi
 
-for command in find flock install mariadb openssl python3 rsync runuser sha256sum systemctl tesseract; do
+for command in cmp find flock install mariadb openssl python3 rsync runuser sha256sum systemctl tesseract; do
     rpg_require_command "${command}"
 done
 
@@ -473,7 +473,17 @@ rpg_atomic_symlink "${web_release}" "${RPG_WEB_CURRENT}"
 
 rpg_note "Installing hardened systemd, nginx and logrotate definitions"
 for unit in "${SOURCE_ROOT}"/systemd/*; do
-    install -m 0644 -o root -g root -- "${unit}" "/etc/systemd/system/$(basename -- "${unit}")"
+    unit_name="$(basename -- "${unit}")"
+    installed_unit="/etc/systemd/system/${unit_name}"
+    if [[ "${control_plane_only}" == yes && "${unit_name}" =~ ^retailprintguard-(pos|rch)-proxy\.service$ ]]; then
+        [[ -f "${installed_unit}" && ! -L "${installed_unit}" ]] || \
+            rpg_die "installed proxy unit is missing or unsafe: ${installed_unit}"
+        cmp -s -- "${unit}" "${installed_unit}" || \
+            rpg_die "installed proxy unit differs during control-plane update: ${unit_name}"
+        rpg_note "Preserved installed proxy unit without rewriting it: ${unit_name}"
+        continue
+    fi
+    install -m 0644 -o root -g root -- "${unit}" "${installed_unit}"
 done
 install -m 0644 -o root -g root -- "${SOURCE_ROOT}/deploy/nginx/retailprintguard.conf" \
     /etc/nginx/sites-available/retailprintguard.conf

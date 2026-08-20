@@ -221,6 +221,9 @@ def test_control_plane_update_never_restarts_or_changes_proxy_code() -> None:
     assert install.index("rpg_assert_data_plane_unchanged") < install.index(
         "Applying versioned database migrations"
     )
+    assert "Preserved installed proxy unit without rewriting it" in install
+    assert "installed proxy unit differs during control-plane update" in install
+    assert '"${unit_name}" =~ ^retailprintguard-(pos|rch)-proxy\\.service$' in install
 
 
 def test_git_control_plane_updater_is_tagged_locked_and_fail_closed() -> None:
