@@ -5,8 +5,14 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-08-20
+
 ### Added
 
+- allowlist parser-only `RPG_POS_BEEPER_PRINTER` per limitare il buzzer a POS
+  specifici (per esempio `2,3`), watcher read-only dello spool in crescita a
+  100 ms con deduplica del fallback DB e monitor ICMP asincrono dei target
+  fisici ogni 10 secondi per gli stati dashboard;
 - colonna Web “Ora cassa” distinta dall’ora di acquisizione, con precisione e
   provenienza osservate; intestazioni della tabella Documenti riordinabili via
   trascinamento o tastiera e ordine persistito nel browser;

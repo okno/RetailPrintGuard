@@ -137,9 +137,12 @@ ricalcolata.
 
 ### Dispositivi e importazioni
 
-La pagina device aggiorna ogni 30 secondi stato, endpoint, ultime attività,
-versione, errore e spool. La pagina import, riservata ai reviewer, mostra batch,
-duplicati ed errori.
+La pagina device aggiorna ogni 10 secondi stato, endpoint, ultime attività,
+versione, errore e spool. Lo stato `ONLINE/OFFLINE` deriva dalla cache di ping
+ICMP verso gli IP fisici configurati, aggiornata fuori dal percorso HTTP con la
+stessa cadenza. Il ping non passa dai listener proxy e non altera il traffico di
+stampa. La pagina import, riservata ai reviewer, mostra batch, duplicati ed
+errori.
 
 ## Accessibilità e sicurezza
 

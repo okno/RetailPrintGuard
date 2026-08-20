@@ -17,6 +17,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from retailprintguard import __version__
 from retailprintguard.api.auth import LoginThrottle, TokenService, constant_time_dummy_verify
+from retailprintguard.api.reachability import DeviceReachabilityMonitor
 from retailprintguard.api.repository import ApiRepository, RawArtifact
 from retailprintguard.api.review_secret import ReviewSecretVerifier
 from retailprintguard.api.schemas import (
@@ -109,12 +110,14 @@ class ApiContext:
         throttle: LoginThrottle,
         review_secret: ReviewSecretVerifier | None = None,
         review_throttle: LoginThrottle | None = None,
+        reachability_monitor: DeviceReachabilityMonitor | None = None,
     ) -> None:
         self.repository = repository
         self.tokens = tokens
         self.throttle = throttle
         self.review_secret = review_secret or ReviewSecretVerifier(None)
         self.review_throttle = review_throttle or LoginThrottle(limit=5, delay_seconds=2)
+        self.reachability_monitor = reachability_monitor
 
 
 def create_router(context: ApiContext) -> APIRouter:
@@ -258,13 +261,34 @@ def create_router(context: ApiContext) -> APIRouter:
         period_to: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> DashboardView:
         normalized_from, normalized_to = _utc_period(period_from, period_to)
-        return repo.dashboard(filters={"from": normalized_from, "to": normalized_to})
+        result = repo.dashboard(filters={"from": normalized_from, "to": normalized_to})
+        if context.reachability_monitor is None:
+            return result
+        counts = context.reachability_monitor.counts()
+        if counts is None:
+            return result
+        return result.model_copy(update={"devices_online": counts[0], "devices_offline": counts[1]})
 
     @router.get("/devices", response_model=list[DeviceView], tags=["devices"])
     def devices(
         _: AnyUser, repo: Annotated[ApiRepository, Depends(repository)]
     ) -> list[DeviceView]:
-        return list(repo.list_devices())
+        result = list(repo.list_devices())
+        if context.reachability_monitor is None:
+            return result
+        snapshots = context.reachability_monitor.snapshots()
+        return [
+            item.model_copy(
+                update={
+                    "online": snapshots[item.id].online,
+                    "reachability_checked_at": snapshots[item.id].checked_at,
+                    "reachability_error": snapshots[item.id].error,
+                }
+            )
+            if item.id in snapshots
+            else item
+            for item in result
+        ]
 
     @router.get(
         "/system/diagnostics",

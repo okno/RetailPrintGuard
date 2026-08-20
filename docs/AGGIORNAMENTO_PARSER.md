@@ -123,37 +123,45 @@ restano necessari.
 ### Buzzer POS dopo una COMANDA
 
 Il worker può inviare il comando buzzer documentato POS80K non appena una nuova
-`KITCHEN_ORDER` completa, proveniente da un device POS/ESC-POS, viene
-riconosciuta dalla preclassificazione testuale bounded. Il controllo avviene
-prima di OCR, normalizzazione completa e commit: il decoder resta puro e
-l'invio è best-effort su una coda bounded distinta per POS. Non viene eseguito
-per RCH, preconti, documenti incompleti, retry già persistiti o
-`--reparse-all`.
+`KITCHEN_ORDER` completa, proveniente da un device POS/ESC-POS selezionato,
+viene riconosciuta dalla preclassificazione testuale bounded. Un watcher
+read-only controlla ogni 100 ms soltanto i `client.raw` regolari sotto le
+directory `*.partial` dei POS abilitati: appena osserva una COMANDA con cut
+accoda il buzzer senza attendere chiusura sessione, `.ready`, import DB, OCR o
+commit. Questo segnale è una mera inferenza operativa su un prefisso ancora in
+crescita: non viene persistito come documento e non sostituisce mai le verifiche
+manifest/hash dell'ingestion autorevole. Il percorso DB resta il fallback e un
+identificatore bounded del job impedisce il doppio beep.
 
-Ingestion e parser eseguono il polling ogni 250 ms; correlazione e antifrode
-mantengono il polling a 3 secondi. Il journal espone `capture_to_queue_ms` e
-`queue_delay_ms`; oltre 2.000 ms viene registrato
-`pos_beeper_latency_budget_missed`. Il limite è un budget operativo misurato
-dalla disponibilità del RAW: una sessione di stampa che non ha ancora prodotto
-un RAW importabile, scheduler e rete non costituiscono una garanzia real-time.
+Il watcher early usa per default 100 ms; ingestion e parser DB eseguono il
+polling ogni 250 ms, mentre correlazione e antifrode mantengono 3 secondi. Il
+journal distingue `pos_beeper_spool_early_queued`, fallback DB e
+`queue_delay_ms`. Scheduler, filesystem e rete non costituiscono una garanzia
+real-time; il percorso resta best-effort e isolato dal relay.
 
 La configurazione è intenzionalmente separata dal YAML condiviso con i proxy:
 
 ```ini
 RPG_POS_BEEPER_ENABLED=true
+RPG_POS_BEEPER_PRINTER=2,3
 RPG_POS_BEEPER_COUNT=3
 RPG_POS_BEEPER_ON_MS=300
 RPG_POS_BEEPER_OFF_MS=200
 RPG_POS_BEEPER_CONNECT_TIMEOUT_SECONDS=1.0
 RPG_POS_BEEPER_QUEUE_SIZE_PER_DEVICE=64
+RPG_POS_BEEPER_SPOOL_POLL_SECONDS=0.1
 ```
 
 Salvarla in `/etc/retailprintguard/parser.env` con proprietario
 `root:retailprintguard-config` e modo `0640`. Conteggio ammesso: 1..63; tempi
-ON/OFF: 0..25.500 ms in multipli di 100 ms. Host e porta non si duplicano nel
-file: derivano dal target del device POS già validato. Il comando non modifica
-frequenza/altezza del tono. Un invio TCP riuscito prova soltanto l'accettazione
-dei byte da parte dello stack remoto, non che il buzzer sia stato udito.
+ON/OFF: 0..25.500 ms in multipli di 100 ms. `RPG_POS_BEEPER_PRINTER` accetta
+numeri POS o id completi separati da virgola (`2,3` equivale a
+`pos_2,pos_3`); un selettore sconosciuto impedisce l'avvio del parser. Se la
+variabile manca o vale `all`, resta attiva la compatibilità con tutti i POS.
+Host e porta non si duplicano nel file: derivano dal target del device POS già
+validato. Il comando non modifica frequenza/altezza del tono. Un invio TCP
+riuscito prova soltanto l'accettazione dei byte da parte dello stack remoto,
+non che il buzzer sia stato udito.
 
 La repository registra in `parser_versions.build_sha256` un digest del modulo
 che implementa il parser. Per ESC/POS il digest include inoltre l'identità del

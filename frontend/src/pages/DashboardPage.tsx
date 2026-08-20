@@ -52,7 +52,7 @@ export function DashboardPage() {
     queryKey: scopedQueryKey('dashboard', 'economic-episodes', episodeParams.toString()),
     queryFn: () => api<Page<Transaction>>(`/transactions?${episodeParams.toString()}`),
   })
-  const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices') })
+  const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), refetchInterval: 10_000 })
   const diagnostics = useQuery({
     queryKey: scopedQueryKey('system', 'diagnostics'),
     queryFn: () => api<Diagnostics>('/system/diagnostics'),

@@ -58,7 +58,7 @@ tramite il repository.
 | `POST /auth/login` | username/password | token e utente |
 | `GET /auth/me` | — | principal corrente |
 | `GET /dashboard` | `from`, `to` | contatori operativi, episodi, differenze, trend, stato |
-| `GET /devices` | — | device e ultima attività/spool |
+| `GET /devices` | — | device, ping ICMP fisico ogni 10 secondi e attività/spool |
 | `GET /sessions` | `limit`, `offset`, `device_id` | sessioni TCP |
 | `GET /jobs` | `limit`, `offset`, `device_id`, `status`, `incomplete`, `review_state`, `from`, `to` | job cattura/import/revisione |
 | `POST /jobs/{id}/review` | azione, motivazione, password di conferma | proiezione job aggiornata e auditata |

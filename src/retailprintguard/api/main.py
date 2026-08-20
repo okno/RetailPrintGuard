@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from retailprintguard import __version__
 from retailprintguard.api.auth import LoginThrottle, TokenService
 from retailprintguard.api.middleware import CorrelationAndSecurityMiddleware
+from retailprintguard.api.reachability import DeviceProbeTarget, DeviceReachabilityMonitor
 from retailprintguard.api.repository import ApiRepository, EmptyRepository
 from retailprintguard.api.review_secret import DEFAULT_ENV_NAME, ReviewSecretVerifier
 from retailprintguard.api.routes import ApiContext, create_router
@@ -27,6 +29,7 @@ def create_app(
     jwt_secret: bytes | None = None,
     settings: Settings | None = None,
     review_password_hash: str | None = None,
+    reachability_monitor: DeviceReachabilityMonitor | None = None,
 ) -> FastAPI:
     if jwt_secret is None:
         jwt_secret = b"test-only-secret-not-for-production-00000000000000000000"
@@ -35,19 +38,40 @@ def create_app(
     failed_delay = settings.api.failed_login_delay_seconds if settings else 2
     if review_password_hash is None and settings is not None:
         review_password_hash = os.environ.get(DEFAULT_ENV_NAME)
+    if reachability_monitor is None and settings is not None:
+        targets = tuple(
+            DeviceProbeTarget(device.id, str(device.target_ip))
+            for device in settings.devices
+            if device.enabled
+        )
+        if targets:
+            reachability_monitor = DeviceReachabilityMonitor(targets)
     context = ApiContext(
         repository or EmptyRepository(),
         TokenService(jwt_secret, lifetime_minutes=token_minutes),
         LoginThrottle(limit=failed_limit, delay_seconds=failed_delay),
         ReviewSecretVerifier(review_password_hash),
         LoginThrottle(limit=failed_limit, delay_seconds=failed_delay),
+        reachability_monitor,
     )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if reachability_monitor is not None:
+            reachability_monitor.start()
+        try:
+            yield
+        finally:
+            if reachability_monitor is not None:
+                reachability_monitor.close()
+
     app = FastAPI(
         title="RetailPrintGuard API",
         version=__version__,
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
+        lifespan=lifespan,
     )
     app.add_middleware(CorrelationAndSecurityMiddleware)
     if settings and settings.api.allowed_origins:

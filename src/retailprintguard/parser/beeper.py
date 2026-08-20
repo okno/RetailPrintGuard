@@ -10,9 +10,11 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import socket
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -24,6 +26,10 @@ LOGGER = logging.getLogger("retailprintguard.parser.beeper")
 
 # ESC ( A, payload length 5, function 97, fixed parameter n=100.
 _BEEP_PREFIX = bytes((0x1B, 0x28, 0x41, 0x05, 0x00, 0x61, 0x64))
+_POS_DEVICE_NUMBER = re.compile(r"^pos_0*(?P<number>[1-9][0-9]*)$")
+_POS_DEVICE_SELECTOR = re.compile(r"^pos_[a-z0-9][a-z0-9_-]{0,59}$")
+_RECENT_EVENT_LIMIT = 10_000
+
 
 @dataclass(frozen=True, slots=True)
 class _BeeperTrigger:
@@ -48,12 +54,8 @@ def is_complete_pos_command(payload: bytes, *, encoding: str = "cp858") -> bool:
             default_encoding=encoding,
         )
         document_type, _evidence = escpos_parser._classify(text)
-        semantic_lines, _metadata = escpos_parser._semantic_lines(
-            lines, segment.base_offset
-        )
-        if any(
-            line.quantity is not None and line.quantity < 0 for line in semantic_lines
-        ):
+        semantic_lines, _metadata = escpos_parser._semantic_lines(lines, segment.base_offset)
+        if any(line.quantity is not None and line.quantity < 0 for line in semantic_lines):
             document_type = DocumentType.ORDER_CHANGE
         if document_type is DocumentType.KITCHEN_ORDER:
             return True
@@ -108,6 +110,30 @@ def _environment_float(
     return value
 
 
+def _environment_printer_selectors(
+    environ: Mapping[str, str],
+) -> frozenset[str] | None:
+    raw = environ.get("RPG_POS_BEEPER_PRINTER")
+    if raw is None or raw.strip().lower() == "all":
+        return None
+    if not raw.strip():
+        raise ValueError("RPG_POS_BEEPER_PRINTER cannot be empty")
+    result: set[str] = set()
+    for item in raw.split(","):
+        selector = item.strip().lower()
+        if selector.isdecimal():
+            number = int(selector, 10)
+            if not 1 <= number <= 256:
+                raise ValueError("beeper printer number must be between 1 and 256")
+            selector = str(number)
+        elif not _POS_DEVICE_SELECTOR.fullmatch(selector):
+            raise ValueError("RPG_POS_BEEPER_PRINTER must contain POS numbers or device ids")
+        if selector in result:
+            raise ValueError("RPG_POS_BEEPER_PRINTER contains a duplicate selector")
+        result.add(selector)
+    return frozenset(result)
+
+
 @dataclass(frozen=True, slots=True)
 class PosBeeperConfiguration:
     """Validated parser-only configuration for the POS80 built-in beeper."""
@@ -118,6 +144,8 @@ class PosBeeperConfiguration:
     off_ms: int = 200
     connect_timeout_seconds: float = 1.0
     queue_size_per_device: int = 64
+    printer_selectors: frozenset[str] | None = None
+    spool_poll_seconds: float = 0.1
 
     def __post_init__(self) -> None:
         if not 1 <= self.count <= 63:
@@ -131,20 +159,16 @@ class PosBeeperConfiguration:
             raise ValueError("beeper connect timeout must be between 0.1 and 10 seconds")
         if not 1 <= self.queue_size_per_device <= 1_000:
             raise ValueError("beeper queue size must be between 1 and 1000")
+        if not 0.05 <= self.spool_poll_seconds <= 1:
+            raise ValueError("beeper spool poll interval must be between 0.05 and 1 seconds")
 
     @classmethod
-    def from_environment(
-        cls, environ: Mapping[str, str] | None = None
-    ) -> PosBeeperConfiguration:
+    def from_environment(cls, environ: Mapping[str, str] | None = None) -> PosBeeperConfiguration:
         values = os.environ if environ is None else environ
         return cls(
             enabled=_environment_bool(values, "RPG_POS_BEEPER_ENABLED", False),
-            count=_environment_int(
-                values, "RPG_POS_BEEPER_COUNT", 3, minimum=1, maximum=63
-            ),
-            on_ms=_environment_int(
-                values, "RPG_POS_BEEPER_ON_MS", 300, minimum=0, maximum=25_500
-            ),
+            count=_environment_int(values, "RPG_POS_BEEPER_COUNT", 3, minimum=1, maximum=63),
+            on_ms=_environment_int(values, "RPG_POS_BEEPER_ON_MS", 300, minimum=0, maximum=25_500),
             off_ms=_environment_int(
                 values, "RPG_POS_BEEPER_OFF_MS", 200, minimum=0, maximum=25_500
             ),
@@ -162,6 +186,14 @@ class PosBeeperConfiguration:
                 minimum=1,
                 maximum=1_000,
             ),
+            printer_selectors=_environment_printer_selectors(values),
+            spool_poll_seconds=_environment_float(
+                values,
+                "RPG_POS_BEEPER_SPOOL_POLL_SECONDS",
+                0.1,
+                minimum=0.05,
+                maximum=1,
+            ),
         )
 
     @property
@@ -171,6 +203,37 @@ class PosBeeperConfiguration:
     @property
     def pattern_seconds(self) -> float:
         return self.count * (self.on_ms + self.off_ms) / 1000
+
+    def selects(self, device_id: str) -> bool:
+        """Match either a configured id (``pos_2``) or its numeric suffix (``2``)."""
+
+        selectors = self.printer_selectors
+        if selectors is None:
+            return True
+        normalized = device_id.strip().lower()
+        if normalized in selectors:
+            return True
+        match = _POS_DEVICE_NUMBER.fullmatch(normalized)
+        return bool(match and str(int(match.group("number"))) in selectors)
+
+    def validate_selection(self, device_ids: Sequence[str]) -> None:
+        selectors = self.printer_selectors
+        if selectors is None:
+            return
+        unmatched = {
+            selector
+            for selector in selectors
+            if not any(
+                selector == device_id.lower()
+                or (
+                    (match := _POS_DEVICE_NUMBER.fullmatch(device_id.lower())) is not None
+                    and selector == str(int(match.group("number")))
+                )
+                for device_id in device_ids
+            )
+        }
+        if unmatched:
+            raise ValueError("RPG_POS_BEEPER_PRINTER selects an unknown POS printer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +286,8 @@ class PosBeeperDispatcher:
         self._targets: dict[str, PosBeeperTarget] = {}
         self._queues: dict[str, queue.Queue[_BeeperTrigger]] = {}
         self._threads: list[threading.Thread] = []
+        self._recent_events: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._recent_events_lock = threading.Lock()
         if len(targets) > 256:
             raise ValueError("POS beeper supports at most 256 targets")
         for target in targets:
@@ -245,7 +310,7 @@ class PosBeeperDispatcher:
                 thread.start()
                 self._threads.append(thread)
 
-    def enqueue(self, device_id: str) -> bool:
+    def enqueue(self, device_id: str, *, event_id: str | None = None) -> bool:
         """Queue one pattern without waiting; return false when it cannot be queued."""
 
         if not self.configuration.enabled or self._stop.is_set():
@@ -257,19 +322,42 @@ class PosBeeperDispatcher:
                 extra={"event": "pos_beeper_target_missing", "device_id": device_id},
             )
             return False
-        try:
-            target_queue.put_nowait(_BeeperTrigger(time.monotonic()))
-        except queue.Full:
-            LOGGER.warning(
-                "POS beeper queue is full; parser output remains valid",
-                extra={"event": "pos_beeper_queue_full", "device_id": device_id},
-            )
-            return False
+        event_key: tuple[str, str] | None = None
+        if event_id is not None:
+            normalized_event = event_id.strip()
+            if not normalized_event or len(normalized_event) > 256:
+                raise ValueError("beeper event id must contain between 1 and 256 characters")
+            event_key = (device_id, normalized_event)
+        with self._recent_events_lock:
+            if event_key is not None and event_key in self._recent_events:
+                LOGGER.info(
+                    "duplicate POS beeper event suppressed",
+                    extra={
+                        "event": "pos_beeper_duplicate_suppressed",
+                        "device_id": device_id,
+                    },
+                )
+                return False
+            try:
+                target_queue.put_nowait(_BeeperTrigger(time.monotonic()))
+            except queue.Full:
+                LOGGER.warning(
+                    "POS beeper queue is full; parser output remains valid",
+                    extra={"event": "pos_beeper_queue_full", "device_id": device_id},
+                )
+                return False
+            if event_key is not None:
+                self._recent_events[event_key] = None
+                while len(self._recent_events) > _RECENT_EVENT_LIMIT:
+                    self._recent_events.popitem(last=False)
         LOGGER.info(
             "POS command beeper queued",
             extra={"event": "pos_beeper_queued", "device_id": device_id},
         )
         return True
+
+    def supports(self, device_id: str) -> bool:
+        return device_id in self._targets
 
     def drain(self, timeout: float) -> bool:
         """Wait bounded time for queued commands to reach their socket send boundary."""

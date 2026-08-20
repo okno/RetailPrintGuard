@@ -11,7 +11,7 @@ import { formatDateTime } from '../format'
 const bytes = new Intl.NumberFormat('it-IT', { notation: 'compact', style: 'unit', unit: 'byte' })
 
 export function DevicesPage() {
-  const query = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), refetchInterval: 30_000 })
+  const query = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), refetchInterval: 10_000 })
   return (
     <>
       <PageHeader title="Stato dispositivi" subtitle="Connettività, code locali e ultime attività delle tre POS e della RCH." />

@@ -56,6 +56,8 @@ export interface Device {
   pending_jobs: number
   service_version?: string
   last_error?: string
+  reachability_checked_at?: string
+  reachability_error?: string
 }
 
 export interface ProxySession {

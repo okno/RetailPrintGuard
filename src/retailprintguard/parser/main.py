@@ -21,6 +21,7 @@ from retailprintguard.parser.beeper import (
     PosBeeperTarget,
 )
 from retailprintguard.parser.repository import ParserRepositoryError, create_parser_repository
+from retailprintguard.parser.spool_beeper import PosSpoolBeeperWatcher
 from retailprintguard.parser.worker import ParserRunReport, ParserWorker
 
 LOGGER = logging.getLogger("retailprintguard.parser")
@@ -89,6 +90,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     runtime: StructuredLoggingRuntime | None = None
     beeper: PosBeeperDispatcher | None = None
+    spool_beeper: PosSpoolBeeperWatcher | None = None
     if args.json_logs:
         runtime = configure_structured_logging("parser")
     try:
@@ -97,18 +99,32 @@ def cli(argv: Sequence[str] | None = None) -> int:
         settings = load_settings(args.config)
         beeper_configuration = PosBeeperConfiguration.from_environment()
         if beeper_configuration.enabled:
+            pos_targets = tuple(
+                PosBeeperTarget(
+                    device_id=device.id,
+                    host=str(device.target_ip),
+                    port=device.target_port,
+                )
+                for device in settings.devices
+                if device.enabled and device.type is DeviceType.POS
+            )
+            beeper_configuration.validate_selection(
+                tuple(target.device_id for target in pos_targets)
+            )
+            selected_targets = tuple(
+                target for target in pos_targets if beeper_configuration.selects(target.device_id)
+            )
             beeper = PosBeeperDispatcher(
                 beeper_configuration,
-                tuple(
-                    PosBeeperTarget(
-                        device_id=device.id,
-                        host=str(device.target_ip),
-                        port=device.target_port,
-                    )
-                    for device in settings.devices
-                    if device.enabled and device.type is DeviceType.POS
-                ),
+                selected_targets,
             )
+            spool_beeper = PosSpoolBeeperWatcher(
+                settings.spool_root,
+                tuple(target.device_id for target in selected_targets),
+                beeper,
+                poll_seconds=beeper_configuration.spool_poll_seconds,
+            )
+            spool_beeper.start()
         worker = ParserWorker(
             create_parser_repository(settings),
             timezone_name=settings.timezone,
@@ -163,6 +179,8 @@ def cli(argv: Sequence[str] | None = None) -> int:
             )
         return 2
     finally:
+        if spool_beeper is not None:
+            spool_beeper.close()
         if beeper is not None:
             beeper.close()
         if runtime is not None:

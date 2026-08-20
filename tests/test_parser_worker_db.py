@@ -35,10 +35,14 @@ class _RecordingBeeper:
         self.device_ids: list[str] = []
         self.events = events
 
-    def enqueue(self, device_id: str) -> bool:
+    def enqueue(self, device_id: str, *, event_id: str | None = None) -> bool:
+        del event_id
         self.device_ids.append(device_id)
         if self.events is not None:
             self.events.append("beep")
+        return True
+
+    def supports(self, _device_id: str) -> bool:
         return True
 
 

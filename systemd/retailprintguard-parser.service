@@ -8,6 +8,7 @@ PartOf=retailprintguard.target
 Type=simple
 User=retailprintguard-worker
 Group=retailprintguard-worker
+SupplementaryGroups=retailprintguard-spool
 UMask=0027
 Environment=PYTHONUNBUFFERED=1
 Environment=RPG_CONFIG=/etc/retailprintguard/config.yaml
@@ -41,6 +42,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 ReadWritePaths=/var/lib/retailprintguard/state /var/log/retailprintguard/worker
+ReadOnlyPaths=/var/lib/retailprintguard/spool
 
 [Install]
 WantedBy=retailprintguard.target

@@ -66,6 +66,8 @@ class DeviceView(BaseModel):
     pending_jobs: int = 0
     service_version: str | None = None
     last_error: str | None = None
+    reachability_checked_at: datetime | None = None
+    reachability_error: str | None = None
 
 
 class DashboardView(BaseModel):

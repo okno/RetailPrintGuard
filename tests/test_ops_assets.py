@@ -139,6 +139,8 @@ def test_parser_ocr_is_control_plane_only_and_has_a_reproducible_language() -> N
     parser = (SYSTEMD / "retailprintguard-parser.service").read_text(encoding="utf-8")
     assert "Environment=RPG_POS_OCR_LANG=ita+eng" in parser
     assert "EnvironmentFile=-/etc/retailprintguard/parser.env" in parser
+    assert "SupplementaryGroups=retailprintguard-spool" in parser
+    assert "ReadOnlyPaths=/var/lib/retailprintguard/spool" in parser
     assert "--interval-seconds 0.25" in parser
     ingestion = (SYSTEMD / "retailprintguard-ingestion.service").read_text(
         encoding="utf-8"
@@ -155,6 +157,8 @@ def test_parser_ocr_is_control_plane_only_and_has_a_reproducible_language() -> N
     beeper_environment = (ROOT / "deploy/parser.env.example").read_text(encoding="utf-8")
     assert "RPG_POS_BEEPER_ENABLED=false" in beeper_environment
     assert "RPG_POS_BEEPER_COUNT=3" in beeper_environment
+    assert "RPG_POS_BEEPER_PRINTER=all" in beeper_environment
+    assert "RPG_POS_BEEPER_SPOOL_POLL_SECONDS=0.1" in beeper_environment
     install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
     assert '"${SOURCE_ROOT}/deploy/parser.env.example"' in install
     for proxy_name in (

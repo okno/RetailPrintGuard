@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from retailprintguard.api.auth import LoginThrottle, PasswordService
 from retailprintguard.api.main import create_app
+from retailprintguard.api.reachability import DeviceProbeTarget, DeviceReachabilityMonitor
 from retailprintguard.api.repository import EmptyRepository, RawArtifact
 from retailprintguard.api.schemas import (
     AlertUpdate,
@@ -328,6 +329,33 @@ def test_health_degrades_when_spool_is_not_healthy() -> None:
     assert response.json()["database"] == "ok"
     assert response.json()["spool"] == "degraded"
     assert response.json()["status"] == "degraded"
+
+
+def test_device_and_dashboard_status_use_the_asynchronous_icmp_cache() -> None:
+    repository = FakeRepository()
+    monitor = DeviceReachabilityMonitor(
+        (DeviceProbeTarget("pos_1", "192.0.2.20"),),
+        probe=lambda _host, _timeout: False,
+    )
+    monitor.poll_once()
+    client = TestClient(
+        create_app(
+            repository=repository,
+            jwt_secret=b"x" * 64,
+            reachability_monitor=monitor,
+        )
+    )
+    headers = _login(client)
+
+    device = client.get("/api/v1/devices", headers=headers)
+    dashboard = client.get("/api/v1/dashboard", headers=headers)
+
+    assert device.status_code == 200
+    assert device.json()[0]["online"] is False
+    assert device.json()[0]["reachability_checked_at"] is not None
+    assert dashboard.status_code == 200
+    assert dashboard.json()["devices_online"] == 0
+    assert dashboard.json()["devices_offline"] == 1
 
 
 def test_protected_routes_reject_missing_token() -> None:

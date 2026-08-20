@@ -7,6 +7,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Event
 from typing import Protocol
 
@@ -19,7 +20,9 @@ LOGGER = logging.getLogger("retailprintguard.parser")
 
 
 class PosCommandBeeper(Protocol):
-    def enqueue(self, device_id: str) -> bool: ...
+    def enqueue(self, device_id: str, *, event_id: str | None = None) -> bool: ...
+
+    def supports(self, device_id: str) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,11 +69,17 @@ class ParserWorker:
                         self.beeper is not None
                         and not reparse
                         and source["import_status"] == "IMPORTED"
+                        and self.beeper.supports(str(source["device_id"]))
                         and is_complete_pos_command(source["request"])
                     )
                     if should_beep:
                         try:
-                            queued = self.beeper.enqueue(str(source["device_id"]))
+                            event_id = Path(str(source["request_path"])).parent.name.removesuffix(
+                                ".partial"
+                            )
+                            queued = self.beeper.enqueue(
+                                str(source["device_id"]), event_id=event_id
+                            )
                             captured_at = source["captured_at"]
                             if captured_at.tzinfo is None:
                                 captured_at = captured_at.replace(tzinfo=UTC)
