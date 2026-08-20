@@ -81,10 +81,15 @@ def test_expected_services_are_separate_and_hardened() -> None:
     for control in SERVICE_NAMES - {
         "retailprintguard-pos-proxy.service",
         "retailprintguard-rch-proxy.service",
+        "retailprintguard-api.service",
     }:
         content = (SYSTEMD / control).read_text(encoding="utf-8")
         assert "EnvironmentFile=/etc/retailprintguard/database.env" in content
         assert "CapabilityBoundingSet=\n" in content
+
+    api = (SYSTEMD / "retailprintguard-api.service").read_text(encoding="utf-8")
+    assert "CapabilityBoundingSet=CAP_NET_RAW\n" in api
+    assert "AmbientCapabilities=CAP_NET_RAW\n" in api
 
 
 def test_nginx_exposes_ui_on_ipv4_while_api_remains_loopback_only() -> None:

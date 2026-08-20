@@ -39,7 +39,8 @@ MemoryDenyWriteExecute=yes
 RemoveIPC=yes
 RestrictAddressFamilies=AF_UNIX AF_INET
 SystemCallArchitectures=native
-CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
 ReadOnlyPaths=/etc/retailprintguard
 
 [Install]

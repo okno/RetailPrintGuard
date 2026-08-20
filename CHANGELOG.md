@@ -5,6 +5,14 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-08-20
+
+### Fixed
+
+- concede esclusivamente all'API la capability `CAP_NET_RAW`, necessaria al
+  monitor ICMP delle stampanti quando il servizio usa `NoNewPrivileges`; gli
+  altri servizi, inclusi proxy e worker, mantengono il bounding set vuoto.
+
 ## [0.4.5] — 2026-08-20
 
 ### Added

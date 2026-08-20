@@ -141,8 +141,9 @@ La pagina device aggiorna ogni 10 secondi stato, endpoint, ultime attività,
 versione, errore e spool. Lo stato `ONLINE/OFFLINE` deriva dalla cache di ping
 ICMP verso gli IP fisici configurati, aggiornata fuori dal percorso HTTP con la
 stessa cadenza. Il ping non passa dai listener proxy e non altera il traffico di
-stampa. La pagina import, riservata ai reviewer, mostra batch, duplicati ed
-errori.
+stampa. L'unità API riceve soltanto `CAP_NET_RAW` per inviare ICMP anche con
+`NoNewPrivileges`; proxy e worker non ricevono capability. La pagina import,
+riservata ai reviewer, mostra batch, duplicati ed errori.
 
 ## Accessibilità e sicurezza
 
