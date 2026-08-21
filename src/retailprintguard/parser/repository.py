@@ -251,6 +251,11 @@ class SqlAlchemyParserRepository:
                             table_code=parsed.table_code,
                             operator_code=parsed.operator_code,
                             terminal_code=parsed.terminal_code,
+                            receipt_header=(
+                                parsed.receipt_header.model_dump(mode="json")
+                                if parsed.receipt_header is not None
+                                else None
+                            ),
                             application_timestamp=parsed.application_timestamp,
                             rch_footer_timestamp=parsed.rch_footer_timestamp,
                             rch_serial_number=parsed.rch_serial_number,
@@ -346,6 +351,11 @@ class SqlAlchemyParserRepository:
                         table_code=parsed.table_code,
                         operator_code=parsed.operator_code,
                         terminal_code=parsed.terminal_code,
+                        receipt_header=(
+                            parsed.receipt_header.model_dump(mode="json")
+                            if parsed.receipt_header is not None
+                            else None
+                        ),
                         application_timestamp=parsed.application_timestamp,
                         rch_footer_timestamp=parsed.rch_footer_timestamp,
                         rch_serial_number=parsed.rch_serial_number,
@@ -388,6 +398,11 @@ class SqlAlchemyParserRepository:
                     document.table_code = parsed.table_code
                     document.operator_code = parsed.operator_code
                     document.terminal_code = parsed.terminal_code
+                    document.receipt_header = (
+                        parsed.receipt_header.model_dump(mode="json")
+                        if parsed.receipt_header is not None
+                        else None
+                    )
                     document.application_timestamp = parsed.application_timestamp
                     document.rch_footer_timestamp = parsed.rch_footer_timestamp
                     document.rch_serial_number = parsed.rch_serial_number

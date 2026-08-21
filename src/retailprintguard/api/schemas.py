@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -213,6 +213,17 @@ class DocumentLineView(BaseModel):
     price_attributions: list[LinePriceAttributionView] = Field(default_factory=list)
 
 
+class ReceiptHeaderView(BaseModel):
+    schema_version: Literal[1] = 1
+    merchant_name: str | None = None
+    legal_name: str | None = None
+    address_lines: list[str] = Field(default_factory=list)
+    phone: str | None = None
+    tax_code: str | None = None
+    vat_number: str | None = None
+    evidence: Literal["RCH_PRINTED_HEADER", "DEVICE_METADATA_CONFIGURED"]
+
+
 class DocumentView(BaseModel):
     id: UUID
     device_id: str
@@ -231,6 +242,7 @@ class DocumentView(BaseModel):
     table_code: str | None = None
     operator_code: str | None = None
     terminal_code: str | None = None
+    receipt_header: ReceiptHeaderView | None = None
     covers: int | None = None
     application_timestamp: datetime | None = None
     application_timestamp_precision: str | None = None

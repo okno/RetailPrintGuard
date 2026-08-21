@@ -54,6 +54,10 @@ import {
   rchSerialEvidenceLabel,
   rchTimestampEvidenceLabel,
 } from '../rchIdentityPresentation'
+import {
+  receiptHeaderEvidenceLabel,
+  receiptHeaderSummary,
+} from '../receiptHeaderPresentation'
 import { documentDetailPath } from '../routes'
 import type { DocumentRecord, Page } from '../types'
 
@@ -177,14 +181,21 @@ export function DocumentsPage() {
       {doc.order_code && <><br />Ordine {doc.order_code}</>}
       {doc.table_code && <><br />Tavolo {doc.table_code}</>}
     </>
-    if (column === 'device') return <>
-      <strong>{deviceLabel(doc.device_id)}</strong>
-      {deviceLabel(doc.device_id) !== doc.device_id && <><br /><small>{doc.device_id}</small></>}
-      {(doc.device_id.toLowerCase().startsWith('rch') || doc.parser_name.toLowerCase().includes('rch')) && <>
-        <br />Seriale RCH: {doc.rch_serial_number ?? NOT_OBSERVED_IN_FLOW}
-        {doc.rch_serial_number && <><br /><small>{rchSerialEvidenceLabel(doc.rch_serial_number_evidence)}</small></>}
-      </>}
-    </>
+    if (column === 'device') {
+      const isRch = doc.device_id.toLowerCase().startsWith('rch')
+        || doc.parser_name.toLowerCase().includes('rch')
+        || doc.receipt_header != null
+      return <>
+        <strong>{deviceLabel(doc.device_id)}</strong>
+        {deviceLabel(doc.device_id) !== doc.device_id && <><br /><small>{doc.device_id}</small></>}
+        {isRch && <>
+          <br />Seriale RCH: {doc.rch_serial_number ?? NOT_OBSERVED_IN_FLOW}
+          {doc.rch_serial_number && <><br /><small>{rchSerialEvidenceLabel(doc.rch_serial_number_evidence)}</small></>}
+          <br /><small>Intestazione: {receiptHeaderSummary(doc.receipt_header)}</small>
+          {doc.receipt_header && <><br /><small>{receiptHeaderEvidenceLabel(doc.receipt_header.evidence)}</small></>}
+        </>}
+      </>
+    }
     if (column === 'total') {
       return doc.gross_total !== undefined && doc.gross_total !== null
         ? money.format(Number(doc.gross_total))

@@ -118,7 +118,11 @@ I tipi `SHIFT_END_REPORT` e `INVOICE` distinguono rispettivamente il report di
 fine turno e la fattura dai generici documenti gestionali. Il dettaglio espone
 `application_timestamp`, `rch_footer_timestamp`, `rch_serial_number`, le
 relative evidenze/precisioni e `rch_clock_offset_seconds`; valori non osservati
-restano null. Le liste operative nascondono per default soltanto i frammenti
+restano null. `receipt_header` espone la versione schema, i campi anagrafici
+disponibili e una provenienza obbligatoria: `RCH_PRINTED_HEADER` significa che
+il blocco è stato osservato nel payload, mentre `DEVICE_METADATA_CONFIGURED`
+indica un fallback amministrativo non presente nel flusso. Le liste operative
+nascondono per default soltanto i frammenti
 incompleti privi di contenuto commerciale, conservandoli con
 `include_technical=true`.
 

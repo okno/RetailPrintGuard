@@ -48,6 +48,7 @@ from retailprintguard.render.pdf import (
     DocumentRenderError,
     render_document_pdf,
 )
+from retailprintguard.render.text import document_text_export
 
 bearer = HTTPBearer(auto_error=False)
 _DOWNLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -514,7 +515,7 @@ def create_router(context: ApiContext) -> APIRouter:
             raise HTTPException(status_code=404, detail="Documento non trovato")
         if not result.normalized_text:
             raise HTTPException(status_code=404, detail="Derivato TXT non disponibile")
-        payload = result.normalized_text.encode("utf-8")
+        payload = document_text_export(result).encode("utf-8")
         artifact = RawArtifact(
             payload,
             f"{document_id}.txt",

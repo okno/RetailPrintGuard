@@ -17,6 +17,9 @@ _TECHNICAL_TOKEN = re.compile(r"<(?:ESC/POS|BYTE):[^>]*>")
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _ROME = ZoneInfo("Europe/Rome")
 NOT_OBSERVED_IN_FLOW = "Non osservato nel flusso"
+RECEIPT_HEADER_NOT_AVAILABLE = "Non osservata nel flusso e non configurata"
+_MAX_HEADER_VALUE_CHARACTERS = 240
+_MAX_HEADER_ADDRESS_LINES = 8
 
 
 def _printed_timestamp(value: Any, precision: str | None) -> str:
@@ -84,6 +87,73 @@ def _clock_offset(value: Any) -> str:
         f"{seconds:+d} s (footer RCH {relation} di {duration} "
         "rispetto all'ora applicativa)"
     )
+
+
+def _header_field(header: Any, name: str) -> Any:
+    if isinstance(header, dict):
+        return header.get(name)
+    return getattr(header, name, None)
+
+
+def _header_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    rendered = _CONTROL_CHARACTER.sub("", str(value)).strip()
+    if not rendered:
+        return None
+    return rendered[:_MAX_HEADER_VALUE_CHARACTERS]
+
+
+def receipt_header_evidence_label(value: Any) -> str:
+    labels = {
+        "RCH_PRINTED_HEADER": "Osservata nel blocco iniziale stampato dalla RCH",
+        "DEVICE_METADATA_CONFIGURED": (
+            "Configurata sul dispositivo (non osservata nel flusso)"
+        ),
+    }
+    if value is None:
+        return RECEIPT_HEADER_NOT_AVAILABLE
+    return labels.get(str(value), f"Provenienza non riconosciuta: {_header_value(value)}")
+
+
+def receipt_header_text_lines(document: Any) -> list[str]:
+    """Return a bounded header projection with explicit evidence provenance."""
+
+    header = getattr(document, "receipt_header", None)
+    lines = ["INTESTAZIONE DOCUMENTO"]
+    if header is None:
+        lines.append(f"Stato: {RECEIPT_HEADER_NOT_AVAILABLE}")
+        return lines
+
+    for label, name in (
+        ("Insegna", "merchant_name"),
+        ("Ragione sociale", "legal_name"),
+    ):
+        value = _header_value(_header_field(header, name))
+        if value:
+            lines.append(f"{label}: {value}")
+
+    address_lines = _header_field(header, "address_lines")
+    if isinstance(address_lines, (list, tuple)):
+        for index, address in enumerate(address_lines[:_MAX_HEADER_ADDRESS_LINES]):
+            value = _header_value(address)
+            if value:
+                label = "Indirizzo" if index == 0 else f"Indirizzo {index + 1}"
+                lines.append(f"{label}: {value}")
+
+    for label, name in (
+        ("Telefono", "phone"),
+        ("Codice fiscale", "tax_code"),
+        ("Partita IVA", "vat_number"),
+    ):
+        value = _header_value(_header_field(header, name))
+        if value:
+            lines.append(f"{label}: {value}")
+    lines.append(
+        "Provenienza intestazione: "
+        + receipt_header_evidence_label(_header_field(header, "evidence"))
+    )
+    return lines
 
 
 def rch_identity_text_lines(document: Any) -> list[str]:
@@ -176,4 +246,46 @@ def receipt_text(normalized_text: str, *, maximum_characters: int = 250_000) -> 
     return "\n".join(output).strip("\n")
 
 
-__all__ = ["NOT_OBSERVED_IN_FLOW", "rch_identity_text_lines", "receipt_text"]
+def document_text_export(document: Any) -> str:
+    """Build the audited TXT view without changing the normalized/RAW evidence."""
+
+    source = getattr(document, "receipt_text", None)
+    if source is None:
+        source = getattr(document, "normalized_text", "")
+    body = receipt_text(str(source or ""))
+    header = getattr(document, "receipt_header", None)
+    evidence = _header_field(header, "evidence") if header is not None else None
+    configured_header = (
+        receipt_header_text_lines(document)
+        if evidence == "DEVICE_METADATA_CONFIGURED"
+        else []
+    )
+    trailing_provenance = []
+    if evidence != "DEVICE_METADATA_CONFIGURED":
+        trailing_provenance = [
+            "",
+            "PROVENIENZA INTESTAZIONE",
+            receipt_header_evidence_label(evidence),
+        ]
+    lines = [
+        "RETAILPRINTGUARD - VISTA DERIVATA",
+        "Il RAW immutabile resta autoritativo.",
+        "",
+        *configured_header,
+        *(('',) if configured_header else ()),
+        "TESTO DOCUMENTO",
+        body or "Nessun testo documento disponibile.",
+        *trailing_provenance,
+    ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+__all__ = [
+    "NOT_OBSERVED_IN_FLOW",
+    "RECEIPT_HEADER_NOT_AVAILABLE",
+    "document_text_export",
+    "rch_identity_text_lines",
+    "receipt_header_evidence_label",
+    "receipt_header_text_lines",
+    "receipt_text",
+]

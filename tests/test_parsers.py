@@ -371,6 +371,117 @@ def test_rch_keeps_application_and_fiscal_footer_identity_distinct() -> None:
     assert "rch_clock_offset_exceeds_one_minute" in document.warnings
 
 
+def test_rch_extracts_only_an_observed_bounded_receipt_header_with_raw_spans() -> None:
+    management = b"".join(
+        (
+            _rch_frame("=o", sequence="0"),
+            _rch_frame('="/(SYNTHETIC HOTEL)', sequence="1"),
+            _rch_frame('="/(EXAMPLE LABS S.R.L.)', sequence="2"),
+            _rch_frame('="/(VIA ESEMPIO 4)', sequence="3"),
+            _rch_frame('="/(00100 CITTA LAB)', sequence="4"),
+            _rch_frame('="/(TELEFONO +39 000 0000000)', sequence="5"),
+            _rch_frame('="/(C.F. SYNTHCF01 - P.IVA SYNTHVAT01)', sequence="6"),
+            _rch_frame('="/(DOCUMENTO GESTIONALE)', sequence="7"),
+            _rch_frame('="/(Voce sintetica                    1,00)', sequence="8"),
+            _rch_frame("=o", sequence="9"),
+        )
+    )
+
+    document = parse_rch(
+        management,
+        b"",
+        device_id="rch_synthetic",
+        session_id="session-rch-heading",
+        job_id="job-rch-heading",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+
+    assert document.receipt_header is not None
+    assert document.receipt_header.model_dump(mode="json") == {
+        "schema_version": 1,
+        "merchant_name": "SYNTHETIC HOTEL",
+        "legal_name": "EXAMPLE LABS S.R.L.",
+        "address_lines": ["VIA ESEMPIO 4", "00100 CITTA LAB"],
+        "phone": "+39 000 0000000",
+        "tax_code": "SYNTHCF01",
+        "vat_number": "SYNTHVAT01",
+        "evidence": "RCH_PRINTED_HEADER",
+    }
+    assert document.raw_metadata["receipt_header_evidence"] == "RCH_PRINTED_HEADER"
+    assert document.raw_metadata["receipt_header_line_indexes"] == list(range(6))
+    spans = document.raw_metadata["receipt_header_source_spans"]
+    assert len(spans) == 6
+    assert [span["offset"] for span in spans] == sorted(span["offset"] for span in spans)
+    assert all(span["direction"] == "CLIENT_TO_DEVICE" for span in spans)
+    descriptions = [line.description for line in document.lines]
+    assert "Voce sintetica" in descriptions
+    assert not {
+        "SYNTHETIC HOTEL",
+        "EXAMPLE LABS S.R.L.",
+        "VIA ESEMPIO 4",
+        "00100 CITTA LAB",
+    }.intersection(descriptions)
+    assert "SYNTHETIC HOTEL" in document.normalized_text
+
+
+def test_rch_does_not_invent_a_receipt_header_from_business_lines() -> None:
+    management = b"".join(
+        (
+            _rch_frame("=o", sequence="0"),
+            _rch_frame('="/(REPORT DI FINE TURNO)', sequence="1"),
+            _rch_frame('="/(Fatture                         42,35)', sequence="2"),
+            _rch_frame('="/(TOT                             42,35)', sequence="3"),
+            _rch_frame("=o", sequence="4"),
+        )
+    )
+
+    document = parse_rch(
+        management,
+        b"",
+        device_id="rch_synthetic",
+        session_id="session-rch-no-heading",
+        job_id="job-rch-no-heading",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+
+    assert document.type is DocumentType.SHIFT_END_REPORT
+    assert document.receipt_header is None
+    assert document.raw_metadata["receipt_header_source_spans"] == []
+
+
+def test_rch_shared_cf_and_vat_label_preserves_the_observed_value_for_both() -> None:
+    management = b"".join(
+        (
+            _rch_frame("=o", sequence="0"),
+            _rch_frame('="/(SYNTHETIC CAFE)', sequence="1"),
+            _rch_frame('="/(C.F. - P.IVA SYNTHVAT01)', sequence="2"),
+            _rch_frame('="/(DOCUMENTO GESTIONALE)', sequence="3"),
+            _rch_frame('="/(Voce sintetica                    1,00)', sequence="4"),
+            _rch_frame("=o", sequence="5"),
+        )
+    )
+
+    document = parse_rch(
+        management,
+        b"",
+        device_id="rch_synthetic",
+        session_id="session-rch-shared-tax-id",
+        job_id="job-rch-shared-tax-id",
+        captured_at=CAPTURED_AT,
+        manifest_sha256=MANIFEST_HASH,
+        source_path="synthetic/client.raw",
+    )[0]
+
+    assert document.receipt_header is not None
+    assert document.receipt_header.tax_code == "SYNTHVAT01"
+    assert document.receipt_header.vat_number == "SYNTHVAT01"
+    assert document.receipt_header.evidence == "RCH_PRINTED_HEADER"
+
+
 def test_rch_commercial_footer_exposes_progressive_clock_serial_and_hash_order() -> None:
     commercial = b"".join(
         (

@@ -94,8 +94,8 @@ derivati ignorano i job con `analysis_excluded=true`.
 |---|---|
 | `parser_versions` | nome, versione e build del parser |
 | `active_parser_versions` | puntatore esplicito alla build attiva per nome parser, con motivo/data |
-| `documents` | identità stabile del documento sorgente |
-| `document_versions` | interpretazioni append-only, inclusi tipo, riferimenti, tavolo, operatore, timestamp, importi, parser e hash |
+| `documents` | identità stabile del documento sorgente e proiezione corrente, inclusa l'intestazione RCH JSON |
+| `document_versions` | interpretazioni append-only, inclusi tipo, riferimenti, tavolo, operatore, timestamp, intestazione RCH, importi, parser e hash |
 | `document_lines` | articoli, portata, quantità, prezzi, sconti, IVA e span raw |
 | `payments` | pagamenti associati a ordine o versione documento |
 
@@ -103,6 +103,12 @@ La coppia `document_id`/`version_sequence` è univoca. Anche
 `document_id`/`parser_version_id`/`source_payload_sha256` impedisce di creare due
 risultati uguali per lo stesso parser e payload. Una rielaborazione non deve
 sovrascrivere la versione precedente.
+
+`receipt_header` usa uno schema JSON versionato e bounded. La provenienza
+`RCH_PRINTED_HEADER` è ammessa soltanto quando il parser conserva gli span del
+blocco osservato; `DEVICE_METADATA_CONFIGURED` viene applicata esclusivamente
+dalla proiezione di lettura del dispositivo RCH e non viene presentata come
+evidenza catturata.
 
 In assenza di un puntatore in `active_parser_versions`, i consumer scelgono la
 versione con sequenza più alta. Un puntatore consente un rollback interpretativo

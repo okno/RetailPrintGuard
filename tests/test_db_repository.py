@@ -1683,6 +1683,95 @@ def test_document_view_uses_configured_rch_serial_only_as_parser_fallback() -> N
     engine.dispose()
 
 
+def test_document_view_uses_versioned_configured_header_only_without_observed_header() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        device = session.get(Device, ids["device"])
+        assert device is not None
+        device.device_type = "rch"
+        device.non_sensitive_config = {
+            "receipt_header": {
+                "schema_version": 1,
+                "merchant_name": "SYNTHETIC HOTEL",
+                "legal_name": "EXAMPLE LABS S.R.L.",
+                "address_lines": ["VIA ESEMPIO 4", "00100 CITTA LAB"],
+                "phone": "+39 000 0000000",
+                "tax_code": "SYNTHCF01",
+                "vat_number": "SYNTHVAT01",
+            }
+        }
+
+    repository = SqlAlchemyApiRepository(factory)
+    configured = repository.get_document(ids["document"])
+    assert configured is not None
+    assert configured.receipt_header is not None
+    assert configured.receipt_header.merchant_name == "SYNTHETIC HOTEL"
+    assert configured.receipt_header.address_lines == [
+        "VIA ESEMPIO 4",
+        "00100 CITTA LAB",
+    ]
+    assert configured.receipt_header.evidence == "DEVICE_METADATA_CONFIGURED"
+
+    with factory.begin() as session:
+        version = session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == ids["document"]
+            )
+        )
+        assert version is not None
+        version.document_type = "PRE_BILL"
+        version.subtype = "PRECONTO"
+        version.receipt_header = {
+            "schema_version": 1,
+            "merchant_name": "OBSERVED SYNTHETIC HOTEL",
+            "legal_name": None,
+            "address_lines": [],
+            "phone": None,
+            "tax_code": None,
+            "vat_number": "OBSERVED01",
+            "evidence": "RCH_PRINTED_HEADER",
+        }
+
+    observed = repository.get_document(ids["document"])
+    assert observed is not None
+    assert observed.receipt_header is not None
+    assert observed.receipt_header.merchant_name == "OBSERVED SYNTHETIC HOTEL"
+    assert observed.receipt_header.vat_number == "OBSERVED01"
+    assert observed.receipt_header.evidence == "RCH_PRINTED_HEADER"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("device_type", "configured_header"),
+    [
+        ("pos", {"merchant_name": "SYNTHETIC HOTEL"}),
+        ("rch", "SYNTHETIC HOTEL"),
+        ("rch", {"schema_version": 2, "merchant_name": "SYNTHETIC HOTEL"}),
+        ("rch", {"merchant_name": "SYNTHETIC HOTEL", "unexpected": "value"}),
+        ("rch", {"merchant_name": " "}),
+        ("rch", {"address_lines": ["X" * 192]}),
+        ("rch", {"address_lines": ["A"] * 9}),
+    ],
+)
+def test_document_view_ignores_invalid_or_non_rch_configured_header(
+    device_type: str,
+    configured_header: object,
+) -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    with factory.begin() as session:
+        device = session.get(Device, ids["device"])
+        assert device is not None
+        device.device_type = device_type
+        device.non_sensitive_config = {"receipt_header": configured_header}
+
+    selected = SqlAlchemyApiRepository(factory).get_document(ids["document"])
+    assert selected is not None
+    assert selected.receipt_header is None
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("device_type", "configured_value"),
     [

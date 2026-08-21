@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retailprintguard"
-version = "0.4.7"
+version = "0.4.8"
 description = "Resilient print evidence ingestion, correlation and fraud analysis platform"
 readme = "README.md"
 requires-python = ">=3.11"

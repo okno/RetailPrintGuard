@@ -21,9 +21,14 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen.canvas import Canvas
 
-from retailprintguard.render.text import NOT_OBSERVED_IN_FLOW, rch_identity_text_lines
+from retailprintguard.render.text import (
+    NOT_OBSERVED_IN_FLOW,
+    rch_identity_text_lines,
+    receipt_header_evidence_label,
+    receipt_header_text_lines,
+)
 
-PDF_RENDERER_VERSION = "rpg-receipt-pdf-1.3.0"
+PDF_RENDERER_VERSION = "rpg-receipt-pdf-1.4.0"
 _ROME = ZoneInfo("Europe/Rome")
 _PAGE_WIDTH = 80 * mm
 _MAX_PAGE_HEIGHT = 297 * mm
@@ -315,6 +320,27 @@ def _generic_lines(document: Any, normalized: str) -> list[_RenderLine]:
             getattr(document, "rch_serial_number", None) is not None,
         )
     )
+    receipt_header = getattr(document, "receipt_header", None)
+    if isinstance(receipt_header, dict):
+        receipt_header_evidence = receipt_header.get("evidence")
+    else:
+        receipt_header_evidence = getattr(receipt_header, "evidence", None)
+    structured_body = bool(getattr(document, "lines", None))
+    render_structured_header = receipt_header_evidence == (
+        "DEVICE_METADATA_CONFIGURED"
+    ) or (
+        receipt_header_evidence == "RCH_PRINTED_HEADER" and structured_body
+    )
+    if render_structured_header:
+        for header_line in receipt_header_text_lines(document):
+            if header_line == "INTESTAZIONE DOCUMENTO":
+                style = "course"
+            elif header_line.startswith(("Provenienza", "Stato")):
+                style = "meta"
+            else:
+                style = "body"
+            _append_wrapped(lines, header_line, style)
+        lines.append(_RenderLine(style="rule"))
     if rch_context:
         for identity_line in rch_identity_text_lines(document):
             style = "meta" if identity_line.startswith("  ") else "body"
@@ -380,7 +406,7 @@ def _generic_lines(document: Any, normalized: str) -> list[_RenderLine]:
         ("Terminale", document.terminal_code),
     ):
         if value:
-            lines.append(_RenderLine(f"{label}: {_safe_text(value)}"))
+            _append_wrapped(lines, f"{label}: {_safe_text(value)}")
     lines.append(_RenderLine(style="rule"))
     has_items = _append_items(lines, document, kitchen=False)
     if not has_items and normalized:
@@ -411,6 +437,16 @@ def _generic_lines(document: Any, normalized: str) -> list[_RenderLine]:
         lines.append(_RenderLine("AVVISI DI PARSING", "label"))
         for warning in document.warnings:
             _append_wrapped(lines, f"- {_safe_text(warning)}", "subtitle")
+    if not render_structured_header and (
+        receipt_header_evidence == "RCH_PRINTED_HEADER" or rch_context
+    ):
+        lines.append(_RenderLine(style="rule"))
+        _append_wrapped(
+            lines,
+            "Provenienza intestazione: "
+            + receipt_header_evidence_label(receipt_header_evidence),
+            "meta",
+        )
     _metadata_footer(lines, document)
     return lines
 

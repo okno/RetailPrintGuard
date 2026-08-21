@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import Select, and_, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, sessionmaker
@@ -48,7 +49,7 @@ from retailprintguard.api.schemas import (
     UserPrincipal,
 )
 from retailprintguard.common.config import Settings
-from retailprintguard.common.domain import AlertStatus, DocumentType
+from retailprintguard.common.domain import AlertStatus, DocumentType, ReceiptHeader
 from retailprintguard.common.hashchain import ZERO_HASH, chained_hash
 from retailprintguard.db.models import (
     ActiveParserVersion,
@@ -132,6 +133,7 @@ _VERSION_SEMANTIC_FIELDS = (
     "table_code",
     "operator_code",
     "terminal_code",
+    "receipt_header",
     "application_timestamp",
     "rch_footer_timestamp",
     "rch_serial_number",
@@ -216,6 +218,58 @@ def _configured_rch_serial_number(device: Device | None) -> str | None:
     ):
         return None
     return candidate
+
+
+def _receipt_header_payload(value: Any, *, evidence: str) -> dict[str, Any] | None:
+    """Validate a receipt header before exposing it through the read model."""
+
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        "schema_version",
+        "merchant_name",
+        "legal_name",
+        "address_lines",
+        "phone",
+        "tax_code",
+        "vat_number",
+        "evidence",
+    }
+    if set(value) - allowed:
+        return None
+    candidate = {
+        key: value[key]
+        for key in (
+            "schema_version",
+            "merchant_name",
+            "legal_name",
+            "address_lines",
+            "phone",
+            "tax_code",
+            "vat_number",
+        )
+        if key in value
+    }
+    candidate["evidence"] = evidence
+    try:
+        header = ReceiptHeader.model_validate(candidate)
+    except ValidationError:
+        return None
+    return header.model_dump(mode="json")
+
+
+def _configured_receipt_header(device: Device | None) -> dict[str, Any] | None:
+    """Return bounded RCH header metadata with explicit configured provenance."""
+
+    if device is None or str(device.device_type).lower() != "rch":
+        return None
+    metadata = device.non_sensitive_config
+    if not isinstance(metadata, dict):
+        return None
+    return _receipt_header_payload(
+        metadata.get("receipt_header"),
+        evidence="DEVICE_METADATA_CONFIGURED",
+    )
 
 
 def _document_has_business_content() -> Any:
@@ -1711,6 +1765,9 @@ class SqlAlchemyApiRepository:
             resolved_code, resolved_code_provenance = resolved_external_code(
                 document, version
             )
+            selected_document_type = _version_value(
+                version, document, "document_type"
+            )
             observed_rch_serial_number = _version_value(
                 version, document, "rch_serial_number"
             )
@@ -1736,12 +1793,30 @@ class SqlAlchemyApiRepository:
                     )
                     else None
                 )
+            observed_receipt_header = _version_value(
+                version, document, "receipt_header"
+            )
+            receipt_header = (
+                _receipt_header_payload(
+                    observed_receipt_header,
+                    evidence="RCH_PRINTED_HEADER",
+                )
+                if isinstance(observed_receipt_header, dict)
+                and observed_receipt_header.get("evidence") == "RCH_PRINTED_HEADER"
+                else None
+            )
+            if receipt_header is None and selected_document_type not in {
+                DocumentType.DEVICE_RESPONSE.value,
+                DocumentType.CANCELLATION.value,
+                DocumentType.UNKNOWN.value,
+            }:
+                receipt_header = _configured_receipt_header(device)
             result.append(
                 DocumentView(
                     id=document.id,
                     device_id=device.external_id if device else str(document.device_id),
                     job_id=document.job_id,
-                    type=_version_value(version, document, "document_type"),
+                    type=selected_document_type,
                     subtype=_version_value(version, document, "subtype"),
                     external_document_code=_version_value(
                         version, document, "external_document_code"
@@ -1766,6 +1841,7 @@ class SqlAlchemyApiRepository:
                     table_code=_version_value(version, document, "table_code"),
                     operator_code=_version_value(version, document, "operator_code"),
                     terminal_code=_version_value(version, document, "terminal_code"),
+                    receipt_header=receipt_header,
                     application_timestamp=_version_value(
                         version, document, "application_timestamp"
                     ),

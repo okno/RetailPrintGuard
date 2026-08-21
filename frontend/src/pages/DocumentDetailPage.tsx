@@ -21,6 +21,11 @@ import {
   deviceLabel,
   documentTypeLabel,
 } from '../documentPresentation'
+import {
+  configuredReceiptHeaderText,
+  RECEIPT_HEADER_NOT_AVAILABLE,
+  receiptHeaderEvidenceLabel,
+} from '../receiptHeaderPresentation'
 import type { DocumentRecord } from '../types'
 
 const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
@@ -37,6 +42,27 @@ function ProvenanceValue({ label, value, provenance }: { label: string, value: R
     <Typography variant="caption" color="text.secondary">{label}</Typography>
     <Typography sx={{ wordBreak: 'break-word' }}>{value}</Typography>
     {provenance && <Typography variant="caption" color="text.secondary">Provenienza: {provenance}</Typography>}
+  </Box>
+}
+
+function ReceiptHeaderDetails({ document }: { document: DocumentRecord }) {
+  const header = document.receipt_header
+  return <Box sx={{ pb: 2, mb: 2, borderBottom: 1, borderColor: 'divider' }}>
+    <Typography variant="h2">Intestazione documento</Typography>
+    {!header
+      ? <Typography color="text.secondary" sx={{ mt: 1.5 }}>{RECEIPT_HEADER_NOT_AVAILABLE}</Typography>
+      : <>
+        {header.merchant_name && <ProvenanceValue label="Insegna" value={header.merchant_name} />}
+        {header.legal_name && <ProvenanceValue label="Ragione sociale" value={header.legal_name} />}
+        {header.address_lines.length > 0 && <ProvenanceValue
+          label="Indirizzo"
+          value={header.address_lines.map((line, index) => <span key={`${index}-${line}`}>{line}<br /></span>)}
+        />}
+        {header.phone && <ProvenanceValue label="Telefono" value={header.phone} />}
+        {header.tax_code && <ProvenanceValue label="Codice fiscale" value={header.tax_code} />}
+        {header.vat_number && <ProvenanceValue label="Partita IVA" value={header.vat_number} />}
+        <ProvenanceValue label="Provenienza intestazione" value={receiptHeaderEvidenceLabel(header.evidence)} />
+      </>}
   </Box>
 }
 
@@ -100,6 +126,9 @@ export function DocumentDetailPage() {
   if (query.isLoading) return <LoadingState />
   if (query.error || !query.data) return <ErrorState error={query.error} />
   const doc = query.data
+  const documentBody = doc.receipt_text || doc.normalized_text || 'Nessun testo documento disponibile.'
+  const configuredHeader = configuredReceiptHeaderText(doc.receipt_header)
+  const receiptPreview = configuredHeader ? `${configuredHeader}\n\n${documentBody}` : documentBody
   const roles = session().user?.roles ?? []
   const canDownloadEvidence = roles.includes('ADMIN') || roles.includes('AUDITOR')
   const hasRchIdentity = doc.device_id.toLowerCase().startsWith('rch')
@@ -107,6 +136,7 @@ export function DocumentDetailPage() {
     || doc.application_timestamp != null
     || doc.rch_footer_timestamp != null
     || doc.rch_serial_number != null
+    || doc.receipt_header != null
 
   async function runArtifact(action: () => Promise<unknown>) {
     setArtifactError(undefined)
@@ -150,7 +180,7 @@ export function DocumentDetailPage() {
             <Tab label="RAW tecnico" disabled={!canDownloadEvidence} />
           </Tabs>
           <CardContent>
-            {tab === 0 && <Paper variant="outlined" sx={(theme) => ({ mx: 'auto', maxWidth: 520, p: 3, bgcolor: theme.appChrome.receiptPaper, color: theme.appChrome.receiptInk, fontFamily: 'ui-monospace,Consolas,monospace', whiteSpace: 'pre-wrap', lineHeight: 1.55 })}>{doc.receipt_text || doc.normalized_text || 'Nessun testo documento disponibile.'}</Paper>}
+            {tab === 0 && <Paper variant="outlined" sx={(theme) => ({ mx: 'auto', maxWidth: 520, p: 3, bgcolor: theme.appChrome.receiptPaper, color: theme.appChrome.receiptInk, fontFamily: 'ui-monospace,Consolas,monospace', whiteSpace: 'pre-wrap', lineHeight: 1.55 })}>{receiptPreview}</Paper>}
             {tab === 1 && <Box sx={{ overflowX: 'auto' }}><Table size="small"><TableHead><TableRow><TableCell>#</TableCell><TableCell>Portata</TableCell><TableCell>Descrizione</TableCell><TableCell align="right">Q.tà</TableCell><TableCell align="right">Prezzo</TableCell><TableCell align="right">Totale</TableCell><TableCell>Stato</TableCell></TableRow></TableHead><TableBody>{doc.lines.map((line) => <TableRow key={line.id ?? line.sequence} sx={(theme) => ({ textDecoration: line.removed ? 'line-through' : 'none', bgcolor: line.removed ? alpha(theme.palette.error.main, theme.palette.mode === 'dark' ? 0.2 : 0.08) : 'transparent' })}><TableCell>{line.sequence}</TableCell><TableCell>{line.course_code ?? '—'}</TableCell><TableCell>{line.description ?? line.raw_text ?? '—'}</TableCell><TableCell align="right">{line.quantity ?? '—'}</TableCell><TableCell align="right"><LinePrice line={line} /></TableCell><TableCell align="right">{line.line_total ? money.format(Number(line.line_total)) : '—'}</TableCell><TableCell>{line.removed ? 'Rimosso' : line.cancelled ? 'Annullato' : line.state ?? 'Attivo'}</TableCell></TableRow>)}</TableBody></Table></Box>}
             {tab === 2 && <Paper component="pre" variant="outlined" sx={{ p: 2, maxHeight: 520, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>{doc.normalized_text || 'Nessun testo normalizzato.'}</Paper>}
             {tab === 3 && <Box><Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>Anteprima esadecimale limitata a 64 KiB; il download completo è separato e auditato.</Typography>{raw ? <Paper component="pre" variant="outlined" sx={{ p: 2, maxHeight: 520, overflow: 'auto', fontSize: 12, whiteSpace: 'pre-wrap' }}>{raw}</Paper> : <Button startIcon={<DownloadOutlined />} onClick={loadRaw}>Richiedi anteprima originale</Button>}</Box>}
@@ -159,6 +189,7 @@ export function DocumentDetailPage() {
       </Grid>
       <Grid size={{ xs: 12, lg: 4 }}>
         <Card><CardContent>
+          <ReceiptHeaderDetails document={doc} />
           <Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography>
           <StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />
           <ProvenanceValue

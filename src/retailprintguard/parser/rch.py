@@ -17,11 +17,12 @@ from retailprintguard.common.domain import (
     EvidenceLevel,
     NormalizedDocument,
     PaymentRecord,
+    ReceiptHeader,
     SourceSpan,
 )
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.5.0"
+PARSER_VERSION = "1.6.0"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -100,6 +101,36 @@ _INVOICE_NUMBER_RE = re.compile(
     r")\s*[:#-]?\s*(?P<value>(?=[A-Z0-9./-]*\d)[A-Z0-9][A-Z0-9./-]{0,63})\s*$",
     re.IGNORECASE,
 )
+_HEADER_BOUNDARY_RE = re.compile(
+    r"^\s*(?:DOCUMENTO\s+(?:GESTIONALE|COMMERCIALE)|"
+    r"REPORT\s+DI\s+FINE\s+TURNO|FATTURA(?:\s+ELETTRONICA)?|"
+    r"PRECONTO|COMANDA|DESCRIZIONE|TOTALE?|TOT\b|ORDINE\s*:|TAVOLO\s*:)",
+    re.IGNORECASE,
+)
+_HEADER_LEGAL_NAME_RE = re.compile(
+    r"\b(?:S\.?\s*R\.?\s*L\.?|S\.?\s*P\.?\s*A\.?|S\.?\s*A\.?\s*S\.?|"
+    r"S\.?\s*N\.?\s*C\.?|SOC(?:IETA|IETÀ)|COOPERATIVA)(?!\w)",
+    re.IGNORECASE,
+)
+_HEADER_ADDRESS_RE = re.compile(
+    r"^\s*(?:VIA|VIALE|PIAZZA|PIAZZALE|CORSO|LARGO|LOCALITA|LOCALITÀ|LOC\.?|"
+    r"STRADA|CONTRADA)\b|^\s*\d{5}\b",
+    re.IGNORECASE,
+)
+_HEADER_PHONE_RE = re.compile(
+    r"\b(?:TEL(?:EFONO)?|PHONE)\b\s*[:.]?\s*(?P<value>\+?[\d][\d ()/.-]{3,62})\s*$",
+    re.IGNORECASE,
+)
+_HEADER_TAX_CODE_RE = re.compile(
+    r"\bC\.?\s*F\.?(?!\w)\s*[:\-]?\s*(?P<value>[A-Z0-9]{8,32})\b",
+    re.IGNORECASE,
+)
+_HEADER_TAX_LABEL_RE = re.compile(r"\bC\.?\s*F\.?(?!\w)", re.IGNORECASE)
+_HEADER_VAT_RE = re.compile(
+    r"\bP\.?\s*(?:IVA|I\.?\s*V\.?\s*A\.?)\b\s*[:\-]?\s*"
+    r"(?P<value>[A-Z0-9]{8,32})\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +164,7 @@ class _Draft:
     start_offset: int
     lines: list[DocumentLine] = field(default_factory=list)
     texts: list[str] = field(default_factory=list)
+    text_sources: list[SourceSpan] = field(default_factory=list)
     item_code: str | None = None
     order_code: str | None = None
     table_code: str | None = None
@@ -173,6 +205,13 @@ class _PrintedRchIdentity:
     commercial_reference_code: str | None
     commercial_reference_code_evidence: str | None
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PrintedReceiptHeader:
+    value: ReceiptHeader | None
+    line_indexes: tuple[int, ...]
+    source_spans: tuple[SourceSpan, ...]
 
 
 def _bcc(prefix: bytes) -> int:
@@ -537,6 +576,120 @@ def _source(frame: Frame) -> SourceSpan:
     )
 
 
+def _append_visible_text(draft: _Draft, frame: Frame, text: str) -> None:
+    """Keep visible text and its immutable RAW span aligned."""
+
+    draft.texts.append(text)
+    draft.text_sources.append(_source(frame))
+
+
+def _printed_receipt_header(draft: _Draft) -> _PrintedReceiptHeader:
+    """Extract a bounded merchant heading only from observed leading text.
+
+    RCH devices often generate the fiscal header internally, in which case it
+    is absent from the request stream and this function returns ``None``.  A
+    generic first line is never enough: at least a tax identifier, or a
+    corroborated legal/address/contact pattern, is required before any heading
+    is promoted to structured evidence.
+    """
+
+    candidates: list[tuple[int, str]] = []
+    for line_index, line in enumerate(draft.texts[:12]):
+        value = " ".join(line.split())
+        if not value:
+            continue
+        if len(value) > 191:
+            break
+        if (
+            _HEADER_BOUNDARY_RE.match(value)
+            or _PRINTED_MONEY_RE.search(value)
+            or _PRINTED_TIMESTAMP_RE.search(value)
+            or _DOCUMENT_CODE_RE.search(value)
+        ):
+            break
+        candidates.append((line_index, value))
+
+    if not candidates:
+        return _PrintedReceiptHeader(None, (), ())
+
+    legal_candidates = [
+        (line_index, line)
+        for line_index, line in candidates
+        if _HEADER_LEGAL_NAME_RE.search(line)
+    ]
+    address_candidates = [
+        (line_index, line)
+        for line_index, line in candidates
+        if _HEADER_ADDRESS_RE.search(line)
+    ]
+    phone_candidates: list[tuple[int, str]] = []
+    tax_candidates: list[tuple[int, str]] = []
+    vat_candidates: list[tuple[int, str]] = []
+    for line_index, line in candidates:
+        if match := _HEADER_PHONE_RE.search(line):
+            phone_candidates.append((line_index, " ".join(match.group("value").split())))
+        tax_match = _HEADER_TAX_CODE_RE.search(line)
+        vat_match = _HEADER_VAT_RE.search(line)
+        if tax_match is not None:
+            tax_candidates.append((line_index, tax_match.group("value").upper()))
+        if vat_match is not None:
+            vat_value = vat_match.group("value").upper()
+            vat_candidates.append((line_index, vat_value))
+            if tax_match is None and _HEADER_TAX_LABEL_RE.search(line):
+                # Italian fiscal headers commonly print one identifier after
+                # the combined ``C.F. - P.IVA`` labels.  Both labels are
+                # directly observed, so retain the shared value for each
+                # structured field instead of leaving C.F. falsely absent.
+                tax_candidates.append((line_index, vat_value))
+
+    has_tax_identity = bool(tax_candidates or vat_candidates)
+    has_corroborated_layout = bool(
+        (phone_candidates and (legal_candidates or address_candidates))
+        or (legal_candidates and address_candidates)
+    )
+    if not has_tax_identity and not has_corroborated_layout:
+        return _PrintedReceiptHeader(None, (), ())
+
+    structured_indexes = {
+        line_index
+        for values in (
+            legal_candidates,
+            address_candidates,
+            phone_candidates,
+            tax_candidates,
+            vat_candidates,
+        )
+        for line_index, _ in values
+    }
+    merchant_candidate = next(
+        (
+            (line_index, line)
+            for line_index, line in candidates
+            if line_index not in structured_indexes
+        ),
+        None,
+    )
+    used_indexes = set(structured_indexes)
+    if merchant_candidate is not None:
+        used_indexes.add(merchant_candidate[0])
+    ordered_indexes = tuple(sorted(used_indexes))
+    source_spans = tuple(
+        draft.text_sources[line_index]
+        for line_index in ordered_indexes
+        if line_index < len(draft.text_sources)
+    )
+    header = ReceiptHeader(
+        merchant_name=merchant_candidate[1] if merchant_candidate is not None else None,
+        legal_name=legal_candidates[0][1] if legal_candidates else None,
+        address_lines=tuple(line for _, line in address_candidates[:8]),
+        phone=phone_candidates[0][1] if phone_candidates else None,
+        tax_code=tax_candidates[0][1] if tax_candidates else None,
+        vat_number=vat_candidates[0][1] if vat_candidates else None,
+        evidence="RCH_PRINTED_HEADER",
+    )
+    return _PrintedReceiptHeader(header, ordered_indexes, source_spans)
+
+
 def _append_management_line(draft: _Draft, frame: Frame, text: str) -> None:
     if len(draft.lines) >= _MAX_LINES:
         if "line_limit_exceeded" not in draft.warnings:
@@ -661,6 +814,15 @@ def _draft_document(
     timezone_name: str,
 ) -> NormalizedDocument:
     text = "\n".join(draft.texts).strip()
+    printed_header = _printed_receipt_header(draft)
+    header_frame_ids = {
+        source.frame_id for source in printed_header.source_spans if source.frame_id
+    }
+    economic_lines = tuple(
+        line
+        for line in draft.lines
+        if line.source is None or line.source.frame_id not in header_frame_ids
+    )
     printed_identity = _printed_rch_identity(
         draft,
         captured_at=captured_at,
@@ -769,6 +931,7 @@ def _draft_document(
         commercial_reference_code=draft.commercial_reference_code,
         order_code=draft.order_code,
         table_code=draft.table_code,
+        receipt_header=printed_header.value,
         application_timestamp=printed_identity.application_timestamp,
         rch_footer_timestamp=printed_identity.footer_timestamp,
         rch_serial_number=printed_identity.serial_number,
@@ -789,7 +952,7 @@ def _draft_document(
         source_path=source_path,
         complete=draft.complete,
         warnings=warnings,
-        lines=tuple(draft.lines),
+        lines=economic_lines,
         payments=payments,
         raw_metadata={
             "source_start_offset": draft.start_offset,
@@ -826,6 +989,15 @@ def _draft_document(
                 printed_identity.footer_timestamp_precision
             ),
             "rch_serial_number_evidence": printed_identity.serial_number_evidence,
+            "receipt_header_evidence": (
+                printed_header.value.evidence
+                if printed_header.value is not None
+                else None
+            ),
+            "receipt_header_line_indexes": list(printed_header.line_indexes),
+            "receipt_header_source_spans": [
+                source.model_dump(mode="json") for source in printed_header.source_spans
+            ],
             "rch_clock_offset_seconds": clock_offset_seconds,
             "progressive_observation_status": (
                 "FULL_CODE_OBSERVED_IN_CAPTURE"
@@ -1149,15 +1321,19 @@ def parse_rch(
         if active.kind == "management":
             if match := _MANAGEMENT_TEXT_RE.fullmatch(text):
                 visible = match.group("text")
-                active.texts.append(visible)
+                _append_visible_text(active, frame, visible)
                 _append_management_line(active, frame, visible)
             continue
         if match := _ITEM_RE.fullmatch(text):
             _append_commercial_item(active, frame, match)
-            active.texts.append(f"{match.group('description')} {_cents(match.group('amount')):.2f}")
+            _append_visible_text(
+                active,
+                frame,
+                f"{match.group('description')} {_cents(match.group('amount')):.2f}",
+            )
         elif match := _COMMERCIAL_TEXT_RE.fullmatch(text):
             visible = match.group("text")
-            active.texts.append(visible)
+            _append_visible_text(active, frame, visible)
             if order_match := _ORDER_RE.fullmatch(visible):
                 active.order_code = order_match.group("value") or None
             if table_match := _TABLE_RE.fullmatch(visible):
@@ -1165,7 +1341,7 @@ def parse_rch(
         elif match := _TOTAL_RE.fullmatch(text):
             active.total = _cents(match.group("amount"))
             active.total_code = match.group("code")
-            active.texts.append(f"TOTALE {active.total:.2f}")
+            _append_visible_text(active, frame, f"TOTALE {active.total:.2f}")
         elif re.fullmatch(r"<</\?\d", text) and active.total is not None:
             finish(complete=True)
     if active is not None:

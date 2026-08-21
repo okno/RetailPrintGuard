@@ -669,6 +669,8 @@ def test_mariadb_offline_migration_ddl_is_renderable(
     assert "FOREIGN KEY(duplicate_of_alert_id) REFERENCES fraud_alerts (id)" in ddl
     assert "ix_fraud_alerts_operational_status_opened" in ddl
     assert "ALTER TABLE document_versions ADD COLUMN document_type VARCHAR(48)" in ddl
+    assert "ALTER TABLE documents ADD COLUMN receipt_header JSON" in ddl
+    assert "ALTER TABLE document_versions ADD COLUMN receipt_header JSON" in ddl
     assert "UPDATE document_versions SET" in ddl
     assert "ix_document_versions_order_document" in ddl
     assert "ALTER TABLE document_lines ADD COLUMN course_code VARCHAR(64)" in ddl

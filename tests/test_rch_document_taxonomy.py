@@ -61,7 +61,7 @@ def test_shift_end_report_signature_wins_over_aggregate_invoice_row() -> None:
     assert document.type is DocumentType.SHIFT_END_REPORT
     assert document.subtype == "RCH_REPORT_FINE_TURNO_LITERAL"
     assert document.parse_confidence == 98
-    assert document.parser_version == PARSER_VERSION == "1.5.0"
+    assert document.parser_version == PARSER_VERSION == "1.6.0"
 
 
 def test_invoice_requires_a_strong_singular_document_signature() -> None:

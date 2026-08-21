@@ -81,6 +81,10 @@ separatamente ora applicativa RCH, ora footer RCH, scarto fra gli orologi,
 acquisizione server e seriale con provenienza. Un campo generato internamente
 dalla stampante ma assente dai byte catturati resta “Non osservato nel flusso”:
 non viene ricostruito dall’ora server o da contatori tecnici.
+L'intestazione RCH è mostrata come blocco strutturato nel dettaglio e come
+sintesi nella tabella. Web, TXT e PDF evitano di duplicarla quando è già
+osservata nel testo; un'intestazione configurata viene invece premessa e
+marcata sempre “configurata sul dispositivo, non osservata nel flusso”.
 Le colonne possono essere trascinate o spostate con i comandi accessibili; la
 preferenza resta nel browser e può essere ripristinata all’ordine predefinito.
 

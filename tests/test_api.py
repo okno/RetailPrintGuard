@@ -21,6 +21,7 @@ from retailprintguard.api.schemas import (
     DocumentView,
     JobReviewRequest,
     JobView,
+    ReceiptHeaderView,
     RoleName,
     RuleView,
     SearchHit,
@@ -103,10 +104,19 @@ class FakeRepository(EmptyRepository):
             job_id=self.job_id,
             type="PRE_BILL",
             subtype="PRECONTO",
+            receipt_header=ReceiptHeaderView(
+                merchant_name="LAB HOTEL",
+                legal_name="SYNTHETIC HOSPITALITY S.R.L.",
+                address_lines=["VIA DEL LABORATORIO 1"],
+                vat_number="00000000000",
+                evidence="RCH_PRINTED_HEADER",
+            ),
             captured_at=datetime.now(UTC),
             gross_total=Decimal("100.00"),
             status="COMPLETE",
-            normalized_text="PRECONTO SINTETICO",
+            normalized_text=(
+                "LAB HOTEL\nSYNTHETIC HOSPITALITY S.R.L.\nPRECONTO SINTETICO"
+            ),
             parser_name="synthetic",
             parser_version="1",
             confidence=100,
@@ -484,15 +494,30 @@ def test_raw_download_requires_auditor_and_is_audited() -> None:
 def test_document_derivatives_and_bidirectional_evidence_downloads() -> None:
     client, repository = _client()
     headers = _login(client)
-    assert (
-        client.get(f"/api/v1/documents/{repository.document_id}/txt", headers=headers).text
-        == "PRECONTO SINTETICO"
+    text_response = client.get(
+        f"/api/v1/documents/{repository.document_id}/txt", headers=headers
     )
+    assert text_response.status_code == 200
+    assert text_response.text.count("LAB HOTEL") == 1
+    assert "Insegna: LAB HOTEL" not in text_response.text
+    assert "PROVENIENZA INTESTAZIONE\nOsservata" in text_response.text
+    assert "TESTO DOCUMENTO\nLAB HOTEL" in text_response.text
+    assert "PRECONTO SINTETICO" in text_response.text
     json_response = client.get(
         f"/api/v1/documents/{repository.document_id}/json", headers=headers
     )
     assert json_response.status_code == 200
     assert json_response.json()["id"] == str(repository.document_id)
+    assert json_response.json()["receipt_header"] == {
+        "schema_version": 1,
+        "merchant_name": "LAB HOTEL",
+        "legal_name": "SYNTHETIC HOSPITALITY S.R.L.",
+        "address_lines": ["VIA DEL LABORATORIO 1"],
+        "phone": None,
+        "tax_code": None,
+        "vat_number": "00000000000",
+        "evidence": "RCH_PRINTED_HEADER",
+    }
     pdf_response = client.get(
         f"/api/v1/documents/{repository.document_id}/pdf", headers=headers
     )

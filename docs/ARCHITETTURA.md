@@ -126,7 +126,7 @@ righe, importi, pagamenti, confidenza, warning e span nel payload. Ogni nuova
 elaborazione crea una `document_version`.
 
 I parser nativi `retailprintguard-escpos` `1.3.0` e
-`retailprintguard-rch-observed` `1.5.0` operano nel control plane:
+`retailprintguard-rch-observed` `1.6.0` operano nel control plane:
 ricevono byte e metadati già acquisiti e restituiscono documenti immutabili.
 I decoder non aprono socket, non modificano lo spool e non importano il relay.
 La segmentazione applicativa avviene sul flusso ricostruito, mai sui confini

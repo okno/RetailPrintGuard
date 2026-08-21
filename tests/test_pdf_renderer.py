@@ -10,6 +10,7 @@ from retailprintguard.api.schemas import (
     DocumentLineView,
     DocumentView,
     LinePriceAttributionView,
+    ReceiptHeaderView,
 )
 from retailprintguard.render.pdf import (
     PDF_RENDERER_VERSION,
@@ -33,6 +34,15 @@ def _document() -> DocumentView:
         external_code="LAB-0001",
         order_code="ORDER-LAB",
         table_code="TABLE-LAB",
+        receipt_header=ReceiptHeaderView(
+            merchant_name="LAB HOTEL",
+            legal_name="SYNTHETIC HOSPITALITY S.R.L.",
+            address_lines=["VIA DEL LABORATORIO 1", "00000 CITTA' TEST"],
+            phone="0000000000",
+            tax_code="SYNTHETIC01",
+            vat_number="00000000000",
+            evidence="RCH_PRINTED_HEADER",
+        ),
         document_timestamp=datetime(2042, 5, 6, 10, 13, tzinfo=UTC),
         document_timestamp_precision="MINUTE",
         document_timestamp_evidence="RCH_APPLICATION_PRINTED_TEXT",
@@ -83,7 +93,7 @@ def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> N
     compact_text = " ".join(text.split())
     assert "Documento: 9901-0043" in text
     assert "Suffisso progressivo RCH: 0043" in text
-    assert "progressivo completo osservato nel flusso" in text
+    assert "progressivo completo osservato nel flusso" in compact_text
     assert "Rif. commerciale: 9901-0042" in text
     assert "Ora applicativa RCH: 06/05/2042 12:13" in compact_text
     assert "Acquisizione server: 06/05/2042 12:11:12" in compact_text
@@ -91,6 +101,10 @@ def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> N
     assert "-120 s (footer RCH indietro di 2 min" in compact_text
     assert "Seriale RCH: 99SYN123456" in compact_text
     assert "prefisso RT stampato dalla RCH" in compact_text
+    assert "INTESTAZIONE DOCUMENTO" in text
+    assert "Insegna: LAB HOTEL" in text
+    assert "Partita IVA: 00000000000" in text
+    assert "Osservata nel blocco iniziale stampato dalla RCH" in compact_text
 
     suffix_only = _document().model_copy(
         update={
@@ -105,10 +119,11 @@ def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> N
         }
     )
     suffix_text = "\n".join(line.text for line in _document_lines(suffix_only))
+    suffix_compact_text = " ".join(suffix_text.split())
     assert "Suffisso progressivo RCH: 0042" in suffix_text
-    assert "non e' un codice completo" in suffix_text
+    assert "non e' un codice completo" in suffix_compact_text
     assert "Documento risolto: 9901-0042 (da riferimento gestionale correlato)" in (
-        suffix_text
+        suffix_compact_text
     )
 
     own_not_observed = suffix_only.model_copy(
@@ -120,7 +135,9 @@ def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> N
     unavailable_text = "\n".join(
         line.text for line in _document_lines(own_not_observed)
     )
-    assert "progressivo proprio generato dalla RCH" in unavailable_text
+    assert "progressivo proprio generato dalla RCH" in " ".join(
+        unavailable_text.split()
+    )
 
     wire_identity_not_observed = own_not_observed.model_copy(
         update={
@@ -151,6 +168,55 @@ def test_receipt_pdf_is_deterministic_bounded_and_identifies_the_renderer() -> N
     assert first.endswith(b"%%EOF\n")
     assert 1_000 < len(first) < 100_000
     assert PDF_RENDERER_VERSION.encode() in first
+
+
+def test_pdf_header_provenance_and_document_type_titles_are_explicit() -> None:
+    configured = _document().model_copy(
+        update={
+            "receipt_header": ReceiptHeaderView(
+                merchant_name="LAB CONFIGURATO",
+                address_lines=[],
+                evidence="DEVICE_METADATA_CONFIGURED",
+            )
+        }
+    )
+    configured_text = " ".join(line.text for line in _document_lines(configured))
+    assert "Configurata sul dispositivo (non osservata nel flusso)" in configured_text
+    assert "Osservata nel blocco iniziale" not in configured_text
+    assert configured_text.count("INTESTAZIONE DOCUMENTO") == 1
+
+    missing = _document().model_copy(update={"receipt_header": None})
+    missing_text = " ".join(line.text for line in _document_lines(missing))
+    assert (
+        "Provenienza intestazione: Non osservata nel flusso e non configurata"
+        in missing_text
+    )
+
+    observed_unstructured = _document().model_copy(
+        update={
+            "lines": [],
+            "normalized_text": (
+                "LAB HOTEL\nSYNTHETIC HOSPITALITY S.R.L.\n"
+                "Articolo sintetico  5,00"
+            ),
+            "receipt_text": None,
+        }
+    )
+    observed_text = "\n".join(
+        line.text for line in _document_lines(observed_unstructured)
+    )
+    assert observed_text.count("LAB HOTEL") == 1
+    assert "Insegna: LAB HOTEL" not in observed_text
+    assert "Provenienza intestazione: Osservata" in observed_text
+
+    shift_report = configured.model_copy(
+        update={"type": "SHIFT_END_REPORT", "subtype": "RCH_REPORT_FINE_TURNO_LITERAL"}
+    )
+    invoice = configured.model_copy(
+        update={"type": "INVOICE", "subtype": "RCH_INVOICE_STRONG_LITERAL"}
+    )
+    assert _document_lines(shift_report)[0].text == "REPORT DI FINE TURNO"
+    assert _document_lines(invoice)[0].text == "FATTURA"
 
 
 def _kitchen_document() -> DocumentView:

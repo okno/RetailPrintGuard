@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -121,6 +121,66 @@ class PaymentRecord(BaseModel):
     evidence: EvidenceLevel = EvidenceLevel.UNKNOWN
 
 
+class ReceiptHeader(BaseModel):
+    """Versioned merchant heading observed on, or configured for, an RCH print.
+
+    The parser only creates ``RCH_PRINTED_HEADER`` values from text present in
+    the captured stream.  ``DEVICE_METADATA_CONFIGURED`` is reserved for the
+    API read-model fallback and must never be presented as captured evidence.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    merchant_name: Annotated[str, Field(min_length=1, max_length=191)] | None = None
+    legal_name: Annotated[str, Field(min_length=1, max_length=191)] | None = None
+    address_lines: tuple[
+        Annotated[str, Field(min_length=1, max_length=191)], ...
+    ] = Field(default=(), max_length=8)
+    phone: Annotated[str, Field(min_length=1, max_length=64)] | None = None
+    tax_code: Annotated[str, Field(min_length=1, max_length=32)] | None = None
+    vat_number: Annotated[str, Field(min_length=1, max_length=32)] | None = None
+    evidence: Literal["RCH_PRINTED_HEADER", "DEVICE_METADATA_CONFIGURED"]
+
+    @field_validator(
+        "merchant_name",
+        "legal_name",
+        "phone",
+        "tax_code",
+        "vat_number",
+        mode="before",
+    )
+    @classmethod
+    def strip_optional_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("address_lines", mode="before")
+    @classmethod
+    def normalize_address_lines(cls, value: Any) -> Any:
+        if value is None:
+            return ()
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("address_lines must be a list or tuple")
+        return tuple(line.strip() if isinstance(line, str) else line for line in value)
+
+    @model_validator(mode="after")
+    def at_least_one_observed_field(self) -> ReceiptHeader:
+        if not any(
+            (
+                self.merchant_name,
+                self.legal_name,
+                self.address_lines,
+                self.phone,
+                self.tax_code,
+                self.vat_number,
+            )
+        ):
+            raise ValueError("receipt header must contain at least one field")
+        return self
+
+
 class NormalizedDocument(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -143,6 +203,7 @@ class NormalizedDocument(BaseModel):
     table_code: str | None = None
     operator_code: str | None = None
     terminal_code: str | None = None
+    receipt_header: ReceiptHeader | None = None
     # Keep the application-authored business time separate from the fiscal
     # printer clock.  On RCH output both can be visible on the same document
     # and a clock skew must remain auditable rather than being silently

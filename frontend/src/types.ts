@@ -130,6 +130,21 @@ export interface DocumentLine {
   }>
 }
 
+export type ReceiptHeaderEvidence =
+  | 'RCH_PRINTED_HEADER'
+  | 'DEVICE_METADATA_CONFIGURED'
+
+export interface ReceiptHeaderRecord {
+  schema_version: 1
+  merchant_name?: string | null
+  legal_name?: string | null
+  address_lines: string[]
+  phone?: string | null
+  tax_code?: string | null
+  vat_number?: string | null
+  evidence: ReceiptHeaderEvidence
+}
+
 export interface DocumentRecord {
   id: string
   device_id: string
@@ -169,6 +184,8 @@ export interface DocumentRecord {
   status: string
   normalized_text: string
   receipt_text?: string
+  /** Structured header projection; absent during rolling upgrades of the API. */
+  receipt_header?: ReceiptHeaderRecord | null
   parser_name: string
   parser_version: string
   confidence: number

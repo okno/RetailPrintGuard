@@ -5,6 +5,29 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.4.8] — 2026-08-21
+
+### Added
+
+- intestazione RCH strutturata e versionata con insegna, ragione sociale,
+  indirizzo, telefono, codice fiscale e partita IVA, disponibile nel dettaglio
+  Web, nella tabella Documenti e nei derivati TXT, JSON e PDF;
+- provenienza esplicita `RCH_PRINTED_HEADER` per i valori realmente osservati
+  nel flusso e `DEVICE_METADATA_CONFIGURED` per il fallback amministrativo del
+  dispositivo quando l'intestazione viene generata internamente dalla RCH.
+
+### Changed
+
+- parser RCH `1.6.0` e renderer PDF `1.4.0`; le righe dell'intestazione restano
+  nel testo normalizzato e negli span RAW, ma non diventano righe economiche;
+- l'intestazione segue la versione parser attiva e il rollback interpretativo,
+  senza sovrascrivere le versioni precedenti né alterare il RAW.
+
+### Fixed
+
+- i derivati leggibili non duplicano un'intestazione già osservata nel corpo;
+  il PDF manda a capo anche i metadati lunghi invece di tagliarli.
+
 ## [0.4.7] — 2026-08-21
 
 ### Added

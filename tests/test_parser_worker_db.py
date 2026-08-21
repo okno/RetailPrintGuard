@@ -8,7 +8,7 @@ from uuid import uuid4
 from sqlalchemy import func, select
 
 from retailprintguard.common.domain import DocumentLine as DomainLine
-from retailprintguard.common.domain import DocumentType
+from retailprintguard.common.domain import DocumentType, ReceiptHeader
 from retailprintguard.correlation.worker import load_latest_documents
 from retailprintguard.db import Base, create_db_engine, session_factory
 from retailprintguard.db.models import (
@@ -250,6 +250,13 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
                 "table_code": "TABLE-V2",
                 "operator_code": "OP-V2",
                 "terminal_code": "TERM-V2",
+                "receipt_header": ReceiptHeader(
+                    merchant_name="SYNTHETIC HOTEL",
+                    legal_name="EXAMPLE LABS S.R.L.",
+                    address_lines=("VIA ESEMPIO 4",),
+                    vat_number="SYNTHVAT01",
+                    evidence="RCH_PRINTED_HEADER",
+                ),
                 "application_timestamp": NOW,
                 "rch_footer_timestamp": NOW - timedelta(minutes=2),
                 "rch_serial_number": "99LAB123456",
@@ -288,6 +295,16 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         assert versions[1].table_code == "TABLE-V2"
         assert versions[1].operator_code == "OP-V2"
         assert versions[1].terminal_code == "TERM-V2"
+        assert versions[1].receipt_header == {
+            "schema_version": 1,
+            "merchant_name": "SYNTHETIC HOTEL",
+            "legal_name": "EXAMPLE LABS S.R.L.",
+            "address_lines": ["VIA ESEMPIO 4"],
+            "phone": None,
+            "tax_code": None,
+            "vat_number": "SYNTHVAT01",
+            "evidence": "RCH_PRINTED_HEADER",
+        }
         assert versions[1].application_timestamp == NOW
         assert versions[1].rch_footer_timestamp == NOW - timedelta(minutes=2)
         assert versions[1].rch_serial_number == "99LAB123456"
@@ -298,6 +315,7 @@ def test_reparse_appends_version_to_stable_document_identity() -> None:
         assert projection.external_document_code_suffix == "0042"
         assert projection.commercial_reference_code == "FISCAL-V1"
         assert projection.table_code == "TABLE-V2"
+        assert projection.receipt_header == versions[1].receipt_header
         assert projection.application_timestamp == NOW
         assert projection.rch_footer_timestamp == NOW - timedelta(minutes=2)
         assert projection.rch_serial_number == "99LAB123456"

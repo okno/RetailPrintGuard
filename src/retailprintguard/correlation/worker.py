@@ -85,6 +85,7 @@ _VERSION_SEMANTIC_FIELDS = (
     "table_code",
     "operator_code",
     "terminal_code",
+    "receipt_header",
     "application_timestamp",
     "rch_footer_timestamp",
     "rch_serial_number",
@@ -470,6 +471,9 @@ def load_latest_documents(
             table_code=_versioned_semantic(version, document, "table_code"),
             operator_code=_versioned_semantic(version, document, "operator_code"),
             terminal_code=_versioned_semantic(version, document, "terminal_code"),
+            receipt_header=_versioned_semantic(
+                version, document, "receipt_header"
+            ),
             application_timestamp=_versioned_semantic(
                 version, document, "application_timestamp"
             ),

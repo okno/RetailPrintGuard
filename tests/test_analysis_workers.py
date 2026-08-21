@@ -2110,6 +2110,16 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         # A nullable field in the selected immutable version is meaningful: it
         # must not inherit the value later written to the mutable projection.
         first.order_code = None
+        first.receipt_header = {
+            "schema_version": 1,
+            "merchant_name": "SYNTHETIC HEADER V1",
+            "legal_name": None,
+            "address_lines": [],
+            "phone": None,
+            "tax_code": None,
+            "vat_number": "SYNTHVAT01",
+            "evidence": "RCH_PRINTED_HEADER",
+        }
         session.add(
             DocumentVersion(
                 document_id=document_id,
@@ -2123,6 +2133,16 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
                 table_code="TABLE-V2",
                 operator_code="OP-V2",
                 terminal_code="TERM-V2",
+                receipt_header={
+                    "schema_version": 1,
+                    "merchant_name": "SYNTHETIC HEADER V2",
+                    "legal_name": None,
+                    "address_lines": [],
+                    "phone": None,
+                    "tax_code": None,
+                    "vat_number": "SYNTHVAT02",
+                    "evidence": "RCH_PRINTED_HEADER",
+                },
                 document_timestamp=NOW + timedelta(seconds=30),
                 gross_total=Decimal("1.00"),
                 status="COMPLETE",
@@ -2148,6 +2168,16 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         projected.table_code = "TABLE-V2"
         projected.operator_code = "OP-V2"
         projected.terminal_code = "TERM-V2"
+        projected.receipt_header = {
+            "schema_version": 1,
+            "merchant_name": "MUTABLE PROJECTION",
+            "legal_name": None,
+            "address_lines": [],
+            "phone": None,
+            "tax_code": None,
+            "vat_number": "PROJECTION01",
+            "evidence": "RCH_PRINTED_HEADER",
+        }
         projected.document_timestamp = NOW + timedelta(seconds=30)
     with factory() as session:
         loaded = load_latest_documents(session, document_ids={document_id})
@@ -2157,6 +2187,8 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         assert loaded[0].value.type.value == "ORDER_CHANGE"
         assert loaded[0].value.table_code == "TABLE-V2"
         assert loaded[0].value.operator_code == "OP-V2"
+        assert loaded[0].value.receipt_header is not None
+        assert loaded[0].value.receipt_header.merchant_name == "SYNTHETIC HEADER V2"
     with factory.begin() as session:
         session.add(
             AnalysisWatermark(
@@ -2195,6 +2227,8 @@ def test_active_parser_pointer_honours_rollback_instead_of_latest_sequence() -> 
         assert loaded[0].value.order_code is None
         assert loaded[0].value.table_code == "LAB-25"
         assert loaded[0].value.operator_code == "OP-1"
+        assert loaded[0].value.receipt_header is not None
+        assert loaded[0].value.receipt_header.merchant_name == "SYNTHETIC HEADER V1"
     engine.dispose()
 
 

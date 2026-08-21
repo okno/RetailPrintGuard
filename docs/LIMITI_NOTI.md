@@ -20,6 +20,11 @@ Stato verificato sul worktree del 13 agosto 2026.
 - L'OCR ESC/POS è un derivato inferenziale: una lettura del tavolo sotto soglia,
   conflittuale o non disponibile resta vuota/warning. Non sostituisce il RAW,
   la fotografia autorizzata o un identificativo testuale esplicito.
+- L'intestazione fisica può essere generata internamente dalla RCH e quindi non
+  comparire nei byte catturati. In tal caso la WebUI può usare soltanto il
+  metadato amministrativo del dispositivo, dichiarato esplicitamente come
+  configurato e non osservato; fotografia e configurazione non diventano prova
+  del contenuto del flusso.
 - Il backfill della migrazione semantica non può ricostruire differenze tra
   vecchie versioni che in precedenza non memorizzavano tipo/tavolo/operatore:
   copia la proiezione legacy disponibile senza modificare hash o RAW.
