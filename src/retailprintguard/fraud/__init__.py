@@ -2,6 +2,7 @@
 
 from retailprintguard.fraud.engine import (
     DEFAULT_RULES,
+    AuthorizedEmployeeDiscount,
     FraudContext,
     FraudEngine,
     FraudEvaluation,
@@ -10,12 +11,14 @@ from retailprintguard.fraud.engine import (
     SuppressedFinding,
     WhitelistEntry,
     WhitelistScope,
+    authorized_employee_discount,
     finding_chain_record,
     finding_fingerprint,
     whitelist_entry_key,
 )
 
 __all__ = [
+    "AuthorizedEmployeeDiscount",
     "DEFAULT_RULES",
     "FraudContext",
     "FraudEngine",
@@ -25,6 +28,7 @@ __all__ = [
     "SuppressedFinding",
     "WhitelistEntry",
     "WhitelistScope",
+    "authorized_employee_discount",
     "finding_chain_record",
     "finding_fingerprint",
     "whitelist_entry_key",

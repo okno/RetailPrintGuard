@@ -25,4 +25,12 @@ describe('RCH identity presentation', () => {
     )
     expect(rchSerialEvidenceLabel('RCH_PRINTED_RT_PREFIX')).toContain('prefisso RT stampato')
   })
+
+  it('keeps fiscal-memory provenance distinct from captured wire evidence', () => {
+    expect(rchTimestampEvidenceLabel('RCH_DGFE_EXPORT')).toContain('export DGFE')
+    expect(rchSerialEvidenceLabel('RCH_DGFE_EXPORT')).toContain('Matricola RT estratta')
+    expect(rchTimestampEvidenceLabel('RCH_FISCAL_SUMMARY_EXPORT')).toContain(
+      'memoria fiscale riepilogo',
+    )
+  })
 })

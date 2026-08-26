@@ -13,6 +13,7 @@ from retailprintguard.common.domain import (
     OrderEvent,
     OrderEventType,
     PaymentRecord,
+    SourceSpan,
 )
 from retailprintguard.common.hashchain import verify_chain
 from retailprintguard.correlation import (
@@ -28,6 +29,7 @@ from retailprintguard.fraud import (
     FraudEngine,
     WhitelistEntry,
     WhitelistScope,
+    authorized_employee_discount,
     finding_chain_record,
 )
 
@@ -446,6 +448,412 @@ def test_total_line_mismatch_accepts_observed_global_discount_and_adjustment() -
             )
         }
         assert "TOTAL_LINE_MISMATCH" not in codes
+
+
+def test_exact_printed_employee_discount_is_excluded_but_unrelated_alert_remains() -> None:
+    prebill = _document(
+        "employee-discount-prebill",
+        DocumentType.PRE_BILL,
+        "100.00",
+        (_line(1, "MEAL", "100.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-EMPLOYEE",
+    )
+    fiscal = _document(
+        "employee-discount-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "70.00",
+        (_line(1, "MEAL", "100.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-EMPLOYEE",
+        # Deliberately inconsistent payment: authorization must cover only the
+        # employee discount, never unrelated antifraud conditions.
+        payments=(PaymentRecord(method="CONTANTI", amount=Decimal("69.00")),),
+    ).model_copy(
+        update={
+            "parser_name": "retailprintguard-rch-observed",
+            "parse_confidence": 90,
+            "evidence": EvidenceLevel.INFERRED,
+            "normalized_text": (
+                "Pasto 100,00\n"
+                "SCONTO DIPENDENTI 30% [-30%] -30,00\n"
+                "TOTALE 70,00"
+            ),
+            "raw_metadata": {
+                "semantic_evidence": "INFERRED_FROM_CAPTURE",
+                "source_start_offset": 120,
+                "source_end_offset": 360,
+            },
+        }
+    )
+    transaction = CorrelationEngine().correlate((prebill, fiscal))[0]
+
+    authorization = authorized_employee_discount(transaction)
+    assert authorization is not None
+    assert authorization.gross_basis == Decimal("100.00")
+    assert authorization.discounted_basis == Decimal("100.00")
+    assert authorization.discount_amount == Decimal("30.00")
+    assert authorization.final_amount == Decimal("70.00")
+    assert authorization.observations[0]["provenance"] == (
+        "RCH_CAPTURED_PRINT_LITERAL"
+    )
+    assert authorization.observations[0]["label"] == (
+        "SCONTO DIPENDENTI 30% [-30%]"
+    )
+
+    codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(
+                transaction=transaction,
+                evaluated_at=BASE_TIME + timedelta(hours=1),
+            )
+        )
+    }
+    assert "MODIFICA_POST_PRECONTO" not in codes
+    assert "PREBILL_FISCAL_AMOUNT_DROP" not in codes
+    assert "PAYMENT_TOTAL_MISMATCH" in codes
+
+
+def test_exact_dgfe_line_modifier_proves_authorized_employee_discount() -> None:
+    prebill = _document(
+        "dgfe-employee-prebill",
+        DocumentType.PRE_BILL,
+        "10.00",
+        (_line(1, "MEAL", "10.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-DGFE-EMPLOYEE",
+    )
+    dgfe_line = _line(1, "MEAL", "10.00").model_copy(
+        update={"discount": Decimal("3.00")}
+    )
+    fiscal = _document(
+        "dgfe-employee-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "7.00",
+        (dgfe_line,),
+        minute=1,
+        device="rch_1",
+        external_code="0001-0007",
+        payments=(PaymentRecord(method="PC", amount=Decimal("7.00")),),
+    ).model_copy(
+        update={
+            "parser_name": "rch.xtools.dgfe.v1",
+            "subtype": "RCH_DGFE_VENDITA",
+            "raw_metadata": {
+                "provenance": "RCH_DGFE_EXPORT",
+                "source_export_kind": "DGFE_DETAIL",
+                "xml_path": "synthetic/Vendita[1]",
+                "fiscal_identity": {
+                    "matricola_rt": "99XX0000001",
+                    "numero_azzeramento": 1,
+                    "numero_documento": 7,
+                    "kind": "Vendita",
+                },
+                "subtotal_modifiers": [],
+                "lines": [
+                    {
+                        "sequence": 1,
+                        "description": "Articolo MEAL",
+                        "line_total": "10.00",
+                        "modifiers": [
+                            {
+                                "amount": "3.00",
+                                "sign": "-",
+                                "description": "Sconto",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+    )
+    transaction = CorrelationEngine().correlate((prebill, fiscal))[0]
+
+    authorization = authorized_employee_discount(transaction)
+    assert authorization is not None
+    assert authorization.discount_amount == Decimal("3.00")
+    assert authorization.observations[0]["provenance"] == "RCH_DGFE_EXPORT"
+    assert not FraudEngine().evaluate(
+        FraudContext(
+            transaction=transaction,
+            evaluated_at=BASE_TIME + timedelta(hours=1),
+        )
+    )
+
+
+def test_employee_discount_recognition_fails_closed_for_non_exact_or_price_change() -> None:
+    prebill = _document(
+        "employee-fail-prebill",
+        DocumentType.PRE_BILL,
+        "100.00",
+        (_line(1, "MEAL", "100.00"),),
+        minute=0,
+        device="pos_1",
+        external_code="PB-EMPLOYEE-FAIL",
+    )
+    exact = _document(
+        "employee-fail-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "70.00",
+        (_line(1, "MEAL", "100.00"),),
+        minute=1,
+        device="rch_1",
+        external_code="DC-EMPLOYEE-FAIL",
+        payments=(PaymentRecord(method="CONTANTI", amount=Decimal("70.00")),),
+    ).model_copy(
+        update={
+            "parser_name": "retailprintguard-rch-observed",
+            "parse_confidence": 90,
+            "evidence": EvidenceLevel.INFERRED,
+            "normalized_text": "Pasto 100,00\nSconto 30% -30,00\nTOTALE 70,00",
+            "raw_metadata": {
+                "semantic_evidence": "INFERRED_FROM_CAPTURE",
+                "source_start_offset": 10,
+                "source_end_offset": 90,
+            },
+        }
+    )
+    wrong_rate = exact.model_copy(
+        update={
+            "id": _id("employee-wrong-rate"),
+            "source_job_id": "job-employee-wrong-rate",
+            "normalized_text": "Pasto 100,00\nSconto 29% -30,00\nTOTALE 70,00",
+        }
+    )
+    price_changed = exact.model_copy(
+        update={
+            "id": _id("employee-price-changed"),
+            "source_job_id": "job-employee-price-changed",
+            "lines": (
+                _line(1, "MEAL", "70.00").model_copy(
+                    update={"line_total": Decimal("100.00")}
+                ),
+            ),
+        }
+    )
+
+    for fiscal in (wrong_rate, price_changed):
+        transaction = CorrelationEngine().correlate((prebill, fiscal))[0]
+        assert authorized_employee_discount(transaction) is None
+        assert "MODIFICA_POST_PRECONTO" in {
+            finding.rule_code
+            for finding in FraudEngine().evaluate(
+                FraudContext(
+                    transaction=transaction,
+                    evaluated_at=BASE_TIME + timedelta(hours=1),
+                )
+            )
+        }
+
+
+def _management_discount_line(
+    sequence: int,
+    description: str,
+    amount: str,
+) -> DocumentLine:
+    value = Decimal(amount)
+    printed = f"{description} {value:.2f}".replace(".", ",")
+    return DocumentLine(
+        sequence=sequence,
+        description=description,
+        quantity=Decimal("1"),
+        unit_price=value,
+        line_total=value,
+        raw_text=printed,
+        source=SourceSpan(
+            direction="request",
+            offset=sequence * 100,
+            length=len(printed),
+            frame_id=str(sequence),
+        ),
+    )
+
+
+def _partial_employee_discount_documents(
+    *,
+    suffix_evidence: bool = True,
+    fiscal_total: str = "153.10",
+    copy_total: str = "153.10",
+    first_discount: str = "-30.00",
+    table_code: str | None = "T-7",
+) -> tuple[NormalizedDocument, NormalizedDocument, NormalizedDocument]:
+    base_lines = (
+        DocumentLine(
+            sequence=1,
+            item_code="A",
+            description="Articolo A",
+            quantity=Decimal("1"),
+            unit_price=Decimal("100.00"),
+            line_total=Decimal("100.00"),
+        ),
+        DocumentLine(
+            sequence=2,
+            item_code="B",
+            description="Articolo B",
+            quantity=Decimal("1"),
+            unit_price=Decimal("93.00"),
+            line_total=Decimal("93.00"),
+        ),
+        DocumentLine(
+            sequence=3,
+            item_code="C",
+            description="Articolo C",
+            quantity=Decimal("1"),
+            unit_price=Decimal("18.00"),
+            line_total=Decimal("18.00"),
+        ),
+    )
+    prebill = _document(
+        "partial-employee-prebill",
+        DocumentType.PRE_BILL,
+        "211.00",
+        base_lines,
+        minute=0,
+        device="pos_1",
+        external_code="PB-PARTIAL-EMPLOYEE",
+    )
+    fiscal = _document(
+        "partial-employee-fiscal",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        fiscal_total,
+        base_lines,
+        minute=1,
+        device="rch_1",
+        external_code=None,
+        external_code_suffix="0002",
+        payments=(
+            PaymentRecord(method="CONTANTI", amount=Decimal(fiscal_total)),
+        ),
+    ).model_copy(
+        update={
+            "external_document_code": None,
+            "table_code": table_code,
+            "raw_metadata": {
+                **(
+                    {
+                        "external_document_code_suffix_evidence": (
+                            "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+                        )
+                    }
+                    if suffix_evidence
+                    else {}
+                )
+            },
+        }
+    )
+    copy_lines = (
+        _management_discount_line(1, "Articolo A", "100.00"),
+        _management_discount_line(
+            2,
+            "SCONTO DIPENDENTI 30% [-30%]",
+            first_discount,
+        ),
+        _management_discount_line(3, "Articolo B", "93.00"),
+        _management_discount_line(
+            4,
+            "SCONTO DIPENDENTI 30% [-30%]",
+            "-27.90",
+        ),
+        _management_discount_line(5, "Articolo C", "18.00"),
+        _management_discount_line(6, "TOT", copy_total),
+    )
+    management = _document(
+        "partial-employee-management-copy",
+        DocumentType.MANAGEMENT_DOCUMENT,
+        copy_total,
+        copy_lines,
+        minute=2,
+        device="rch_1",
+        external_code="MGMT-0046",
+        commercial_reference_code="LAB9-0002",
+    ).model_copy(
+        update={
+            "parser_name": "retailprintguard-rch-observed",
+            "table_code": table_code,
+            "parse_confidence": 90,
+            "evidence": EvidenceLevel.INFERRED,
+            "normalized_text": "\n".join(line.raw_text or "" for line in copy_lines),
+            "raw_metadata": {
+                "semantic_evidence": "INFERRED_FROM_CAPTURE",
+                "source_start_offset": 100,
+                "source_end_offset": 700,
+                "commercial_reference_code_evidence": (
+                    "RCH_PRINTED_UNQUALIFIED_DOCUMENT_NUMBER"
+                ),
+            },
+        }
+    )
+    return prebill, fiscal, management
+
+
+def test_partial_item_employee_discount_is_proven_by_strong_management_copy() -> None:
+    prebill, fiscal, management = _partial_employee_discount_documents()
+    transaction = CorrelationEngine().correlate((management, fiscal, prebill))[0]
+
+    authorization = authorized_employee_discount(transaction)
+    assert authorization is not None
+    assert authorization.gross_basis == Decimal("211.00")
+    assert authorization.discounted_basis == Decimal("193.00")
+    assert authorization.discount_amount == Decimal("57.90")
+    assert authorization.final_amount == Decimal("153.10")
+    assert management.id in authorization.document_ids
+    assert fiscal.id in authorization.document_ids
+    assert {item["paired_item_sequence"] for item in authorization.observations} == {
+        1,
+        3,
+    }
+
+
+def test_partial_employee_discount_accepts_live_identity_with_both_tables_absent() -> None:
+    prebill, fiscal, management = _partial_employee_discount_documents(
+        table_code=None
+    )
+    transaction = CorrelationEngine().correlate((management, fiscal, prebill))[0]
+
+    authorization = authorized_employee_discount(transaction)
+    assert authorization is not None
+    assert authorization.discounted_basis == Decimal("193.00")
+    assert authorization.discount_amount == Decimal("57.90")
+    assert authorization.observations[0]["fiscal_identity_resolution"] == (
+        "SEQUENCE_CONFIRMED_SUFFIX"
+    )
+    assert not {
+        "MODIFICA_POST_PRECONTO",
+        "NEGATIVE_OR_ZERO_VALUE_ITEM",
+        "TOTAL_LINE_MISMATCH",
+    } & {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(
+                transaction=transaction,
+                evaluated_at=BASE_TIME + timedelta(hours=1),
+            )
+        )
+    }
+
+
+def test_management_employee_discount_fails_closed_without_pair_or_strong_identity() -> None:
+    cases = (
+        _partial_employee_discount_documents(first_discount="-29.99"),
+        _partial_employee_discount_documents(suffix_evidence=False),
+        _partial_employee_discount_documents(fiscal_total="152.00"),
+    )
+    for prebill, fiscal, management in cases:
+        transaction = CorrelationEngine().correlate((management, fiscal, prebill))[0]
+        assert authorized_employee_discount(transaction) is None
+        assert "MODIFICA_POST_PRECONTO" in {
+            finding.rule_code
+            for finding in FraudEngine().evaluate(
+                FraudContext(
+                    transaction=transaction,
+                    evaluated_at=BASE_TIME + timedelta(hours=1),
+                )
+            )
+        }
 
 
 def test_scenario_b_split_100_into_two_50_has_no_amount_drop_false_positive() -> None:

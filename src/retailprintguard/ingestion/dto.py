@@ -16,6 +16,8 @@ class SourceKind(StrEnum):
     COMMERCIAL_RCH_CAPTURE_V1 = "commercialrchproxy.capture.v1"
     COMMERCIAL_RCH_PARSED_V1 = "commercialrchproxy.pharsed.v1"
     PRINTPROXY_V3 = "printproxy.archive.v3"
+    RCH_XTOOLS_DGFE_V1 = "rch.xtools.dgfe.v1"
+    RCH_XTOOLS_FISCAL_SUMMARY_V1 = "rch.xtools.fiscal_summary.v1"
 
 
 class ArtifactRole(StrEnum):
@@ -35,6 +37,8 @@ class ArtifactRole(StrEnum):
     INTEGRITY_LEDGER_RECORD = "INTEGRITY_LEDGER_RECORD"
     INTEGRITY_LEDGER_LATEST_RECORD = "INTEGRITY_LEDGER_LATEST_RECORD"
     INTEGRITY_LEDGER_HEAD = "INTEGRITY_LEDGER_HEAD"
+    DGFE_XML = "DGFE_XML"
+    FISCAL_SUMMARY_XML = "FISCAL_SUMMARY_XML"
 
 
 class StreamDirection(StrEnum):

@@ -80,6 +80,10 @@ class FakeRepository(EmptyRepository):
             commercial_documents=3,
             open_alerts=1,
             economic_difference=Decimal("50.00"),
+            sold_product_quantity_bar=Decimal("12"),
+            sold_product_quantity_kitchen=Decimal("8.5"),
+            sold_product_quantity_pizzeria=Decimal("6"),
+            employee_discount_total=Decimal("4.20"),
         )
 
     def list_devices(self) -> list[DeviceView]:
@@ -193,11 +197,16 @@ class FakeRepository(EmptyRepository):
     ) -> RawArtifact | None:
         if document_id != self.document_id:
             return None
-        payload = b"\x1bSYNTHETIC" if direction == "request" else b"ACK"
+        payload = {
+            "request": b"\x1bSYNTHETIC",
+            "response": b"ACK",
+            "source": b"<MemoriaDettaglio versione=\"3.0\" />",
+        }[direction]
         return RawArtifact(
             payload,
-            f"synthetic-{direction}.raw",
+            f"synthetic-{direction}.{'xml' if direction == 'source' else 'raw'}",
             hashlib.sha256(payload).hexdigest(),
+            media_type="application/xml" if direction == "source" else "application/octet-stream",
         )
 
     def get_job_raw(self, job_id: UUID, *, direction: str) -> RawArtifact | None:
@@ -319,6 +328,10 @@ def test_login_dashboard_and_bad_password() -> None:
     response = client.get("/api/v1/dashboard", headers=headers)
     assert response.status_code == 200
     assert response.json()["economic_difference"] == "50.00"
+    assert response.json()["sold_product_quantity_bar"] == "12"
+    assert response.json()["sold_product_quantity_kitchen"] == "8.5"
+    assert response.json()["sold_product_quantity_pizzeria"] == "6"
+    assert response.json()["employee_discount_total"] == "4.20"
     assert any(entry.action == "AUTH_LOGIN" for entry in repository.audits)
 
     diagnostics = client.get("/api/v1/system/diagnostics", headers=headers)
@@ -539,6 +552,13 @@ def test_document_derivatives_and_bidirectional_evidence_downloads() -> None:
         ).content
         == b"\x1bSYNTHETIC"
     )
+    source = client.get(
+        f"/api/v1/documents/{repository.document_id}/raw?direction=source",
+        headers=headers,
+    )
+    assert source.status_code == 200
+    assert source.headers["content-type"] == "application/xml"
+    assert source.content.startswith(b"<MemoriaDettaglio")
 
 
 def test_alert_workflow_and_csv_export() -> None:

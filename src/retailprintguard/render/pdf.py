@@ -326,9 +326,10 @@ def _generic_lines(document: Any, normalized: str) -> list[_RenderLine]:
     else:
         receipt_header_evidence = getattr(receipt_header, "evidence", None)
     structured_body = bool(getattr(document, "lines", None))
-    render_structured_header = receipt_header_evidence == (
-        "DEVICE_METADATA_CONFIGURED"
-    ) or (
+    render_structured_header = receipt_header_evidence in {
+        "DEVICE_METADATA_CONFIGURED",
+        "RCH_DGFE_EXPORT",
+    } or (
         receipt_header_evidence == "RCH_PRINTED_HEADER" and structured_body
     )
     if render_structured_header:
@@ -438,7 +439,8 @@ def _generic_lines(document: Any, normalized: str) -> list[_RenderLine]:
         for warning in document.warnings:
             _append_wrapped(lines, f"- {_safe_text(warning)}", "subtitle")
     if not render_structured_header and (
-        receipt_header_evidence == "RCH_PRINTED_HEADER" or rch_context
+        receipt_header_evidence in {"RCH_PRINTED_HEADER", "RCH_DGFE_EXPORT"}
+        or rch_context
     ):
         lines.append(_RenderLine(style="rule"))
         _append_wrapped(

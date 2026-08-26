@@ -124,9 +124,10 @@ class PaymentRecord(BaseModel):
 class ReceiptHeader(BaseModel):
     """Versioned merchant heading observed on, or configured for, an RCH print.
 
-    The parser only creates ``RCH_PRINTED_HEADER`` values from text present in
-    the captured stream.  ``DEVICE_METADATA_CONFIGURED`` is reserved for the
-    API read-model fallback and must never be presented as captured evidence.
+    ``RCH_PRINTED_HEADER`` is reserved for text present in the captured stream.
+    ``RCH_DGFE_EXPORT`` identifies a header read from an immutable fiscal-memory
+    export, while ``DEVICE_METADATA_CONFIGURED`` is reserved for the API
+    read-model fallback.  Neither may be presented as captured-stream evidence.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -140,7 +141,11 @@ class ReceiptHeader(BaseModel):
     phone: Annotated[str, Field(min_length=1, max_length=64)] | None = None
     tax_code: Annotated[str, Field(min_length=1, max_length=32)] | None = None
     vat_number: Annotated[str, Field(min_length=1, max_length=32)] | None = None
-    evidence: Literal["RCH_PRINTED_HEADER", "DEVICE_METADATA_CONFIGURED"]
+    evidence: Literal[
+        "RCH_PRINTED_HEADER",
+        "RCH_DGFE_EXPORT",
+        "DEVICE_METADATA_CONFIGURED",
+    ]
 
     @field_validator(
         "merchant_name",

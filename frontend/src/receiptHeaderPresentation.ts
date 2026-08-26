@@ -6,6 +6,9 @@ export function receiptHeaderEvidenceLabel(evidence: ReceiptHeaderEvidence | str
   if (evidence === 'RCH_PRINTED_HEADER') {
     return 'Osservata nel blocco iniziale stampato dalla RCH'
   }
+  if (evidence === 'RCH_DGFE_EXPORT') {
+    return 'Estratta dall\'export della memoria fiscale DGFE'
+  }
   if (evidence === 'DEVICE_METADATA_CONFIGURED') {
     return 'Configurata sul dispositivo (non osservata nel flusso)'
   }
@@ -20,8 +23,11 @@ export function receiptHeaderSummary(header: ReceiptHeaderRecord | null | undefi
 }
 
 export function configuredReceiptHeaderText(header: ReceiptHeaderRecord | null | undefined) {
-  if (!header || header.evidence !== 'DEVICE_METADATA_CONFIGURED') return null
-  const lines = ['INTESTAZIONE DOCUMENTO (CONFIGURATA)']
+  if (!header || !['DEVICE_METADATA_CONFIGURED', 'RCH_DGFE_EXPORT'].includes(header.evidence)) return null
+  const title = header.evidence === 'RCH_DGFE_EXPORT'
+    ? 'INTESTAZIONE DOCUMENTO (MEMORIA FISCALE DGFE)'
+    : 'INTESTAZIONE DOCUMENTO (CONFIGURATA)'
+  const lines = [title]
   if (header.merchant_name) lines.push(header.merchant_name)
   if (header.legal_name) lines.push(header.legal_name)
   lines.push(...header.address_lines)

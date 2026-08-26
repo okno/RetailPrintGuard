@@ -14,6 +14,9 @@ describe('receipt header presentation', () => {
     expect(receiptHeaderEvidenceLabel('DEVICE_METADATA_CONFIGURED')).toBe(
       'Configurata sul dispositivo (non osservata nel flusso)',
     )
+    expect(receiptHeaderEvidenceLabel('RCH_DGFE_EXPORT')).toBe(
+      'Estratta dall\'export della memoria fiscale DGFE',
+    )
   })
 
   it('does not imply that a missing header was observed', () => {
@@ -44,5 +47,9 @@ describe('receipt header presentation', () => {
       ...configured,
       evidence: 'RCH_PRINTED_HEADER',
     })).toBeNull()
+    expect(configuredReceiptHeaderText({
+      ...configured,
+      evidence: 'RCH_DGFE_EXPORT',
+    })).toContain('INTESTAZIONE DOCUMENTO (MEMORIA FISCALE DGFE)')
   })
 })

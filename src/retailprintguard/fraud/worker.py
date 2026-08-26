@@ -21,7 +21,11 @@ from retailprintguard.common.domain import (
 )
 from retailprintguard.common.domain import OrderEvent as DomainOrderEvent
 from retailprintguard.common.hashchain import ZERO_HASH, canonical_json, chained_hash
-from retailprintguard.correlation.engine import ALGORITHM_VERSION, CorrelationEngine
+from retailprintguard.correlation.engine import (
+    ALGORITHM_VERSION,
+    CorrelatedTransaction,
+    CorrelationEngine,
+)
 from retailprintguard.correlation.worker import (
     LoadedDocument,
     correlation_input_fingerprint,
@@ -42,6 +46,7 @@ from retailprintguard.db.models import (
 )
 from retailprintguard.fraud.engine import (
     DEFAULT_RULES,
+    AuthorizedEmployeeDiscount,
     FraudContext,
     FraudEngine,
     OperatorPatternStats,
@@ -49,12 +54,13 @@ from retailprintguard.fraud.engine import (
     SuppressedFinding,
     WhitelistEntry,
     WhitelistScope,
+    authorized_employee_discount,
     finding_fingerprint,
     technical_non_sale_line,
 )
 from retailprintguard.fraud.versioning import rule_configuration_fingerprint
 
-FRAUD_ENGINE_VERSION = "rpg-fraud-1.3.0"
+FRAUD_ENGINE_VERSION = "rpg-fraud-1.4.0"
 _AUXILIARY_ECONOMIC_RULE_CODES = (
     "PREBILL_FISCAL_AMOUNT_DROP",
     "ITEM_REMOVED_AFTER_PREBILL",
@@ -154,14 +160,13 @@ class FraudWorker:
             comparison_documents = tuple(item.value for item in comparison_loaded)
             comparison_by_id = {item.value.id: item for item in comparison_loaded}
             whitelists = self._load_whitelists(session, now)
-            operator_counts, anomalous_transactions, void_counts = self._operator_statistics(
-                session, correlations, comparison_by_id
-            )
-            evaluated = 0
-            findings_detected = 0
-            findings_suppressed = 0
-            alerts_inserted = 0
-            evidence_inserted = 0
+            prepared: dict[
+                UUID,
+                tuple[CorrelatedTransaction, dict[UUID, LoadedDocument], set[UUID]],
+            ] = {}
+            # Resolve fully proven employee discounts before operator statistics.
+            # Otherwise legacy economic alerts could inflate the operator anomaly
+            # rate for one final cycle and manufacture a secondary false positive.
             for correlation in correlations:
                 ids = set(
                     session.scalars(
@@ -179,13 +184,12 @@ class FraudWorker:
                 )
                 if current_fingerprint != correlation.input_fingerprint:
                     continue
-                candidate_transactions = self.correlation_engine.correlate(
-                    item.value for item in loaded
-                )
                 transaction = next(
                     (
                         candidate
-                        for candidate in candidate_transactions
+                        for candidate in self.correlation_engine.correlate(
+                            item.value for item in loaded
+                        )
                         if candidate.transaction_id == correlation.transaction_id
                         and {document.id for document in candidate.documents} == ids
                     ),
@@ -193,6 +197,29 @@ class FraudWorker:
                 )
                 if transaction is None:
                     continue
+                employee_discount = authorized_employee_discount(transaction)
+                if employee_discount is not None:
+                    alerts_reclassified += self._justify_authorized_employee_discount_alerts(
+                        session,
+                        correlation,
+                        employee_discount,
+                        by_id,
+                        now,
+                    )
+                prepared[correlation.id] = (transaction, by_id, ids)
+            operator_counts, anomalous_transactions, void_counts = self._operator_statistics(
+                session, correlations, comparison_by_id
+            )
+            evaluated = 0
+            findings_detected = 0
+            findings_suppressed = 0
+            alerts_inserted = 0
+            evidence_inserted = 0
+            for correlation in correlations:
+                prepared_item = prepared.get(correlation.id)
+                if prepared_item is None:
+                    continue
+                transaction, by_id, ids = prepared_item
                 order_events = self._load_order_events(session, ids)
                 operator = next(
                     (
@@ -279,6 +306,128 @@ class FraudWorker:
                 alerts_superseded=alerts_superseded,
                 alerts_reclassified=alerts_reclassified,
             )
+
+    @staticmethod
+    def _justify_authorized_employee_discount_alerts(
+        session: Session,
+        correlation: DocumentCorrelation,
+        authorization: AuthorizedEmployeeDiscount,
+        loaded_by_id: dict[UUID, LoadedDocument],
+        now: datetime,
+    ) -> int:
+        """Close only economic alerts fully explained by the legal 30% benefit."""
+
+        alerts = session.scalars(
+            select(FraudAlert)
+            .join(
+                FraudRuleVersion,
+                FraudRuleVersion.id == FraudAlert.fraud_rule_version_id,
+            )
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(
+                FraudAlert.correlation_id == correlation.id,
+                FraudAlert.is_canonical.is_(True),
+                FraudAlert.status.in_(("OPEN", "UNDER_REVIEW", "CONFIRMED")),
+                FraudRule.code.in_(
+                    ("MODIFICA_POST_PRECONTO", *_AUXILIARY_ECONOMIC_RULE_CODES)
+                ),
+            )
+            .order_by(FraudAlert.opened_at, FraudAlert.id)
+            .with_for_update()
+        ).all()
+        if not alerts:
+            return 0
+        evidence_payload = authorization.model_dump(mode="json")
+        try:
+            observed_document_id = UUID(
+                str(authorization.observations[0].get("document_id"))
+            )
+        except (IndexError, TypeError, ValueError):
+            observed_document_id = authorization.document_ids[0]
+        primary_document_id = (
+            observed_document_id
+            if observed_document_id in loaded_by_id
+            else authorization.document_ids[0]
+        )
+        loaded = loaded_by_id.get(primary_document_id)
+        raw = (
+            session.get(RawPayload, loaded.raw_payload_id)
+            if loaded is not None and loaded.raw_payload_id is not None
+            else None
+        )
+        reason = (
+            "Riduzione interamente spiegata dallo sconto dipendenti autorizzato del 30%, "
+            "provato da literal fiscale/DGFE e riconciliato al centesimo senza altre "
+            "rimozioni o variazioni di prezzo."
+        )
+        justified = 0
+        for alert in alerts:
+            previous_status = alert.status
+            alert.status = "JUSTIFIED"
+            alert.closed_at = now
+            alert.updated_at = now
+            alert.closure_reason = reason
+            evidence_sequence = (
+                session.scalar(
+                    select(func.max(FraudAlertEvidence.sequence)).where(
+                        FraudAlertEvidence.fraud_alert_id == alert.id
+                    )
+                )
+                or 0
+            ) + 1
+            session.add(
+                FraudAlertEvidence(
+                    fraud_alert_id=alert.id,
+                    sequence=evidence_sequence,
+                    document_id=primary_document_id,
+                    print_job_id=(loaded.database_job_id if loaded is not None else None),
+                    raw_payload_id=None if raw is None else raw.id,
+                    evidence_type="AUTHORIZED_EMPLOYEE_DISCOUNT",
+                    summary="Sconto dipendenti autorizzato del 30%",
+                    evidence={
+                        "kind": "authorized_employee_discount",
+                        **evidence_payload,
+                    },
+                    artifact_path=None if raw is None else raw.source_path,
+                    artifact_sha256=None if raw is None else raw.sha256,
+                )
+            )
+            latest = session.scalar(
+                select(FraudAlertHistory)
+                .where(FraudAlertHistory.fraud_alert_id == alert.id)
+                .order_by(FraudAlertHistory.sequence.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            history_sequence = 1 if latest is None else latest.sequence + 1
+            previous_hash = ZERO_HASH if latest is None else latest.record_hash
+            payload = {
+                "alert_id": str(alert.id),
+                "sequence": history_sequence,
+                "actor_user_id": None,
+                "event_type": "ALERT_AUTO_JUSTIFIED_EMPLOYEE_DISCOUNT",
+                "previous_status": previous_status,
+                "new_status": "JUSTIFIED",
+                "note": None,
+                "reason": reason,
+                "occurred_at": now.isoformat(),
+                "previous_hash": previous_hash,
+            }
+            session.add(
+                FraudAlertHistory(
+                    fraud_alert_id=alert.id,
+                    sequence=history_sequence,
+                    event_type="ALERT_AUTO_JUSTIFIED_EMPLOYEE_DISCOUNT",
+                    previous_status=previous_status,
+                    new_status="JUSTIFIED",
+                    reason=reason,
+                    occurred_at=now,
+                    previous_record_hash=previous_hash,
+                    record_hash=chained_hash(payload, previous_hash),
+                )
+            )
+            justified += 1
+        return justified
 
     @staticmethod
     def _reclassify_known_false_positives(session: Session, now: datetime) -> int:

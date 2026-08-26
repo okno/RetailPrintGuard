@@ -185,6 +185,24 @@ def test_pdf_header_provenance_and_document_type_titles_are_explicit() -> None:
     assert "Osservata nel blocco iniziale" not in configured_text
     assert configured_text.count("INTESTAZIONE DOCUMENTO") == 1
 
+    dgfe = configured.model_copy(
+        update={
+            "receipt_header": ReceiptHeaderView(
+                merchant_name="LAB MEMORIA",
+                address_lines=[],
+                evidence="RCH_DGFE_EXPORT",
+            ),
+            "document_timestamp_evidence": "RCH_DGFE_EXPORT",
+            "rch_serial_number": "99LABDGFE01",
+            "rch_serial_number_evidence": "RCH_DGFE_EXPORT",
+        }
+    )
+    dgfe_text = " ".join(line.text for line in _document_lines(dgfe))
+    assert dgfe_text.count("LAB MEMORIA") == 1
+    assert "Estratta dall'export della memoria fiscale DGFE" in dgfe_text
+    assert "data/ora fiscale estratta dall'export DGFE" in dgfe_text
+    assert "matricola RT estratta dall'export DGFE" in dgfe_text
+
     missing = _document().model_copy(update={"receipt_header": None})
     missing_text = " ".join(line.text for line in _document_lines(missing))
     assert (

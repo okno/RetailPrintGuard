@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,7 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from retailprintguard.common.domain import (
     NON_SALE_DOCUMENT_TYPES,
     AlertSeverity,
+    DocumentLine,
     DocumentType,
+    EvidenceLevel,
     FraudFinding,
     NormalizedDocument,
     OrderEvent,
@@ -25,6 +28,7 @@ from retailprintguard.common.hashchain import ZERO_HASH, canonical_json, chained
 from retailprintguard.correlation.engine import (
     CorrelatedTransaction,
     LineChangeType,
+    is_dgfe_fiscal_evidence,
     numeric_suffix,
 )
 
@@ -46,6 +50,26 @@ _SECONDARY_ECONOMIC_RULES = {
     "EXTREME_PRICE_CHANGE",
     "SAME_REFERENCE_DIFFERENT_AMOUNT",
 }
+_AUTHORIZED_EMPLOYEE_DISCOUNT_RULES = {
+    "MODIFICA_POST_PRECONTO",
+    *_SECONDARY_ECONOMIC_RULES,
+}
+_EMPLOYEE_DISCOUNT_RATE = Decimal("30.0000")
+_EMPLOYEE_DISCOUNT_FACTOR = Decimal("0.30")
+_MONEY_QUANTUM = Decimal("0.01")
+_RCH_CAPTURE_PARSER = "retailprintguard-rch-observed"
+_EMPLOYEE_DISCOUNT_LABEL_RE = re.compile(
+    r"^SCONTO(?:\s+DIPENDENT(?:E|I))?\s+30(?:[,.]0+)?\s*%"
+    r"(?:\s*\[-30(?:[,.]0+)?%\])?$",
+    re.IGNORECASE,
+)
+_GENERIC_STRUCTURED_DISCOUNT_RE = re.compile(r"^SCONTO$", re.IGNORECASE)
+_EMPLOYEE_DISCOUNT_LITERAL_RE = re.compile(
+    r"^\s*(?P<label>SCONTO(?:\s+DIPENDENT(?:E|I))?\s+30(?:[,.]0+)?\s*%)"
+    r"(?P<structured_suffix>\s*\[-30(?:[,.]0+)?%\])?"
+    r"\s+(?P<amount>-\s*(?:\d{1,3}(?:[. ]\d{3})+|\d+)[,.]\d{2})\s*$",
+    re.IGNORECASE,
+)
 
 
 class RuleDefinition(BaseModel):
@@ -66,6 +90,27 @@ class OperatorPatternStats(BaseModel):
     transaction_count: int
     anomalous_transaction_count: int
     void_or_cancellation_count: int = 0
+
+
+class AuthorizedEmployeeDiscount(BaseModel):
+    """Fail-closed proof that one sale reduction is the authorized 30% benefit.
+
+    This is a derived interpretation, never a mutation of the captured fiscal
+    evidence.  ``observations`` records whether each amount came from an exact
+    printed literal or from a DGFE line modifier and retains the source
+    document/line coordinates needed for an audit.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rate_percent: Decimal = _EMPLOYEE_DISCOUNT_RATE
+    gross_basis: Decimal
+    discounted_basis: Decimal
+    discount_amount: Decimal
+    final_amount: Decimal
+    document_ids: tuple[UUID, ...]
+    line_references: tuple[tuple[UUID, int], ...] = ()
+    observations: tuple[dict[str, Any], ...]
 
 
 class WhitelistScope(StrEnum):
@@ -262,6 +307,618 @@ def technical_non_sale_line(description: str) -> bool:
     return normalized in labels or normalized.startswith(prefixes)
 
 
+def _money_amount(value: str) -> Decimal | None:
+    """Parse a bounded printed amount without accepting a signless discount."""
+
+    compact = value.replace(" ", "")
+    if not compact.startswith("-"):
+        return None
+    unsigned = compact[1:]
+    if "," in unsigned and "." in unsigned:
+        if unsigned.rfind(",") > unsigned.rfind("."):
+            unsigned = unsigned.replace(".", "").replace(",", ".")
+        else:
+            unsigned = unsigned.replace(",", "")
+    else:
+        unsigned = unsigned.replace(",", ".")
+    try:
+        parsed = Decimal(unsigned)
+    except InvalidOperation:
+        return None
+    return parsed.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP) if parsed > ZERO else None
+
+
+def _money_round(value: Decimal) -> Decimal:
+    return value.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _employee_discount_label(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = " ".join(value.strip().upper().split())
+    return _EMPLOYEE_DISCOUNT_LABEL_RE.fullmatch(normalized) is not None
+
+
+def _dgfe_discount_observations(
+    document: NormalizedDocument,
+) -> tuple[tuple[dict[str, Any], ...], tuple[tuple[UUID, int], ...]] | None:
+    """Read only exact, line-scoped DGFE modifiers whose amount is exactly 30%."""
+
+    metadata = document.raw_metadata
+    if (
+        not is_dgfe_fiscal_evidence(document)
+        or metadata.get("provenance") != "RCH_DGFE_EXPORT"
+        or metadata.get("source_export_kind") != "DGFE_DETAIL"
+    ):
+        return None
+    if metadata.get("subtotal_modifiers") not in (None, [], ()):
+        return None
+    raw_lines = metadata.get("lines")
+    if not isinstance(raw_lines, list):
+        return None
+    observations: list[dict[str, Any]] = []
+    references: list[tuple[UUID, int]] = []
+    for fallback_sequence, raw_line in enumerate(raw_lines, start=1):
+        if not isinstance(raw_line, Mapping):
+            return None
+        modifiers = raw_line.get("modifiers")
+        if modifiers in (None, [], ()):
+            continue
+        # Multiple stacked modifiers make the effective basis ambiguous.  They
+        # remain visible to antifraud rather than being guessed as authorized.
+        if not isinstance(modifiers, list) or len(modifiers) != 1:
+            return None
+        modifier = modifiers[0]
+        if not isinstance(modifier, Mapping) or modifier.get("sign") != "-":
+            return None
+        description = modifier.get("description")
+        normalized_description = (
+            " ".join(description.strip().upper().split())
+            if isinstance(description, str)
+            else ""
+        )
+        if not (
+            _EMPLOYEE_DISCOUNT_LABEL_RE.fullmatch(normalized_description)
+            or _GENERIC_STRUCTURED_DISCOUNT_RE.fullmatch(normalized_description)
+        ):
+            return None
+        try:
+            basis = Decimal(str(raw_line.get("line_total")))
+            amount = Decimal(str(modifier.get("amount")))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        basis = _money_round(basis)
+        amount = _money_round(abs(amount))
+        if basis <= ZERO or amount != _money_round(basis * _EMPLOYEE_DISCOUNT_FACTOR):
+            return None
+        sequence_value = raw_line.get("sequence", fallback_sequence)
+        try:
+            sequence = int(str(sequence_value))
+        except (TypeError, ValueError):
+            return None
+        if sequence < 0:
+            return None
+        references.append((document.id, sequence))
+        observations.append(
+            {
+                "kind": "authorized_employee_discount_observation",
+                "provenance": "RCH_DGFE_EXPORT",
+                "evidence": "DGFE_LINE_MODIFIER",
+                "document_id": str(document.id),
+                "line_sequence": sequence,
+                "description": str(description),
+                "gross_basis": str(basis),
+                "discount_amount": str(amount),
+                "rate_percent": str(_EMPLOYEE_DISCOUNT_RATE),
+                "xml_path": metadata.get("xml_path"),
+            }
+        )
+    return tuple(observations), tuple(references)
+
+
+def _literal_discount_observations(
+    document: NormalizedDocument,
+) -> tuple[tuple[dict[str, Any], ...], tuple[tuple[UUID, int], ...]] | None:
+    """Extract exact printed ``SCONTO 30% -x,xx`` literals from live RCH evidence."""
+
+    metadata = document.raw_metadata
+    if (
+        document.parser_name != _RCH_CAPTURE_PARSER
+        or document.parse_confidence < 70
+        or document.evidence is EvidenceLevel.UNKNOWN
+        or metadata.get("semantic_evidence") != "INFERRED_FROM_CAPTURE"
+        or not isinstance(metadata.get("source_start_offset"), int)
+        or not isinstance(metadata.get("source_end_offset"), int)
+    ):
+        return None
+    observations: list[dict[str, Any]] = []
+    for line_index, raw_line in enumerate(document.normalized_text.splitlines(), start=1):
+        normalized = " ".join(raw_line.strip().upper().split())
+        match = _EMPLOYEE_DISCOUNT_LITERAL_RE.fullmatch(raw_line)
+        if normalized.startswith("SCONTO") and match is None:
+            # An additional or malformed discount is never silently covered by
+            # the authorized employee benefit.
+            return None
+        if match is None:
+            continue
+        amount = _money_amount(match.group("amount"))
+        if amount is None:
+            return None
+        observations.append(
+            {
+                "kind": "authorized_employee_discount_observation",
+                "provenance": "RCH_CAPTURED_PRINT_LITERAL",
+                "evidence": "EXACT_SCONTO_30_PERCENT_LITERAL",
+                "document_id": str(document.id),
+                "normalized_text_line": line_index,
+                "label": " ".join(
+                    (
+                        match.group("label")
+                        + (match.group("structured_suffix") or "")
+                    )
+                    .upper()
+                    .split()
+                ),
+                "discount_amount": str(amount),
+                "rate_percent": str(_EMPLOYEE_DISCOUNT_RATE),
+                "source_start_offset": metadata.get("source_start_offset"),
+                "source_end_offset": metadata.get("source_end_offset"),
+            }
+        )
+    references = tuple(
+        (document.id, line.sequence)
+        for line in document.lines
+        if _employee_discount_label(line.description)
+        and line.line_total is not None
+        and line.line_total < ZERO
+    )
+    return tuple(observations), references
+
+
+def _normalized_line_label(value: str | None) -> str:
+    if value is None:
+        return ""
+    return " ".join(
+        "".join(character if character.isalnum() else " " for character in value.upper()).split()
+    )
+
+
+def _management_sale_section(
+    document: NormalizedDocument,
+) -> tuple[tuple[DocumentLine, ...], DocumentLine] | None:
+    """Return observed rows before the first printed document-total marker."""
+
+    ordered = tuple(sorted(document.lines, key=lambda line: line.sequence))
+    if len({line.sequence for line in ordered}) != len(ordered):
+        return None
+    for index, line in enumerate(ordered):
+        if (
+            line.line_total is not None
+            and _normalized_line_label(line.description)
+            in {"TOT", "TOTALE", "TOTALE COMPLESSIVO"}
+        ):
+            return ordered[:index], line
+    return None
+
+
+def _line_identities(line: DocumentLine) -> set[str]:
+    identities: set[str] = set()
+    if line.item_code:
+        identities.add(f"CODE:{' '.join(str(line.item_code).upper().split())}")
+    description = _normalized_line_label(line.description)
+    if description:
+        identities.add(f"DESC:{description}")
+    return identities
+
+
+def _counter_suffix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    match = re.search(r"(?:^|[-/])(?P<value>\d{1,8})$", value.strip())
+    return match.group("value") if match is not None else None
+
+
+def _strong_management_companion(
+    management: NormalizedDocument,
+    fiscal: NormalizedDocument,
+    sale_lines: tuple[DocumentLine, ...],
+) -> bool:
+    """Reproduce the correlator's bounded full/suffix fiscal resolution."""
+
+    if (
+        management.type is not DocumentType.MANAGEMENT_DOCUMENT
+        or not management.complete
+        or management.commercial_reference_code is None
+        or management.raw_metadata.get("commercial_reference_code_evidence") is None
+        or not str(
+            management.raw_metadata.get("commercial_reference_code_evidence")
+        ).startswith("RCH_PRINTED_")
+        or management.source_device_id != fiscal.source_device_id
+        or _document_total(management) is None
+        or _document_total(fiscal) is None
+        or _money_round(_document_total(management) or ZERO)
+        != _money_round(_document_total(fiscal) or ZERO)
+    ):
+        return False
+    reference = management.commercial_reference_code.strip()
+    exact_reference = (
+        fiscal.external_document_code is not None
+        and reference == fiscal.external_document_code.strip()
+    )
+    reference_suffix = _counter_suffix(reference)
+    fiscal_suffix = _counter_suffix(fiscal.external_document_code_suffix)
+    suffix_reference = (
+        reference_suffix is not None
+        and fiscal_suffix is not None
+        and reference_suffix == fiscal_suffix
+        and fiscal.raw_metadata.get("external_document_code_suffix_evidence")
+        == "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+    )
+    if not exact_reference and not suffix_reference:
+        return False
+    management_order = _normalized_line_label(management.order_code)
+    fiscal_order = _normalized_line_label(fiscal.order_code)
+    if not management_order or management_order != fiscal_order:
+        return False
+    management_table = _normalized_line_label(management.table_code)
+    fiscal_table = _normalized_line_label(fiscal.table_code)
+    if bool(management_table) != bool(fiscal_table):
+        return False
+    if management_table and management_table != fiscal_table:
+        return False
+    if abs((_document_time(management) - _document_time(fiscal)).total_seconds()) > 300:
+        return False
+    management_items = {
+        identity
+        for line in sale_lines
+        if line.line_total is not None
+        and line.line_total > ZERO
+        for identity in _line_identities(line)
+    }
+    fiscal_items = {
+        identity
+        for line in fiscal.lines
+        if line.line_total is not None
+        and line.line_total > ZERO
+        for identity in _line_identities(line)
+    }
+    return bool(management_items & fiscal_items)
+
+
+def _management_employee_discount(
+    management: NormalizedDocument,
+    fiscal: NormalizedDocument,
+    sale_lines: tuple[DocumentLine, ...],
+    total_line: DocumentLine,
+) -> tuple[
+    Decimal,
+    Decimal,
+    Decimal,
+    tuple[dict[str, Any], ...],
+    tuple[tuple[UUID, int], ...],
+] | None:
+    """Prove line-paired 30% discounts in a strongly resolved management copy."""
+
+    extracted = _literal_discount_observations(management)
+    if extracted is None:
+        return None
+    literal_observations, literal_references = extracted
+    if not literal_observations:
+        return None
+    declared_total = _document_total(management)
+    if (
+        declared_total is None
+        or total_line.line_total is None
+        or _money_round(total_line.line_total) != _money_round(declared_total)
+    ):
+        return None
+
+    gross_basis = ZERO
+    discounted_basis = ZERO
+    discount_amount = ZERO
+    paired_references: list[tuple[UUID, int]] = []
+    observations: list[dict[str, Any]] = []
+    for index, line in enumerate(sale_lines):
+        value = line.line_total
+        if value is None:
+            continue
+        value = _money_round(value)
+        if _employee_discount_label(line.description):
+            if value >= ZERO or index == 0:
+                return None
+            previous = sale_lines[index - 1]
+            previous_value = previous.line_total
+            if (
+                previous_value is None
+                or previous_value <= ZERO
+                or _employee_discount_label(previous.description)
+                or technical_non_sale_line(previous.description or "")
+                or previous.source is None
+                or line.source is None
+                or line.raw_text is None
+            ):
+                return None
+            literal = _EMPLOYEE_DISCOUNT_LITERAL_RE.fullmatch(line.raw_text)
+            literal_amount = (
+                _money_amount(literal.group("amount")) if literal is not None else None
+            )
+            amount = _money_round(abs(value))
+            basis = _money_round(previous_value)
+            if (
+                literal_amount != amount
+                or amount != _money_round(basis * _EMPLOYEE_DISCOUNT_FACTOR)
+            ):
+                return None
+            discounted_basis += basis
+            discount_amount += amount
+            paired_references.append((management.id, line.sequence))
+            observations.append(
+                {
+                    "kind": "authorized_employee_discount_observation",
+                    "provenance": "RCH_MANAGEMENT_COPY_PRINT_LITERAL",
+                    "evidence": "IMMEDIATE_PRECEDING_ITEM_PAIR",
+                    "document_id": str(management.id),
+                    "fiscal_document_id": str(fiscal.id),
+                    "commercial_reference_code": management.commercial_reference_code,
+                    "fiscal_external_document_code": fiscal.external_document_code,
+                    "fiscal_external_document_code_suffix": (
+                        fiscal.external_document_code_suffix
+                    ),
+                    "fiscal_identity_resolution": (
+                        "FULL_COMMERCIAL_REFERENCE"
+                        if fiscal.external_document_code is not None
+                        and management.commercial_reference_code
+                        == fiscal.external_document_code
+                        else "SEQUENCE_CONFIRMED_SUFFIX"
+                    ),
+                    "fiscal_suffix_evidence": fiscal.raw_metadata.get(
+                        "external_document_code_suffix_evidence"
+                    ),
+                    "table_code": management.table_code,
+                    "fiscal_time_delta_seconds": abs(
+                        int(
+                            (
+                                _document_time(management)
+                                - _document_time(fiscal)
+                            ).total_seconds()
+                        )
+                    ),
+                    "line_sequence": line.sequence,
+                    "paired_item_sequence": previous.sequence,
+                    "paired_item_description": previous.description,
+                    "gross_basis": str(basis),
+                    "discount_amount": str(amount),
+                    "rate_percent": str(_EMPLOYEE_DISCOUNT_RATE),
+                    "source": line.source.model_dump(mode="json"),
+                }
+            )
+            continue
+        if value <= ZERO or technical_non_sale_line(line.description or ""):
+            return None
+        gross_basis += value
+
+    gross_basis = _money_round(gross_basis)
+    discounted_basis = _money_round(discounted_basis)
+    discount_amount = _money_round(discount_amount)
+    # Every printed discount must be a one-to-one paired row and vice versa.
+    if (
+        not observations
+        or len(observations) != len(literal_observations)
+        or set(paired_references) != set(literal_references)
+        or discount_amount
+        != _money_round(
+            sum(
+                (Decimal(str(item["discount_amount"])) for item in literal_observations),
+                ZERO,
+            )
+        )
+        or discount_amount != _money_round(discounted_basis * _EMPLOYEE_DISCOUNT_FACTOR)
+        or _money_round(gross_basis - discount_amount) != _money_round(declared_total)
+    ):
+        return None
+    return (
+        gross_basis,
+        discounted_basis,
+        discount_amount,
+        tuple(observations),
+        tuple(paired_references),
+    )
+
+
+def _document_employee_discount(
+    document: NormalizedDocument,
+) -> tuple[
+    Decimal,
+    Decimal,
+    Decimal,
+    tuple[dict[str, Any], ...],
+    tuple[tuple[UUID, int], ...],
+] | None:
+    """Return basis, discounted basis, discount and provenance for one fiscal close."""
+
+    if not _valid_fiscal_document(document):
+        return None
+    extracted = (
+        _dgfe_discount_observations(document)
+        if is_dgfe_fiscal_evidence(document)
+        else _literal_discount_observations(document)
+    )
+    if extracted is None:
+        return None
+    observations, references = extracted
+    if not observations:
+        return None
+    discount = sum(
+        (Decimal(str(item["discount_amount"])) for item in observations), ZERO
+    )
+    discount = _money_round(discount)
+    product_totals: list[Decimal] = []
+    for line in document.lines:
+        if line.line_total is None:
+            if line.description and not technical_non_sale_line(line.description):
+                return None
+            continue
+        if _employee_discount_label(line.description):
+            if line.line_total >= ZERO:
+                return None
+            continue
+        if line.line_total < ZERO:
+            return None
+        if line.description and technical_non_sale_line(line.description):
+            continue
+        product_totals.append(line.line_total)
+    if not product_totals:
+        return None
+    gross_basis = _money_round(sum(product_totals, ZERO))
+    discounted_basis = (
+        _money_round(
+            sum((Decimal(str(item["gross_basis"])) for item in observations), ZERO)
+        )
+        if is_dgfe_fiscal_evidence(document)
+        else gross_basis
+    )
+    if discount != _money_round(discounted_basis * _EMPLOYEE_DISCOUNT_FACTOR):
+        return None
+    declared_total = _document_total(document)
+    if declared_total is None or _money_round(declared_total) != _money_round(
+        gross_basis - discount
+    ):
+        return None
+    if document.discount_total is not None and _money_round(
+        abs(document.discount_total)
+    ) != discount:
+        return None
+    return gross_basis, discounted_basis, discount, observations, references
+
+
+def authorized_employee_discount(
+    transaction: CorrelatedTransaction,
+) -> AuthorizedEmployeeDiscount | None:
+    """Recognize only a fully explained, authorized 30% employee discount.
+
+    The predicate deliberately fails closed.  It requires complete authoritative
+    fiscal closes, exact printed or DGFE evidence, per-document arithmetic,
+    transaction-level arithmetic, and the absence of item removals, quantity
+    changes, arbitrary price changes, or DGFE/stream conflicts.
+    """
+
+    if (
+        transaction.prebill_total is None
+        or transaction.prebill_total <= ZERO
+        or transaction.difference_amount is None
+        or transaction.difference_amount <= ZERO
+        or transaction.fiscal_evidence_mismatches
+        or not transaction.fiscal_total_document_ids
+    ):
+        return None
+    authoritative_ids = set(transaction.fiscal_total_document_ids)
+    documents = [
+        document for document in transaction.documents if document.id in authoritative_ids
+    ]
+    if len(documents) != len(authoritative_ids):
+        return None
+
+    gross_basis = ZERO
+    discounted_basis = ZERO
+    discount_amount = ZERO
+    final_amount = ZERO
+    observations: list[dict[str, Any]] = []
+    references: list[tuple[UUID, int]] = []
+    evidence_document_ids: set[UUID] = set(authoritative_ids)
+    used_companions: set[UUID] = set()
+    for document in documents:
+        result = _document_employee_discount(document)
+        if result is None:
+            companions: list[
+                tuple[NormalizedDocument, tuple[DocumentLine, ...], DocumentLine]
+            ] = []
+            for candidate in transaction.documents:
+                if candidate.id in used_companions:
+                    continue
+                section = _management_sale_section(candidate)
+                if section is None:
+                    continue
+                sale_lines, total_line = section
+                if _strong_management_companion(candidate, document, sale_lines):
+                    companions.append((candidate, sale_lines, total_line))
+            if len(companions) != 1:
+                return None
+            companion, sale_lines, total_line = companions[0]
+            result = _management_employee_discount(
+                companion,
+                document,
+                sale_lines,
+                total_line,
+            )
+            if result is None:
+                return None
+            used_companions.add(companion.id)
+            evidence_document_ids.add(companion.id)
+        (
+            basis,
+            document_discounted_basis,
+            discount,
+            document_observations,
+            document_references,
+        ) = result
+        gross_basis += basis
+        discounted_basis += document_discounted_basis
+        discount_amount += discount
+        final_amount += _document_total(document) or ZERO
+        observations.extend(document_observations)
+        references.extend(document_references)
+
+    gross_basis = _money_round(gross_basis)
+    discounted_basis = _money_round(discounted_basis)
+    discount_amount = _money_round(discount_amount)
+    final_amount = _money_round(final_amount)
+    expected_discount = _money_round(discounted_basis * _EMPLOYEE_DISCOUNT_FACTOR)
+    if (
+        gross_basis != _money_round(transaction.prebill_total)
+        or discounted_basis <= ZERO
+        or discounted_basis > gross_basis
+        or discount_amount != expected_discount
+        or discount_amount != _money_round(transaction.difference_amount)
+        or final_amount != _money_round(transaction.observed_final_total)
+        or final_amount != _money_round(gross_basis - discount_amount)
+    ):
+        return None
+
+    allowed_changes = {LineChangeType.UNCHANGED, LineChangeType.DISCOUNT_CHANGED}
+    discount_change_amount = ZERO
+    saw_discount_change = False
+    for change in transaction.line_changes:
+        if change.change_type in allowed_changes:
+            if change.change_type is LineChangeType.DISCOUNT_CHANGED:
+                saw_discount_change = True
+                before = change.before_discount or ZERO
+                after = change.after_discount or ZERO
+                if after <= before:
+                    return None
+                discount_change_amount += after - before
+            continue
+        if (
+            change.change_type is LineChangeType.ADDED
+            and _employee_discount_label(change.description)
+            and change.after_total is not None
+            and change.after_total < ZERO
+        ):
+            continue
+        return None
+    if saw_discount_change and _money_round(discount_change_amount) != discount_amount:
+        return None
+
+    return AuthorizedEmployeeDiscount(
+        gross_basis=gross_basis,
+        discounted_basis=discounted_basis,
+        discount_amount=discount_amount,
+        final_amount=final_amount,
+        document_ids=tuple(sorted(evidence_document_ids, key=str)),
+        line_references=tuple(sorted(set(references), key=lambda item: (str(item[0]), item[1]))),
+        observations=tuple(observations),
+    )
+
+
 def _line_total_candidates(
     document: NormalizedDocument, line_sum: Decimal
 ) -> tuple[Decimal, ...] | None:
@@ -424,6 +1081,7 @@ class FraudEngine:
             for document in context.transaction.documents
         ):
             return ()
+        employee_discount = authorized_employee_discount(context.transaction)
         findings: list[FraudFinding] = []
         for rule in self.rules:
             if not rule.enabled:
@@ -469,6 +1127,16 @@ class FraudEngine:
         if primary_rule_enabled and context.transaction.prebill_total is not None:
             findings = [
                 item for item in findings if item.rule_code not in _SECONDARY_ECONOMIC_RULES
+            ]
+        if employee_discount is not None:
+            # The authorization is arithmetic and evidence based; it covers
+            # only the sale-value reduction it fully explains.  Independent
+            # sequence, duplicate, payment, cancellation and operator findings
+            # remain visible.
+            findings = [
+                item
+                for item in findings
+                if item.rule_code not in _AUTHORIZED_EMPLOYEE_DISCOUNT_RULES
             ]
         return tuple(findings)
 
@@ -1078,6 +1746,12 @@ class FraudEngine:
         self, context: FraudContext, rule: RuleDefinition
     ) -> _FindingData | None:
         del rule
+        employee_discount = authorized_employee_discount(context.transaction)
+        authorized_lines = (
+            set(employee_discount.line_references)
+            if employee_discount is not None
+            else set()
+        )
         evidence: list[dict[str, Any]] = []
         involved: set[Any] = set()
         for document in context.transaction.documents:
@@ -1089,6 +1763,8 @@ class FraudEngine:
             }:
                 continue
             for line in document.lines:
+                if (document.id, line.sequence) in authorized_lines:
+                    continue
                 effective_unit_price = (
                     line.modified_unit_price
                     if line.modified_unit_price is not None
@@ -1138,9 +1814,19 @@ class FraudEngine:
         self, context: FraudContext, rule: RuleDefinition
     ) -> _FindingData | None:
         tolerance = _decimal(rule.parameters.get("tolerance"), "0.01")
+        employee_discount = authorized_employee_discount(context.transaction)
+        authorized_documents = (
+            set(employee_discount.document_ids)
+            if employee_discount is not None
+            else set()
+        )
         mismatches: list[dict[str, Any]] = []
         involved: list[Any] = []
         for document in context.transaction.documents:
+            if document.id in authorized_documents:
+                # The authorization predicate already reconstructed this exact
+                # document from its product basis and observed 30% modifier.
+                continue
             if document.type in {
                 DocumentType.ORDER_CHANGE,
                 DocumentType.KITCHEN_ORDER,
@@ -1294,6 +1980,7 @@ def finding_chain_record(
 
 
 __all__ = [
+    "AuthorizedEmployeeDiscount",
     "DEFAULT_RULES",
     "FraudContext",
     "FraudEngine",
@@ -1303,6 +1990,7 @@ __all__ = [
     "SuppressedFinding",
     "WhitelistEntry",
     "WhitelistScope",
+    "authorized_employee_discount",
     "finding_chain_record",
     "finding_fingerprint",
     "whitelist_entry_key",

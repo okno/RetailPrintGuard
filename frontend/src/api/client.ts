@@ -113,7 +113,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T
 }
 
-export async function rawDocument(documentId: string, direction: 'request' | 'response' = 'request'): Promise<Uint8Array> {
+export async function rawDocument(documentId: string, direction: 'request' | 'response' | 'source' = 'request'): Promise<Uint8Array> {
   const headers = new Headers()
   if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`)
   const response = await request(`${API_ROOT}/documents/${encodeURIComponent(documentId)}/raw?direction=${direction}&preview_bytes=65536`, { headers })

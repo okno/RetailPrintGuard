@@ -455,6 +455,119 @@ def test_database_workers_persist_scenario_a_idempotently() -> None:
     engine.dispose()
 
 
+def test_worker_justifies_legacy_loss_alert_for_proven_employee_discount() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        pos_id = _device(session, "pos_1", "pos", 9100)
+        rch_id = _device(session, "rch_1", "rch", 23)
+        parser = ParserVersion(
+            name="retailprintguard-rch-observed",
+            version="1.6.0-synthetic",
+            build_sha256=_sha("employee-discount-parser"),
+            protocol="rch",
+        )
+        session.add(parser)
+        session.flush()
+        _document(
+            session,
+            device_id=pos_id,
+            parser_id=parser.id,
+            source="employee-prebill",
+            document_type="PRE_BILL",
+            total="100.00",
+            when=NOW,
+            lines=(("Pasto dipendente", "100.00"),),
+            external_document_code="PB-EMP-0042",
+        )
+        fiscal_id = _document(
+            session,
+            device_id=rch_id,
+            parser_id=parser.id,
+            source="employee-fiscal",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="70.00",
+            when=NOW + timedelta(minutes=1),
+            lines=(("Pasto dipendente", "100.00"),),
+            payment="70.00",
+            external_document_code="DC-EMP-0042",
+        )
+        fiscal_version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == fiscal_id)
+        )
+        assert fiscal_version is not None
+        fiscal_version.normalized_text = (
+            "Pasto dipendente 100,00\nSconto 30% -30,00\nTOTALE 70,00"
+        )
+        fiscal_version.parse_confidence = 90
+        fiscal_version.evidence_level = "INFERRED"
+        fiscal_version.raw_metadata = {
+            "semantic_evidence": "INFERRED_FROM_CAPTURE",
+            "source_start_offset": 100,
+            "source_end_offset": 260,
+        }
+
+    assert CorrelationWorker(factory).run_once().correlations_inserted == 1
+    fraud = FraudWorker(factory)
+    clean_run = fraud.run_once()
+    assert clean_run.alerts_inserted == 0
+
+    with factory.begin() as session:
+        primary_version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "MODIFICA_POST_PRECONTO")
+            .order_by(FraudRuleVersion.version.desc())
+        )
+        correlation = session.scalar(select(DocumentCorrelation))
+        assert primary_version is not None and correlation is not None
+        legacy = FraudAlert(
+            fraud_rule_version_id=primary_version.id,
+            correlation_id=correlation.id,
+            transaction_id=correlation.transaction_id,
+            finding_key=_sha("legacy-employee-discount-loss"),
+            severity="HIGH",
+            score=79,
+            status="OPEN",
+            description="Riduzione del valore di vendita dopo il preconto",
+            explanation="Motore legacy privo dell'esclusione autorizzata",
+            original_amount=Decimal("100.00"),
+            final_amount=Decimal("70.00"),
+            difference_amount=Decimal("30.00"),
+            difference_percent=Decimal("30.0000"),
+            confidence=95,
+            opened_at=NOW + timedelta(minutes=2),
+        )
+        session.add(legacy)
+        session.flush()
+        legacy_id = legacy.id
+
+    reclassified = fraud.run_once()
+    assert reclassified.alerts_reclassified == 1
+    assert reclassified.alerts_inserted == 0
+    with factory() as session:
+        alert = session.get(FraudAlert, legacy_id)
+        assert alert is not None and alert.status == "JUSTIFIED"
+        evidence = session.scalar(
+            select(FraudAlertEvidence).where(
+                FraudAlertEvidence.fraud_alert_id == legacy_id,
+                FraudAlertEvidence.evidence_type == "AUTHORIZED_EMPLOYEE_DISCOUNT",
+            )
+        )
+        assert evidence is not None
+        assert evidence.artifact_path == "/spool/employee-fiscal/client.raw"
+        assert evidence.artifact_sha256
+        assert evidence.evidence["discount_amount"] == "30.00"
+        history = session.scalar(
+            select(FraudAlertHistory).where(
+                FraudAlertHistory.fraud_alert_id == legacy_id,
+                FraudAlertHistory.event_type
+                == "ALERT_AUTO_JUSTIFIED_EMPLOYEE_DISCOUNT",
+            )
+        )
+        assert history is not None and history.new_status == "JUSTIFIED"
+    engine.dispose()
+
+
 def test_fresh_reports_and_invoices_never_create_sale_projections() -> None:
     for document_type in ("SHIFT_END_REPORT", "INVOICE"):
         engine, factory = _database()
@@ -2546,4 +2659,126 @@ def test_correlation_algorithm_change_rewinds_control_plane_watermark() -> None:
         watermark = session.get(AnalysisWatermark, "correlation")
         assert watermark is not None
         assert watermark.metadata_json["correlation_algorithm_version"] == ALGORITHM_VERSION
+    engine.dispose()
+
+
+def test_dgfe_duplicate_evidence_persists_once_in_economic_read_model() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        rch_id = _device(session, "rch_dgfe_lab", "rch", 23)
+        stream_parser = ParserVersion(
+            name="retailprintguard-rch-observed",
+            version="1.4.0",
+            build_sha256=_sha("stream-parser-dgfe-dedup"),
+            protocol="rch_observed",
+        )
+        dgfe_parser = ParserVersion(
+            name="rch.xtools.dgfe.v1",
+            version="1.0.0",
+            build_sha256=_sha("dgfe-parser-dedup"),
+            protocol="rch_dgfe_xml",
+        )
+        session.add_all((stream_parser, dgfe_parser))
+        session.flush()
+        stream_id = _document(
+            session,
+            device_id=rch_id,
+            parser_id=stream_parser.id,
+            source="dgfe-dedup-stream",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="18.00",
+            when=NOW,
+            lines=(("Articolo sintetico", "18.00"),),
+            payment="18.00",
+            external_document_code="0062-0014",
+        )
+        dgfe_id = _document(
+            session,
+            device_id=rch_id,
+            parser_id=dgfe_parser.id,
+            source="dgfe-dedup-memory",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="17.00",
+            when=NOW + timedelta(minutes=1),
+            lines=(("Articolo sintetico", "17.00"),),
+            payment="17.00",
+            external_document_code="0062-0014",
+            raw_metadata={
+                "provenance": "RCH_DGFE_EXPORT",
+                "fiscal_identity": {
+                    "matricola_rt": "RTLAB0000014",
+                    "numero_azzeramento": 62,
+                    "numero_documento": 14,
+                    "kind": "VENDITA",
+                },
+            },
+        )
+        # A historical fiscal-memory import is captured today, while its
+        # semantic document time remains next to the original wire evidence.
+        dgfe_document = session.get(Document, dgfe_id)
+        assert dgfe_document is not None
+        dgfe_document.captured_at = NOW + timedelta(days=30)
+
+    report = CorrelationWorker(factory).run_once()
+
+    assert report.correlations_inserted == 1
+    with factory() as session:
+        correlation = session.scalar(
+            select(DocumentCorrelation).where(
+                DocumentCorrelation.status == "AUTOMATIC"
+            )
+        )
+        assert correlation is not None
+        assert "dgfe_fiscal_identity" in correlation.matched_criteria
+        assert "dgfe_evidence_mismatch" in correlation.matched_criteria
+        members = {
+            member.document_id: member
+            for member in session.scalars(
+                select(DocumentCorrelationMember).where(
+                    DocumentCorrelationMember.correlation_id == correlation.id
+                )
+            )
+        }
+        assert set(members) == {stream_id, dgfe_id}
+        assert members[dgfe_id].role == "FISCAL"
+        assert "ECONOMIC_TOTAL_AUTHORITY" in members[dgfe_id].criteria
+        assert "ECONOMIC_PAYMENT_AUTHORITY" in members[dgfe_id].criteria
+        assert "ECONOMIC_LINE_AUTHORITY" in members[dgfe_id].criteria
+        assert members[stream_id].role == "FISCAL_EVIDENCE"
+        events = session.scalars(
+            select(OrderEvent).order_by(OrderEvent.sequence)
+        ).all()
+        assert sum(
+            event.event_type == "FISCAL_DOCUMENT_ISSUED" for event in events
+        ) == 2
+        assert sum(event.event_type == "PAYMENT_RECORDED" for event in events) == 1
+        closed = next(event for event in events if event.event_type == "ORDER_CLOSED")
+        assert closed.details["fiscal_total"] == "17.0000"
+        closed_snapshot = session.scalar(
+            select(OrderSnapshot).where(OrderSnapshot.order_event_id == closed.id)
+        )
+        assert closed_snapshot is not None
+        assert len(closed_snapshot.lines) == 1
+        assert closed_snapshot.lines[0]["line_total"] == "17.0000"
+
+    transactions, total = SqlAlchemyApiRepository(factory).list_transactions(
+        limit=10,
+        offset=0,
+        filters={},
+    )
+    assert total == 1
+    transaction = transactions[0]
+    assert transaction.document_count == 2
+    assert transaction.fiscal_total == Decimal("17.0000")
+    assert transaction.diff["fiscal_evidence"]["deduplicated"] is True
+    assert transaction.diff["fiscal_evidence"]["mismatch"] is True
+    assert set(transaction.diff["fiscal_evidence"]["mismatch_fields"]) == {
+        "dgfe_line_consistency",
+        "dgfe_payment_consistency",
+        "dgfe_total_consistency",
+    }
+    assert set(transaction.diff["fiscal_evidence"]["document_ids"]) == {
+        str(stream_id),
+        str(dgfe_id),
+    }
     engine.dispose()

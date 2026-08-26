@@ -161,7 +161,12 @@ def test_spool_watcher_ignores_unselected_devices_and_links(tmp_path: Path) -> N
     outside.write_bytes(payload)
     linked_job = tmp_path / "pos_2" / "linked.partial"
     linked_job.mkdir(parents=True)
-    (linked_job / "client.raw").symlink_to(outside)
+    try:
+        (linked_job / "client.raw").symlink_to(outside)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     watcher = PosSpoolBeeperWatcher(tmp_path, ("pos_2",), beeper)
 
     watcher.scan_once()

@@ -5,6 +5,43 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.4.9] — 2026-08-26
+
+### Added
+
+- importatore Linux append-only per export XML V11 di dettaglio DGFE e memoria
+  riepilogo prodotti da RCH XTools, con XML originale, SHA-256, progressivi,
+  matricola RT, timestamp fiscale, righe, modificatori, pagamenti e intestazione;
+- wrapper operativo `import_rch_memory.sh`, validazione predefinita e import
+  esplicito con backup/lock, più download Web auditato dell'XML originale.
+- companion Windows `Acquire-RchDgfeExport.ps1` per avviare facoltativamente
+  XTools, rilevare export nuovi e stabili, verificare radice/versione/matricola
+  e produrre copie byte-identiche, SHA-256 e manifest in un outbox privato.
+- dashboard per periodo con quantità nette delle righe prodotto di BAR, CUCINA
+  e PIZZERIA e totale in euro degli sconti dipendenti osservati al 30%, senza
+  duplicare la stessa vendita tra flusso RCH, copia gestionale ed export DGFE.
+
+### Changed
+
+- correlazione DGFE/stream basata su identità fiscale forte: entrambe le fonti
+  restano consultabili, mentre totali, pagamenti e righe sono conteggiati una
+  sola volta; eventuali divergenze restano evidenziate nel diff della vendita.
+- motore antifrode `rpg-fraud-1.4.0`: uno sconto dipendenti viene giustificato
+  soltanto se ogni riduzione osservata vale esattamente il 30% della propria
+  riga prodotto, i totali quadrano al centesimo e non esistono rimozioni,
+  variazioni di quantità/prezzo o conflitti tra evidenze; gli alert indipendenti
+  restano operativi e quelli economici pregressi sono chiusi append-only.
+
+### Security
+
+- parser XML bounded e fail-closed: DTD/entity vietate, nessun accesso rete,
+  limiti di dimensione/nodi/profondità/testo e nessuna dichiarazione di firma
+  valida senza una trust chain configurata; nessun comando viene inviato alla
+  RCH e nessun componente proxy/sniffer è stato modificato.
+- il companion Windows non automatizza clic, non conosce indirizzi di cassa e
+  non apre socket: la scelta `Letture DGFE -> Export V11 XML` resta un'azione
+  esplicita dell'operatore nell'interfaccia ufficiale XTools.
+
 ## [0.4.8] — 2026-08-21
 
 ### Added

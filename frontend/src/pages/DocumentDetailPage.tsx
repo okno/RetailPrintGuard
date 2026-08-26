@@ -131,6 +131,8 @@ export function DocumentDetailPage() {
   const receiptPreview = configuredHeader ? `${configuredHeader}\n\n${documentBody}` : documentBody
   const roles = session().user?.roles ?? []
   const canDownloadEvidence = roles.includes('ADMIN') || roles.includes('AUDITOR')
+  const isFiscalMemoryExport = doc.subtype.startsWith('RCH_DGFE_')
+    || doc.subtype === 'RCH_FISCAL_MEMORY_CLOSURE'
   const hasRchIdentity = doc.device_id.toLowerCase().startsWith('rch')
     || doc.parser_name.toLowerCase().includes('rch')
     || doc.application_timestamp != null
@@ -149,7 +151,7 @@ export function DocumentDetailPage() {
 
   async function loadRaw() {
     await runArtifact(async () => {
-      setRaw(hex(await rawDocument(doc.id)))
+      setRaw(hex(await rawDocument(doc.id, isFiscalMemoryExport ? 'source' : 'request')))
       setTab(3)
     })
   }
@@ -157,12 +159,16 @@ export function DocumentDetailPage() {
   const actions = <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
     <Button startIcon={<ArrowBack />} onClick={() => navigate('/documenti')}>Indietro</Button>
     {canDownloadEvidence && <>
-      <Button variant="outlined" startIcon={<CodeOutlined />} onClick={loadRaw}>Anteprima RAW</Button>
+      <Button variant="outlined" startIcon={<CodeOutlined />} onClick={loadRaw}>{isFiscalMemoryExport ? 'Anteprima XML' : 'Anteprima RAW'}</Button>
       <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/txt`, `${doc.id}.txt`))}>TXT</Button>
       <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/json`, `${doc.id}.json`))}>JSON</Button>
       <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/pdf`, `${doc.id}.pdf`))}>PDF</Button>
-      <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/raw?direction=request`, `${doc.id}-request.raw`))}>RAW richiesta</Button>
-      <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/raw?direction=response`, `${doc.id}-response.raw`))}>RAW risposta</Button>
+      {isFiscalMemoryExport
+        ? <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/raw?direction=source`, `${doc.id}-memoria-fiscale.xml`))}>XML memoria fiscale</Button>
+        : <>
+          <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/raw?direction=request`, `${doc.id}-request.raw`))}>RAW richiesta</Button>
+          <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/raw?direction=response`, `${doc.id}-response.raw`))}>RAW risposta</Button>
+        </>}
     </>}
   </Box>
 
@@ -177,7 +183,7 @@ export function DocumentDetailPage() {
             <Tab label="Scontrino" />
             <Tab label="Righe strutturate" />
             <Tab label="Testo parser" />
-            <Tab label="RAW tecnico" disabled={!canDownloadEvidence} />
+            <Tab label={isFiscalMemoryExport ? 'XML tecnico' : 'RAW tecnico'} disabled={!canDownloadEvidence} />
           </Tabs>
           <CardContent>
             {tab === 0 && <Paper variant="outlined" sx={(theme) => ({ mx: 'auto', maxWidth: 520, p: 3, bgcolor: theme.appChrome.receiptPaper, color: theme.appChrome.receiptInk, fontFamily: 'ui-monospace,Consolas,monospace', whiteSpace: 'pre-wrap', lineHeight: 1.55 })}>{receiptPreview}</Paper>}

@@ -111,6 +111,32 @@ def test_operational_lifecycle_scripts_are_present_and_guard_restart() -> None:
     assert "journalctl" in logs and "--follow" in logs
 
 
+def test_rch_memory_import_wrapper_is_offline_and_validate_first() -> None:
+    wrapper = (SCRIPTS / "import_rch_memory.sh").read_text(encoding="utf-8")
+    guide = (ROOT / "docs/RCH_DGFE_IMPORT.md").read_text(encoding="utf-8")
+
+    assert "execute=no" in wrapper
+    assert "args+=(--validate-only)" in wrapper
+    assert "--execute" in wrapper
+    assert '--dgfe-root "${inbox}"' in wrapper
+    assert '--dgfe-device "${device_id}"' in wrapper
+    assert "retailprintguard.db.repository:create_ingestion_repository" in wrapper
+    assert wrapper.index('"${SCRIPT_DIR}/backup.sh"') < wrapper.index(
+        "retailprintguard.db.repository:create_ingestion_repository"
+    )
+    assert "RPG_DATABASE_URL is missing" in wrapper
+    assert "systemctl" not in wrapper
+    for network_client in ("curl ", "wget ", "telnet ", "nc ", "/dev/tcp"):
+        assert network_client not in wrapper
+
+    assert "RCH XTools" in guide
+    assert "Windows/Android" in guide
+    assert "VM Windows" in guide and "bridged" in guide
+    assert "cassa accesa ma inattiva" in guide
+    assert "Non usare mai l'indirizzo virtuale del proxy" in guide
+    assert "--device rch_1" in guide
+
+
 def test_installer_never_mutates_host_networking_and_requires_site_validation() -> None:
     install = (SCRIPTS / "install.sh").read_text(encoding="utf-8")
     forbidden = (

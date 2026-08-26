@@ -17,11 +17,13 @@ from threading import Event
 from typing import Any
 
 from retailprintguard import __version__
-from retailprintguard.common.config import Settings, load_settings
+from retailprintguard.common.config import DeviceType, Settings, load_settings
 from retailprintguard.common.logging import StructuredLoggingRuntime, configure_structured_logging
 from retailprintguard.importer.historical import HistoricalImporter
 from retailprintguard.ingestion.adapters import SourceAdapter
 from retailprintguard.ingestion.canonical import CanonicalCaptureV1Adapter
+from retailprintguard.ingestion.dgfe import RCHFiscalMemoryXMLAdapter
+from retailprintguard.ingestion.dto import Endpoint
 from retailprintguard.ingestion.printproxy import PrintProxyV3Adapter
 from retailprintguard.ingestion.rch import RCHCaptureV1Adapter, RCHParsedV1Adapter
 from retailprintguard.ingestion.repository import (
@@ -71,6 +73,16 @@ def _parser(*, historical: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--rch-instance", default="commercialrchproxy-primary")
     parser.add_argument("--printproxy-root", type=Path, help="printproxy v3 DATA_DIR root")
     parser.add_argument("--printproxy-instance", default="printproxy-primary")
+    parser.add_argument(
+        "--dgfe-root",
+        type=Path,
+        help="read-only directory containing official RCH/AE fiscal-memory XML exports",
+    )
+    parser.add_argument(
+        "--dgfe-device",
+        help="enabled configured RCH device that produced every XML in --dgfe-root",
+    )
+    parser.add_argument("--dgfe-instance", default="rch-xtools-primary")
     parser.add_argument("--printproxy-hmac-key-file", type=Path)
     parser.add_argument(
         "--allow-unauthenticated-printproxy",
@@ -212,10 +224,30 @@ def build_adapters(args: argparse.Namespace, settings: Settings) -> tuple[Source
                 require_hmac=not args.allow_unauthenticated_printproxy,
             )
         )
+    if args.dgfe_root is not None:
+        if not args.dgfe_device:
+            raise ValueError("--dgfe-device is required with --dgfe-root")
+        matching = [device for device in settings.devices if device.id == args.dgfe_device]
+        if len(matching) != 1:
+            raise ValueError("--dgfe-device must identify one configured device")
+        device = matching[0]
+        if not device.enabled or device.type is not DeviceType.RCH:
+            raise ValueError("--dgfe-device must be an enabled RCH device")
+        adapters.append(
+            RCHFiscalMemoryXMLAdapter(
+                args.dgfe_root,
+                source_instance_id=args.dgfe_instance,
+                device_id=device.id,
+                device_endpoint=Endpoint(str(device.target_ip), device.target_port),
+                timezone=settings.timezone,
+            )
+        )
+    elif args.dgfe_device is not None:
+        raise ValueError("--dgfe-device requires --dgfe-root")
     if not adapters:
         raise ValueError(
             "at least one --canonical-root, --rch-root, --rch-parsed-root or "
-            "--printproxy-root is required"
+            "--printproxy-root or --dgfe-root is required"
         )
     return tuple(adapters)
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -92,6 +93,7 @@ from retailprintguard.ingestion.dto import (
     NormalizedEnvelope,
     QuarantineRecord,
     RetryRecord,
+    SourceKind,
     StreamDirection,
 )
 from retailprintguard.ingestion.errors import RepositoryUnavailable as IngestionUnavailable
@@ -122,6 +124,42 @@ SOURCE_TYPES = {
     DocumentType.PRE_BILL.value,
     DocumentType.MANAGEMENT_DOCUMENT.value,
 }
+
+DASHBOARD_SALES_DEPARTMENTS = ("BAR", "CUCINA", "PIZZERIA")
+DASHBOARD_POS_SALE_TYPES = (
+    DocumentType.KITCHEN_ORDER.value,
+    DocumentType.ORDER.value,
+    DocumentType.ORDER_CHANGE.value,
+)
+_EMPLOYEE_DISCOUNT_30_PATTERN = (
+    r"(?:SCONTO|SCONTI)(?:\s+(?:DIPENDENTE|DIPENDENTI))?\s+30\s*%"
+    r"(?:\s*\[\s*-30\s*%\s*\])?"
+)
+_EMPLOYEE_DISCOUNT_30_RE = re.compile(
+    rf"{_EMPLOYEE_DISCOUNT_30_PATTERN}",
+    re.IGNORECASE,
+)
+_EMPLOYEE_DISCOUNT_30_RAW_RE = re.compile(
+    rf"(?P<label>{_EMPLOYEE_DISCOUNT_30_PATTERN})"
+    r"\s+(?P<amount>-\s*(?:\d{1,3}(?:[. ]\d{3})+|\d+)[,.]\d{2})",
+    re.IGNORECASE,
+)
+_STRONG_MANAGEMENT_FISCAL_CRITERIA = frozenset(
+    {
+        "commercial_reference_to_fiscal_progressive",
+        "commercial_reference_to_observed_fiscal_suffix",
+    }
+)
+_STRONG_GENERAL_SALE_CRITERIA = frozenset(
+    {
+        "order_code",
+        "time_proximity",
+        "amount_relationship",
+        "line_similarity",
+        "document_sequence",
+        "device_context",
+    }
+)
 
 _VERSION_SEMANTIC_FIELDS = (
     "document_type",
@@ -613,6 +651,578 @@ def _historical_correlation_occurrences() -> Any:
     )
 
 
+def _dashboard_sales_department_quantities(
+    session: Session,
+    *,
+    document_period: Sequence[Any],
+) -> dict[str, Decimal]:
+    """Return net product quantities printed by each configured POS department.
+
+    One selected parser version contributes for each logical ``Document``.  A
+    positive order line adds its quantity and a signed ``ORDER_CHANGE`` line
+    subtracts it; identical product rows are deliberately *not* collapsed
+    because two equal rows can be two real sales.  Cancelled/removed projections
+    and incomplete documents are not economic sale evidence.  A final clamp at
+    zero prevents a partial historical range containing only a negative delta
+    from presenting a negative number of sold articles.
+    """
+
+    department = func.upper(func.trim(Device.department)).label("department")
+    semantic_type = _version_column(
+        DocumentVersion.document_type,
+        Document.document_type,
+    )
+    rows = session.execute(
+        select(
+            department,
+            func.coalesce(func.sum(DocumentLine.quantity), MONEY_ZERO).label("quantity"),
+        )
+        .select_from(DocumentLine)
+        .join(
+            DocumentVersion,
+            DocumentVersion.id == DocumentLine.document_version_id,
+        )
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .join(Device, Device.id == Document.device_id)
+        .where(
+            DocumentVersion.id == _latest_version_id(),
+            DocumentVersion.complete.is_(True),
+            semantic_type.in_(DASHBOARD_POS_SALE_TYPES),
+            department.in_(DASHBOARD_SALES_DEPARTMENTS),
+            DocumentLine.quantity.is_not(None),
+            DocumentLine.cancelled.is_(False),
+            DocumentLine.removed.is_(False),
+            *document_period,
+        )
+        .group_by(department)
+    ).all()
+    result = {name: MONEY_ZERO for name in DASHBOARD_SALES_DEPARTMENTS}
+    for name, quantity in rows:
+        normalized = quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
+        result[str(name)] = max(MONEY_ZERO, normalized)
+    return result
+
+
+def _employee_discount_adjustments(
+    version: DocumentVersion,
+    lines: Sequence[DocumentLine],
+) -> tuple[tuple[Decimal, ...], tuple[Decimal, ...]]:
+    """Return structured discount amounts and the subset explicitly labelled 30%.
+
+    DGFE stores a discount as a modifier of the sold row, while the observed RCH
+    stream can expose it as a separate negative line.  Metadata is preferred
+    when present so the same DGFE modifier is not counted again through its
+    projected ``DocumentLine.discount`` column.
+    """
+
+    generic: list[Decimal] = []
+    employee: list[Decimal] = []
+
+    def append_adjustment(value: Any) -> None:
+        if not isinstance(value, dict) or str(value.get("sign", "")).strip() != "-":
+            return
+        description = str(value.get("description") or "").strip()
+        if "SCONT" not in description.upper():
+            return
+        try:
+            amount = abs(Decimal(str(value.get("amount"))))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+        if amount <= MONEY_ZERO:
+            return
+        generic.append(amount)
+        if _employee_discount_30_label(description):
+            employee.append(amount)
+
+    metadata = version.raw_metadata if isinstance(version.raw_metadata, dict) else {}
+    raw_lines = metadata.get("lines")
+    if isinstance(raw_lines, list):
+        for raw_line in raw_lines:
+            if not isinstance(raw_line, dict):
+                continue
+            modifiers = raw_line.get("modifiers")
+            if isinstance(modifiers, list):
+                for modifier in modifiers:
+                    append_adjustment(modifier)
+    subtotal_modifiers = metadata.get("subtotal_modifiers")
+    if isinstance(subtotal_modifiers, list):
+        for modifier in subtotal_modifiers:
+            append_adjustment(modifier)
+    if generic:
+        return tuple(generic), tuple(employee)
+
+    for line in lines:
+        description = line.description or ""
+        raw_text = line.raw_text or ""
+        if "SCONT" not in description.upper() and "SCONT" not in raw_text.upper():
+            continue
+        amount: Decimal | None = None
+        if line.discount is not None and line.discount != MONEY_ZERO:
+            amount = abs(line.discount)
+        elif line.line_total is not None and line.line_total < MONEY_ZERO:
+            amount = abs(line.line_total)
+        elif line.unit_price is not None and line.unit_price < MONEY_ZERO:
+            quantity = abs(line.quantity or Decimal("1"))
+            amount = abs(line.unit_price) * quantity
+        if amount is None or amount <= MONEY_ZERO:
+            continue
+        generic.append(amount)
+        if _employee_discount_30_label(description, raw_text):
+            employee.append(amount)
+    return tuple(generic), tuple(employee)
+
+
+def _employee_discount_30_label(
+    description: str | None,
+    raw_text: str | None = None,
+) -> bool:
+    """Recognise only the exact authorised 30% label, never arbitrary 30% text."""
+
+    normalized_description = " ".join((description or "").strip().split())
+    if normalized_description and _EMPLOYEE_DISCOUNT_30_RE.fullmatch(
+        normalized_description
+    ):
+        return True
+    normalized_raw = " ".join((raw_text or "").strip().split())
+    return bool(
+        normalized_raw
+        and (
+            _EMPLOYEE_DISCOUNT_30_RE.fullmatch(normalized_raw)
+            or _EMPLOYEE_DISCOUNT_30_RAW_RE.fullmatch(normalized_raw)
+        )
+    )
+
+
+def _structured_line_amount(line: DocumentLine) -> Decimal | None:
+    if line.line_total is not None:
+        return line.line_total
+    if line.unit_price is not None:
+        return line.unit_price * (line.quantity or Decimal("1"))
+    return None
+
+
+def _dashboard_technical_sale_line(description: str) -> bool:
+    upper = " ".join(description.upper().split())
+    normalized = " ".join(
+        "".join(character if character.isalnum() else " " for character in upper).split()
+    )
+    labels = {
+        "IVA",
+        "TOT",
+        "TOTALE",
+        "TOTALE COMPLESSIVO",
+        "RESTO",
+        "CONTANTI",
+        "PAGAMENTO CONTANTE",
+        "IMPORTO PAGATO",
+        "IMPONIBILE",
+        "ALIQUOTA IVA",
+        "DI CUI IVA",
+        "EURO",
+    }
+    prefixes = (
+        "IVA ",
+        "TOT ",
+        "TOTALE ",
+        "RESTO ",
+        "CONTANTI ",
+        "PAGAMENTO ",
+        "IMPORTO PAGATO ",
+        "IMPONIBILE ",
+        "ALIQUOTA IVA ",
+        "DI CUI IVA ",
+        "DOCUMENTO GESTIONALE",
+        "DOCUMENTO COMMERCIALE",
+    )
+    tax_breakdown = re.match(r"^[A-Z]\s+\d+(?:[.,]\d+)?\s*%", upper) is not None
+    return normalized in labels or normalized.startswith(prefixes) or tax_breakdown
+
+
+def _dashboard_total_line(description: str) -> bool:
+    normalized = " ".join(
+        "".join(
+            character if character.isalnum() else " "
+            for character in description.upper()
+        ).split()
+    )
+    return normalized in {"TOT", "TOTALE", "TOTALE COMPLESSIVO"}
+
+
+def _validated_management_employee_discount_total(
+    version: DocumentVersion,
+    lines: Sequence[DocumentLine],
+) -> Decimal:
+    """Validate the observed RCH employee-discount sequence and document total."""
+
+    ordered_lines = sorted(lines, key=lambda item: (item.sequence, str(item.id)))
+    total_index = next(
+        (
+            index
+            for index, line in enumerate(ordered_lines)
+            if _structured_line_amount(line) is not None
+            and _dashboard_total_line(line.description or line.raw_text or "")
+        ),
+        None,
+    )
+    if total_index is None:
+        return MONEY_ZERO
+    if any(
+        _employee_discount_30_label(line.description, line.raw_text)
+        for line in ordered_lines[total_index + 1 :]
+    ):
+        return MONEY_ZERO
+
+    positive_basis = MONEY_ZERO
+    validated = MONEY_ZERO
+    previous_product_amount: Decimal | None = None
+    # Payments and tax breakdown follow the first observed total.  They are
+    # deliberately outside the sale-section validation, independent of the
+    # payment method vocabulary (cash, card, room charge, future methods).
+    for line in ordered_lines[:total_index]:
+        description = (line.description or line.raw_text or "").strip()
+        amount = _structured_line_amount(line)
+        employee_label = _employee_discount_30_label(
+            line.description,
+            line.raw_text,
+        )
+        if employee_label:
+            if amount is None or amount >= MONEY_ZERO or previous_product_amount is None:
+                return MONEY_ZERO
+            observed_discount = abs(amount)
+            expected_discount = (previous_product_amount * Decimal("0.30")).quantize(
+                Decimal("0.01")
+            )
+            if abs(observed_discount - expected_discount) > Decimal("0.01"):
+                return MONEY_ZERO
+            validated += observed_discount
+            previous_product_amount = None
+            continue
+        is_product = (
+            amount is not None
+            and amount > MONEY_ZERO
+            and not _dashboard_technical_sale_line(description)
+        )
+        if is_product:
+            positive_basis += amount
+            previous_product_amount = amount
+        else:
+            # "Immediately preceding" is literal: a technical or unrelated
+            # row between article and discount invalidates the pairing.
+            previous_product_amount = None
+
+    observed_total = (
+        version.gross_total if version.gross_total is not None else version.net_total
+    )
+    if validated <= MONEY_ZERO or observed_total is None:
+        return MONEY_ZERO
+    if abs((positive_basis - validated) - observed_total) > Decimal("0.01"):
+        return MONEY_ZERO
+    return validated
+
+
+def _counter_suffix(value: Any) -> int | None:
+    if value is None:
+        return None
+    match = re.search(r"(\d{1,16})\s*$", str(value).strip())
+    return int(match.group(1)) if match is not None else None
+
+
+def _dashboard_product_keys(lines: Sequence[DocumentLine]) -> frozenset[str]:
+    result: set[str] = set()
+    for line in lines:
+        description = (line.description or line.raw_text or "").strip()
+        amount = _structured_line_amount(line)
+        if amount is not None and _dashboard_total_line(description):
+            break
+        if (
+            not description
+            or amount is None
+            or amount <= MONEY_ZERO
+            or _dashboard_technical_sale_line(description)
+        ):
+            continue
+        normalized = " ".join(
+            "".join(
+                character if character.isalnum() else " "
+                for character in description.upper()
+            ).split()
+        )
+        if normalized:
+            result.add(normalized)
+    return frozenset(result)
+
+
+def _management_fiscal_pair_valid(
+    management: dict[str, Any],
+    fiscal: dict[str, Any],
+) -> bool:
+    if not management["strong_fiscal_reference"]:
+        return False
+    if management["device_id"] != fiscal["device_id"]:
+        return False
+    management_order = str(management["order_code"] or "").strip().upper()
+    fiscal_order = str(fiscal["order_code"] or "").strip().upper()
+    if not management_order or management_order != fiscal_order:
+        return False
+    if abs((management["document_time"] - fiscal["document_time"]).total_seconds()) > 300:
+        return False
+    if management["gross_total"] is None or (
+        management["gross_total"] != fiscal["gross_total"]
+    ):
+        return False
+    management_table = str(management["table_code"] or "").strip().upper() or None
+    fiscal_table = str(fiscal["table_code"] or "").strip().upper() or None
+    if not (
+        (management_table is None and fiscal_table is None)
+        or (
+            management_table is not None
+            and fiscal_table is not None
+            and management_table == fiscal_table
+        )
+    ):
+        return False
+    if not (management["product_keys"] & fiscal["product_keys"]):
+        return False
+
+    reference = str(management["commercial_reference"] or "").strip().upper()
+    fiscal_code = str(fiscal["external_code"] or "").strip().upper()
+    exact_reference = bool(reference and fiscal_code and reference == fiscal_code)
+    suffix_reference = (
+        _counter_suffix(reference) is not None
+        and _counter_suffix(reference)
+        == _counter_suffix(fiscal["external_suffix"] or fiscal_code)
+        and fiscal["suffix_evidence"]
+        == "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+    )
+    return exact_reference or suffix_reference
+
+
+def _dashboard_employee_discount_total(
+    session: Session,
+    *,
+    occurrence: Any,
+    episode_period: Sequence[Any],
+) -> Decimal:
+    """Count authorised ``Sconto 30%`` evidence once per current sale episode.
+
+    Current correlation members marked ``ECONOMIC_LINE_AUTHORITY`` are the
+    economic source of truth, so a later DGFE import cannot duplicate the live
+    stream.  When RCH exposes the explicit label only on a management/pre-fiscal
+    print, current correlation membership groups copies and alternative views;
+    the largest structured -30% total is counted once for that episode.
+    """
+
+    semantic_type = _version_column(
+        DocumentVersion.document_type,
+        Document.document_type,
+    )
+    external_code = _version_column(
+        DocumentVersion.external_document_code,
+        Document.external_document_code,
+    ).label("external_document_code")
+    rows = session.execute(
+        select(
+            occurrence.c.transaction_id,
+            Document,
+            DocumentVersion,
+            Device.external_id.label("device_external_id"),
+            external_code,
+            semantic_type,
+            DocumentCorrelationMember.criteria,
+            DocumentCorrelationMember.contribution_score,
+        )
+        .select_from(occurrence)
+        .join(
+            DocumentCorrelationMember,
+            DocumentCorrelationMember.correlation_id == occurrence.c.correlation_id,
+        )
+        .join(Document, Document.id == DocumentCorrelationMember.document_id)
+        .join(Device, Device.id == Document.device_id)
+        .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+        .where(
+            DocumentVersion.id == _latest_version_id(),
+            DocumentVersion.complete.is_(True),
+            semantic_type.in_(
+                (
+                    DocumentType.COMMERCIAL_DOCUMENT.value,
+                    DocumentType.MANAGEMENT_DOCUMENT.value,
+                )
+            ),
+            *episode_period,
+        )
+    ).all()
+    if not rows:
+        return MONEY_ZERO
+
+    version_ids = {row[2].id for row in rows}
+    lines_by_version: dict[UUID, list[DocumentLine]] = {}
+    for line in session.scalars(
+        select(DocumentLine)
+        .where(DocumentLine.document_version_id.in_(version_ids))
+        .order_by(DocumentLine.document_version_id, DocumentLine.sequence)
+    ):
+        lines_by_version.setdefault(line.document_version_id, []).append(line)
+
+    candidates_by_transaction: dict[UUID, list[dict[str, Any]]] = {}
+    for (
+        transaction_id,
+        document,
+        version,
+        device_id,
+        code,
+        document_type,
+        criteria,
+        contribution_score,
+    ) in rows:
+        document_type_value = str(document_type)
+        version_lines = lines_by_version.get(version.id, ())
+        generic, employee = _employee_discount_adjustments(
+            version,
+            version_lines,
+        )
+        if document_type_value == DocumentType.MANAGEMENT_DOCUMENT.value:
+            validated_management_total = _validated_management_employee_discount_total(
+                version,
+                version_lines,
+            )
+            employee = (
+                (validated_management_total,)
+                if validated_management_total > MONEY_ZERO
+                else ()
+            )
+        member_criteria = set(criteria or [])
+        metadata = version.raw_metadata if isinstance(version.raw_metadata, dict) else {}
+        candidates_by_transaction.setdefault(transaction_id, []).append(
+            {
+                "document_id": document.id,
+                "device_id": str(device_id),
+                "external_code": str(code).strip().upper() if code else None,
+                "external_suffix": _version_value(
+                    version,
+                    document,
+                    "external_document_code_suffix",
+                ),
+                "commercial_reference": _version_value(
+                    version,
+                    document,
+                    "commercial_reference_code",
+                ),
+                "order_code": _version_value(version, document, "order_code"),
+                "table_code": _version_value(version, document, "table_code"),
+                "document_time": (
+                    _version_value(version, document, "document_timestamp")
+                    or document.captured_at
+                ),
+                "document_type": document_type_value,
+                "gross_total": (
+                    version.gross_total
+                    if version.gross_total is not None
+                    else version.net_total
+                ),
+                "authority": "ECONOMIC_LINE_AUTHORITY" in member_criteria,
+                "strong_fiscal_reference": bool(
+                    member_criteria & _STRONG_MANAGEMENT_FISCAL_CRITERIA
+                )
+                or (
+                    contribution_score >= 80
+                    and member_criteria >= _STRONG_GENERAL_SALE_CRITERIA
+                ),
+                "product_keys": _dashboard_product_keys(version_lines),
+                "suffix_evidence": metadata.get(
+                    "external_document_code_suffix_evidence"
+                ),
+                "generic": generic,
+                "employee": employee,
+                "dgfe": (
+                    metadata.get("provenance") == "RCH_DGFE_EXPORT"
+                ),
+            }
+        )
+
+    total = MONEY_ZERO
+    for candidates in candidates_by_transaction.values():
+        commercial_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["document_type"] == DocumentType.COMMERCIAL_DOCUMENT.value
+        ]
+        management_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["document_type"] == DocumentType.MANAGEMENT_DOCUMENT.value
+        ]
+        authorities = [
+            candidate for candidate in commercial_candidates if candidate["authority"]
+        ]
+        if not authorities:
+            # Legacy correlations predate authority markers.  Preserve split
+            # fiscal receipts, but collapse two representations carrying the
+            # same strong device/progressive identity.
+            selected_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+            for candidate in commercial_candidates:
+                identity = (
+                    (candidate["device_id"], candidate["external_code"])
+                    if candidate["external_code"]
+                    else ("DOCUMENT", str(candidate["document_id"]))
+                )
+                current = selected_by_identity.get(identity)
+                rank = (
+                    sum(candidate["employee"], MONEY_ZERO),
+                    int(candidate["dgfe"]),
+                    str(candidate["document_id"]),
+                )
+                if current is None or rank > current["rank"]:
+                    selected_by_identity[identity] = {**candidate, "rank": rank}
+            authorities = list(selected_by_identity.values())
+
+        transaction_total = MONEY_ZERO
+        for authority in authorities:
+            explicit = tuple(authority["employee"])
+            if explicit:
+                transaction_total += sum(explicit, MONEY_ZERO)
+                continue
+            generic = list(authority["generic"])
+            if not generic:
+                continue
+            companions = [
+                candidate
+                for candidate in candidates
+                if candidate["document_id"] != authority["document_id"]
+                and (
+                    not authority["external_code"]
+                    or candidate["external_code"] == authority["external_code"]
+                )
+            ]
+            for amount in (
+                value for companion in companions for value in companion["employee"]
+            ):
+                try:
+                    index = generic.index(amount)
+                except ValueError:
+                    continue
+                transaction_total += amount
+                generic.pop(index)
+        if transaction_total <= MONEY_ZERO:
+            # Observed deployments print the explicit employee discount on a
+            # management/pre-fiscal document while the corresponding fiscal
+            # stream can omit the label.  Copies and pre-fiscal projections in
+            # the same transaction are alternative views of one sale, so use
+            # the largest structured total once rather than summing them.
+            transaction_total = max(
+                (
+                    sum(candidate["employee"], MONEY_ZERO)
+                    for candidate in management_candidates
+                    if any(
+                        _management_fiscal_pair_valid(candidate, fiscal)
+                        for fiscal in commercial_candidates
+                    )
+                ),
+                default=MONEY_ZERO,
+            )
+        total += transaction_total
+    return total
+
+
 def _alert_has_device(device_external_id: str) -> Any:
     """Build an isolated membership predicate for an alert's correlated devices."""
 
@@ -837,6 +1447,15 @@ class SqlAlchemyApiRepository:
                     DocumentType.KITCHEN_ORDER,
                 )
             )
+            department_quantities = _dashboard_sales_department_quantities(
+                session,
+                document_period=document_period,
+            )
+            employee_discount_total = _dashboard_employee_discount_total(
+                session,
+                occurrence=occurrence,
+                episode_period=episode_period,
+            )
             open_alerts = (
                 session.scalar(
                     select(func.count())
@@ -1051,6 +1670,10 @@ class SqlAlchemyApiRepository:
                 incomplete_jobs=incomplete_jobs,
                 false_positive_alerts=false_positives,
                 justified_alerts=justified,
+                sold_product_quantity_bar=department_quantities["BAR"],
+                sold_product_quantity_kitchen=department_quantities["CUCINA"],
+                sold_product_quantity_pizzeria=department_quantities["PIZZERIA"],
+                employee_discount_total=employee_discount_total,
             )
 
     def diagnostics(self) -> DiagnosticsView:
@@ -1796,13 +2419,19 @@ class SqlAlchemyApiRepository:
             observed_receipt_header = _version_value(
                 version, document, "receipt_header"
             )
+            receipt_header_evidence = (
+                observed_receipt_header.get("evidence")
+                if isinstance(observed_receipt_header, dict)
+                else None
+            )
             receipt_header = (
                 _receipt_header_payload(
                     observed_receipt_header,
-                    evidence="RCH_PRINTED_HEADER",
+                    evidence=str(receipt_header_evidence),
                 )
                 if isinstance(observed_receipt_header, dict)
-                and observed_receipt_header.get("evidence") == "RCH_PRINTED_HEADER"
+                and receipt_header_evidence
+                in {"RCH_PRINTED_HEADER", "RCH_DGFE_EXPORT"}
                 else None
             )
             if receipt_header is None and selected_document_type not in {
@@ -2177,16 +2806,23 @@ class SqlAlchemyApiRepository:
             return {
                 "request": "CLIENT_TO_DEVICE",
                 "response": "DEVICE_TO_CLIENT",
+                "source": "METADATA",
             }[direction]
         except KeyError as exc:
-            raise ValueError("direction must be request or response") from exc
+            raise ValueError("direction must be request, response or source") from exc
 
     @staticmethod
     def _raw_artifact(raw: RawPayload, filename_prefix: str) -> RawArtifact:
+        xml_source = raw.artifact_role in {
+            ArtifactRole.DGFE_XML.value,
+            ArtifactRole.FISCAL_SUMMARY_XML.value,
+        }
         return RawArtifact(
             raw.payload,
-            f"{filename_prefix}_{raw.artifact_role.lower()}.raw",
+            f"{filename_prefix}_{raw.artifact_role.lower()}."
+            f"{'xml' if xml_source else 'raw'}",
             raw.sha256,
+            media_type="application/xml" if xml_source else "application/octet-stream",
         )
 
     def get_document_raw(
@@ -2206,15 +2842,25 @@ class SqlAlchemyApiRepository:
                 )
             )
             raw = session.get(RawPayload, version.raw_payload_id) if version else None
-            if raw is not None and raw.direction != stored_direction:
+            source_roles = {
+                ArtifactRole.DGFE_XML.value,
+                ArtifactRole.FISCAL_SUMMARY_XML.value,
+            }
+            if raw is not None and (
+                raw.direction != stored_direction
+                or (direction == "source" and raw.artifact_role not in source_roles)
+            ):
                 raw = None
             if raw is None:
+                criteria = [
+                    RawPayload.job_id == document.job_id,
+                    RawPayload.direction == stored_direction,
+                ]
+                if direction == "source":
+                    criteria.append(RawPayload.artifact_role.in_(source_roles))
                 raw = session.scalar(
                     select(RawPayload)
-                    .where(
-                        RawPayload.job_id == document.job_id,
-                        RawPayload.direction == stored_direction,
-                    )
+                    .where(*criteria)
                     .order_by(RawPayload.created_at, RawPayload.id)
                     .limit(1)
                 )
@@ -2319,6 +2965,14 @@ class SqlAlchemyApiRepository:
     def _transaction_view(
         self, session: Session, correlation: DocumentCorrelation
     ) -> TransactionView:
+        members = {
+            member.document_id: member
+            for member in session.scalars(
+                select(DocumentCorrelationMember).where(
+                    DocumentCorrelationMember.correlation_id == correlation.id
+                )
+            )
+        }
         documents = session.scalars(
             select(Document)
             .join(
@@ -2359,12 +3013,35 @@ class SqlAlchemyApiRepository:
             for document in documents
             if semantics(document, "document_type") in SALE_FISCAL_TYPES
         ]
-        fiscal_documents = [
+        complete_fiscal_documents = [
             document
             for document in commercial_documents
             if document.id in versions
             and versions[document.id].complete
             and versions[document.id].gross_total is not None
+        ]
+        total_authority_ids = {
+            document_id
+            for document_id, member in members.items()
+            if "ECONOMIC_TOTAL_AUTHORITY" in (member.criteria or [])
+        }
+        payment_authority_ids = {
+            document_id
+            for document_id, member in members.items()
+            if "ECONOMIC_PAYMENT_AUTHORITY" in (member.criteria or [])
+        }
+        line_authority_ids = {
+            document_id
+            for document_id, member in members.items()
+            if "ECONOMIC_LINE_AUTHORITY" in (member.criteria or [])
+        }
+        # Correlations created before the DGFE-aware algorithm have no
+        # authority markers and retain their historical projection.  New
+        # correlations count one selected observation per fiscal identity.
+        fiscal_documents = [
+            document
+            for document in complete_fiscal_documents
+            if not total_authority_ids or document.id in total_authority_ids
         ]
         fiscal_documents.sort(key=lambda item: (document_time(item), item.captured_at, item.id))
         economic_closures = [
@@ -2488,7 +3165,15 @@ class SqlAlchemyApiRepository:
         )
         if fiscal_documents:
             observed_final_total: Decimal | None = fiscal_total
-            final_documents = fiscal_documents
+            final_documents = (
+                [
+                    document
+                    for document in commercial_documents
+                    if document.id in line_authority_ids
+                ]
+                if line_authority_ids
+                else fiscal_documents
+            )
             settlement_basis = "FISCAL"
         elif economic_closures:
             observed_final_total = management_total
@@ -2741,6 +3426,44 @@ class SqlAlchemyApiRepository:
                 "settlement_basis": settlement_basis,
                 "difference": str(difference) if difference is not None else None,
                 "lines": _stored_line_diff(prebill_lines, fiscal_lines),
+                "fiscal_evidence": {
+                    "deduplicated": any(
+                        member.role == "FISCAL_EVIDENCE" for member in members.values()
+                    ),
+                    "document_ids": [str(document.id) for document in commercial_documents],
+                    "total_authority_document_ids": [
+                        str(document.id)
+                        for document in fiscal_documents
+                    ],
+                    "payment_authority_document_ids": [
+                        str(document_id)
+                        for document_id in sorted(payment_authority_ids, key=str)
+                    ],
+                    "line_authority_document_ids": [
+                        str(document.id)
+                        for document in (
+                            [
+                                item
+                                for item in commercial_documents
+                                if item.id in line_authority_ids
+                            ]
+                            if line_authority_ids
+                            else fiscal_documents
+                        )
+                    ],
+                    "mismatch": "dgfe_evidence_mismatch" in matched_criteria,
+                    "mismatch_fields": sorted(
+                        criterion
+                        for criterion in (correlation.unmatched_criteria or [])
+                        if str(criterion).startswith("dgfe_")
+                        and str(criterion).endswith("_consistency")
+                    ),
+                    "explanation": (
+                        correlation.explanation
+                        if "dgfe_fiscal_identity" in matched_criteria
+                        else None
+                    ),
+                },
             },
         )
 
@@ -3566,7 +4289,14 @@ class SqlAlchemyIngestionRepository:
                     return RepositoryImportResult(ImportDisposition.DUPLICATE, str(existing.id))
                 job = self._insert_envelope(session, envelope)
                 self._record_import_attempt(session, envelope, job, status="IMPORTED")
-                self._update_device_status(session, envelope, job)
+                if envelope.source_kind not in {
+                    SourceKind.RCH_XTOOLS_DGFE_V1,
+                    SourceKind.RCH_XTOOLS_FISCAL_SUMMARY_V1,
+                }:
+                    # An offline fiscal-memory export proves document content,
+                    # not current network reachability or a fresh physical
+                    # print.  It must not make the device look ONLINE.
+                    self._update_device_status(session, envelope, job)
                 session.flush()
                 return RepositoryImportResult(ImportDisposition.IMPORTED, str(job.id))
         except IntegrityError as exc:
@@ -3870,7 +4600,14 @@ class SqlAlchemyIngestionRepository:
             ),
             status=envelope.status,
             capture_complete=envelope.complete,
-            timeline_complete=bool(envelope.chunks),
+            timeline_complete=(
+                bool(envelope.chunks)
+                or envelope.source_kind
+                in {
+                    SourceKind.RCH_XTOOLS_DGFE_V1,
+                    SourceKind.RCH_XTOOLS_FISCAL_SUMMARY_V1,
+                }
+            ),
             import_status="IMPORTED",
             warnings=list(envelope.warnings),
             errors=[],
@@ -4042,60 +4779,135 @@ class SqlAlchemyIngestionRepository:
             )
             session.add(parser)
             session.flush()
-        request_raw = (raw_payloads.get(ArtifactRole.REQUEST_RAW.value) or [None])[0]
+        source_raw = next(
+            (
+                (raw_payloads.get(role.value) or [None])[0]
+                for role in (
+                    ArtifactRole.REQUEST_RAW,
+                    ArtifactRole.DGFE_XML,
+                    ArtifactRole.FISCAL_SUMMARY_XML,
+                )
+                if (raw_payloads.get(role.value) or [None])[0] is not None
+            ),
+            None,
+        )
         previous_hash = ZERO_HASH
         for sequence, parsed in enumerate(envelope.documents, start=1):
             semantic = parsed.semantic
-            document = Document(
-                device_id=device.id,
-                session_id=proxy_session.id,
-                job_id=job.id,
-                source_document_key=parsed.external_id,
-                document_type=parsed.document_type.value,
-                subtype=parsed.subtype or parsed.document_type.value,
-                external_document_code=_optional_text(
-                    _first(
-                        semantic,
-                        "external_document_code",
-                        "document_code",
-                        "document_number",
-                        "number",
-                    )
-                ),
-                external_document_code_suffix=_optional_text(
-                    _first(
-                        semantic,
-                        "external_document_code_suffix",
-                        "document_number_suffix",
-                    )
-                ),
-                commercial_reference_code=_optional_text(
-                    _first(
-                        semantic,
-                        "commercial_reference_code",
-                        "commercial_document_reference",
-                    )
-                ),
-                order_code=_optional_text(
-                    _first(semantic, "order_code", "order_reference", "order_number")
-                ),
-                table_code=_optional_text(_first(semantic, "table_code", "table", "table_number")),
-                operator_code=_optional_text(
-                    _first(semantic, "operator_code", "operator", "cashier")
-                ),
-                terminal_code=_optional_text(
-                    _first(semantic, "terminal_code", "terminal", "register")
-                ),
-                document_timestamp=parsed.capture_time,
-                captured_at=parsed.capture_time or envelope.opened_at,
+            document_type = parsed.document_type.value
+            subtype = parsed.subtype or document_type
+            external_document_code = _optional_text(
+                _first(
+                    semantic,
+                    "external_document_code",
+                    "document_code",
+                    "document_number",
+                    "number",
+                )
             )
-            session.add(document)
-            session.flush()
+            external_document_code_suffix = _optional_text(
+                _first(
+                    semantic,
+                    "external_document_code_suffix",
+                    "document_number_suffix",
+                )
+            )
+            commercial_reference_code = _optional_text(
+                _first(
+                    semantic,
+                    "commercial_reference_code",
+                    "commercial_document_reference",
+                )
+            )
+            order_code = _optional_text(
+                _first(semantic, "order_code", "order_reference", "order_number")
+            )
+            table_code = _optional_text(
+                _first(semantic, "table_code", "table", "table_number")
+            )
+            operator_code = _optional_text(
+                _first(semantic, "operator_code", "operator", "cashier")
+            )
+            terminal_code = _optional_text(
+                _first(semantic, "terminal_code", "terminal", "register")
+            )
+            receipt_header = (
+                semantic.get("receipt_header")
+                if isinstance(semantic.get("receipt_header"), dict)
+                else None
+            )
+            rch_serial_number = _optional_text(semantic.get("rch_serial_number"))
+
+            document: Document | None = None
+            if (
+                envelope.source_kind
+                in {
+                    SourceKind.RCH_XTOOLS_DGFE_V1,
+                    SourceKind.RCH_XTOOLS_FISCAL_SUMMARY_V1,
+                }
+                and rch_serial_number is not None
+                and external_document_code is not None
+            ):
+                # Overlapping DGFE exports are common.  Merge only with an
+                # earlier DGFE logical document, never with a live stream
+                # document: the new XML and its RAW still get their own job,
+                # while the web projection remains one fiscal document with
+                # append-only versions from every export.
+                matches = session.scalars(
+                    select(Document)
+                    .join(PrintJob, PrintJob.id == Document.job_id)
+                    .where(
+                        Document.device_id == device.id,
+                        Document.rch_serial_number == rch_serial_number,
+                        Document.external_document_code == external_document_code,
+                        Document.document_type == document_type,
+                        PrintJob.source_system == envelope.source_kind.value,
+                    )
+                    .with_for_update()
+                    .limit(2)
+                ).all()
+                if len(matches) > 1:
+                    raise ValueError(
+                        "multiple DGFE documents already share one strong fiscal identity"
+                    )
+                document = matches[0] if matches else None
+            if document is None:
+                document = Document(
+                    device_id=device.id,
+                    session_id=proxy_session.id,
+                    job_id=job.id,
+                    source_document_key=parsed.external_id,
+                    document_type=document_type,
+                    subtype=subtype,
+                    external_document_code=external_document_code,
+                    external_document_code_suffix=external_document_code_suffix,
+                    commercial_reference_code=commercial_reference_code,
+                    order_code=order_code,
+                    table_code=table_code,
+                    operator_code=operator_code,
+                    terminal_code=terminal_code,
+                    receipt_header=receipt_header,
+                    rch_serial_number=rch_serial_number,
+                    document_timestamp=parsed.capture_time,
+                    captured_at=parsed.capture_time or envelope.opened_at,
+                )
+                session.add(document)
+                session.flush()
+                version_sequence = 1
+            else:
+                version_sequence = (
+                    session.scalar(
+                        select(func.max(DocumentVersion.version_sequence)).where(
+                            DocumentVersion.document_id == document.id
+                        )
+                    )
+                    or 0
+                ) + 1
             normalized_text = _text(
                 _first(semantic, "normalized_text", "text", "clean_text"),
                 default="",
             )
-            source_hash = request_raw.sha256 if request_raw else envelope.manifest_sha256
+            source_hash = source_raw.sha256 if source_raw else envelope.manifest_sha256
             version_payload = {
                 "document_id": str(document.id),
                 "sequence": sequence,
@@ -4108,19 +4920,21 @@ class SqlAlchemyIngestionRepository:
             version = DocumentVersion(
                 document_id=document.id,
                 parser_version_id=parser.id,
-                raw_payload_id=request_raw.id if request_raw else None,
-                version_sequence=1,
+                raw_payload_id=source_raw.id if source_raw else None,
+                version_sequence=version_sequence,
                 parsed_at=datetime.now(UTC),
-                document_type=document.document_type,
-                subtype=document.subtype,
-                external_document_code=document.external_document_code,
-                external_document_code_suffix=document.external_document_code_suffix,
-                commercial_reference_code=document.commercial_reference_code,
-                order_code=document.order_code,
-                table_code=document.table_code,
-                operator_code=document.operator_code,
-                terminal_code=document.terminal_code,
-                document_timestamp=document.document_timestamp,
+                document_type=document_type,
+                subtype=subtype,
+                external_document_code=external_document_code,
+                external_document_code_suffix=external_document_code_suffix,
+                commercial_reference_code=commercial_reference_code,
+                order_code=order_code,
+                table_code=table_code,
+                operator_code=operator_code,
+                terminal_code=terminal_code,
+                receipt_header=receipt_header,
+                rch_serial_number=rch_serial_number,
+                document_timestamp=parsed.capture_time,
                 gross_total=_as_decimal(_first(semantic, "gross_total", "total", "total_amount")),
                 net_total=_as_decimal(_first(semantic, "net_total", "taxable_total")),
                 discount_total=_as_decimal(_first(semantic, "discount_total", "discount")),
@@ -4133,7 +4947,7 @@ class SqlAlchemyIngestionRepository:
                 evidence_level=parsed.evidence,
                 source_manifest_sha256=envelope.manifest_sha256,
                 source_payload_sha256=source_hash,
-                source_path=(request_raw.source_path if request_raw else job.manifest_path),
+                source_path=(source_raw.source_path if source_raw else job.manifest_path),
                 complete=parsed.complete,
                 warnings=list(parsed.warnings),
                 errors=list(semantic.get("issues", [])),

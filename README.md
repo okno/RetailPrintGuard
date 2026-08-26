@@ -10,7 +10,7 @@ le direzioni e non importa parser, API o database. La cattura usa una coda
 limitata e uno spool locale; un guasto del control plane non deve trasformarsi
 in una dipendenza sincrona della stampa.
 
-> Stato: release `0.4.8`. I test software sintetici coprono relay,
+> Stato: release `0.4.9`. I test software sintetici coprono relay,
 > spool, configurazione, import, correlazione, regole, modelli e API. Il collaudo
 > su hardware reale, il confronto PCAP direct-vs-proxy e l'installazione sul
 > target Debian 12 non sono ancora attestati da questo repository. Consultare
@@ -137,6 +137,7 @@ RetailPrintGuard/
 - [Episodi di vendita e riduzione dei falsi positivi](docs/ANTIFRODE_EPISODI_VENDITA.md)
 - [Modello antifrode](docs/FRAUD_DETECTION_MODEL.md)
 - [Importazione storica](docs/IMPORT_STORICO.md)
+- [Importazione DGFE e memoria fiscale RCH](docs/RCH_DGFE_IMPORT.md)
 - [Migrazione dai proxy standalone](docs/MIGRAZIONE_DA_LEGACY.md)
 - [Guida operativa](docs/OPERATIONS.md)
 - [Installazione Debian](docs/INSTALLAZIONE_DEBIAN.md)

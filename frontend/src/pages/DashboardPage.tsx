@@ -5,7 +5,11 @@ import {
   DevicesOutlined,
   EuroOutlined,
   HistoryOutlined,
+  LocalCafeOutlined,
+  LocalPizzaOutlined,
+  PercentOutlined,
   PriceChangeOutlined,
+  RestaurantOutlined,
   ShieldOutlined,
   WarningAmberOutlined,
 } from '@mui/icons-material'
@@ -26,6 +30,7 @@ import { transactionDetailPath } from '../routes'
 import type { Dashboard, Device, Diagnostics, Page, Transaction } from '../types'
 
 const euros = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
+const quantities = new Intl.NumberFormat('it-IT', { maximumFractionDigits: 4 })
 
 function routeWithPeriod(path: string, period: URLSearchParams, extras?: Record<string, string>) {
   const query = new URLSearchParams()
@@ -83,6 +88,18 @@ export function DashboardPage() {
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ammanco potenziale totale" value={euros.format(Number(economicDifference))} helper="somma unica degli episodi del periodo" icon={<EuroOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Incompleti da revisionare" value={incompleteJobs} helper="il RAW originale non viene eliminato" icon={<AssignmentLateOutlined />} tone={theme.palette.secondary.main} to={routeWithPeriod('/incompleti', period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Storico non operativo" value={archivedKnown ? archived : '—'} helper="falsi positivi e giustificati" icon={<HistoryOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'archive' })} /></Grid>
+        <Grid size={{ xs: 12 }} sx={{ mt: 1 }}>
+          <Box>
+            <Typography variant="h2">Vendite per reparto</Typography>
+            <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+              Quantità nette delle righe prodotto nel periodo selezionato; le variazioni negative riducono il totale.
+            </Typography>
+          </Box>
+        </Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Prodotti BAR" value={quantities.format(Number(data.sold_product_quantity_bar ?? 0))} helper="quantità netta venduta" icon={<LocalCafeOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Prodotti CUCINA" value={quantities.format(Number(data.sold_product_quantity_kitchen ?? 0))} helper="quantità netta venduta" icon={<RestaurantOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Prodotti PIZZERIA" value={quantities.format(Number(data.sold_product_quantity_pizzeria ?? 0))} helper="quantità netta venduta" icon={<LocalPizzaOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Sconti dipendenti -30%" value={euros.format(Number(data.employee_discount_total ?? 0))} helper="autorizzati; esclusi dal rischio antifrode" icon={<PercentOutlined />} tone={theme.palette.success.main} /></Grid>
         <Grid size={{ xs: 12 }}>
           <Card
             sx={{

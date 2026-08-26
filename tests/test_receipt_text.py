@@ -179,3 +179,27 @@ def test_document_text_export_prepends_only_configured_header() -> None:
     assert text.index("Insegna: LAB CONFIGURATO") < text.index("TESTO DOCUMENTO")
     assert "Configurata sul dispositivo (non osservata nel flusso)" in text
     assert "PROVENIENZA INTESTAZIONE" not in text
+
+
+def test_document_text_export_projects_dgfe_header_with_distinct_provenance() -> None:
+    document = SimpleNamespace(
+        receipt_header={
+            "schema_version": 1,
+            "merchant_name": "LAB MEMORIA",
+            "legal_name": None,
+            "address_lines": ["VIA SINTETICA 42"],
+            "phone": None,
+            "tax_code": None,
+            "vat_number": "99999999999",
+            "evidence": "RCH_DGFE_EXPORT",
+        },
+        receipt_text="Articolo sintetico  1,23",
+        normalized_text="ignored",
+    )
+
+    text = document_text_export(document)
+
+    assert text.count("LAB MEMORIA") == 1
+    assert text.index("Insegna: LAB MEMORIA") < text.index("TESTO DOCUMENTO")
+    assert "Estratta dall'export della memoria fiscale DGFE" in text
+    assert "osservata nel flusso" not in text.lower()

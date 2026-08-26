@@ -17,7 +17,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Select, and_, or_, select
+from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from retailprintguard.common.domain import (
@@ -41,6 +41,8 @@ from retailprintguard.correlation.engine import (
     LineChangeType,
     apply_order_change_lines,
     compare_document_lines,
+    dgfe_document_number,
+    is_dgfe_fiscal_evidence,
 )
 from retailprintguard.db.models import (
     ActiveParserVersion,
@@ -612,6 +614,11 @@ def _candidate_batch(
         for item in loaded_seeds
         if (suffix := _printed_counter_suffix(item.value.commercial_reference_code)) is not None
     }
+    dgfe_document_suffixes = {
+        suffix
+        for item in loaded_seeds
+        if (suffix := dgfe_document_number(item.value)) is not None
+    }
     table_codes = {item.value.table_code for item in loaded_seeds if item.value.table_code}
     source_job_ids = {item.value.source_job_id for item in loaded_seeds if item.value.source_job_id}
     strong_blocks = []
@@ -650,7 +657,8 @@ def _candidate_batch(
                 ),
             )
         )
-    if commercial_reference_suffixes:
+    fiscal_link_suffixes = commercial_reference_suffixes | dgfe_document_suffixes
+    if fiscal_link_suffixes:
         # This indexed lookup only broadens the bounded candidate
         # neighbourhood. The engine still requires same table, line identity,
         # status-response provenance and a narrow time window before a suffix
@@ -658,12 +666,12 @@ def _candidate_batch(
         strong_blocks.append(
             or_(
                 DocumentVersion.external_document_code_suffix.in_(
-                    commercial_reference_suffixes
+                    fiscal_link_suffixes
                 ),
                 and_(
                     _legacy_version_semantics(),
                     Document.external_document_code_suffix.in_(
-                        commercial_reference_suffixes
+                        fiscal_link_suffixes
                     ),
                 ),
             )
@@ -680,9 +688,14 @@ def _candidate_batch(
         )
     if source_job_ids:
         strong_blocks.append(PrintJob.source_job_id.in_(source_job_ids))
+    semantic_document_time = func.coalesce(
+        DocumentVersion.document_timestamp,
+        Document.document_timestamp,
+        Document.captured_at,
+    )
     candidate_statement = _document_query().where(
-        Document.captured_at >= earliest - window,
-        Document.captured_at <= latest + window,
+        semantic_document_time >= earliest - window,
+        semantic_document_time <= latest + window,
         or_(Document.id.in_(seed_ids), *strong_blocks),
     )
     candidate_ids = {row[0].id for row in session.execute(candidate_statement)}
@@ -752,6 +765,12 @@ def _candidate_pairs(
                 "commercial_suffix",
                 document.external_document_code_suffix,
             )].append(document)
+        if (
+            document.type is DocumentType.COMMERCIAL_DOCUMENT
+            and is_dgfe_fiscal_evidence(document)
+            and (dgfe_suffix := dgfe_document_number(document)) is not None
+        ):
+            blocks[("commercial_suffix", dgfe_suffix)].append(document)
         if (
             document.type
             in {
@@ -833,10 +852,19 @@ def _supersede_non_sale_correlations(
     )
 
 
-def _member_role(document: NormalizedDocument) -> str:
+def _member_role(
+    document: NormalizedDocument,
+    *,
+    fiscal_total_authorities: set[UUID] | None = None,
+) -> str:
     if document.type in _SOURCE_TYPES:
         return "SOURCE"
     if document.type in _FISCAL_TYPES:
+        if (
+            fiscal_total_authorities
+            and document.id not in fiscal_total_authorities
+        ):
+            return "FISCAL_EVIDENCE"
         return "FISCAL"
     if document.type is DocumentType.PAYMENT:
         return "PAYMENT"
@@ -1051,6 +1079,9 @@ class CorrelationWorker:
         )
         session.add(correlation)
         session.flush()
+        total_authorities = set(transaction.fiscal_total_document_ids)
+        payment_authorities = set(transaction.fiscal_payment_document_ids)
+        line_authorities = set(transaction.fiscal_line_document_ids)
         for document in transaction.documents:
             scores = [
                 self.engine.score_candidate_pair(document, other)
@@ -1058,14 +1089,25 @@ class CorrelationWorker:
                 if other.id != document.id
             ]
             best = max(scores, key=lambda item: item.score, default=None)
-            criteria = [] if best is None else [item.name for item in best.criteria if item.matched]
+            criteria = (
+                [] if best is None else [item.name for item in best.criteria if item.matched]
+            )
+            if document.id in total_authorities:
+                criteria.append("ECONOMIC_TOTAL_AUTHORITY")
+            if document.id in payment_authorities:
+                criteria.append("ECONOMIC_PAYMENT_AUTHORITY")
+            if document.id in line_authorities:
+                criteria.append("ECONOMIC_LINE_AUTHORITY")
             session.add(
                 DocumentCorrelationMember(
                     correlation_id=correlation.id,
                     document_id=document.id,
-                    role=_member_role(document),
+                    role=_member_role(
+                        document,
+                        fiscal_total_authorities=total_authorities,
+                    ),
                     contribution_score=0 if best is None else best.score,
-                    criteria=criteria,
+                    criteria=sorted(set(criteria)),
                 )
             )
         return correlation, True
@@ -1191,6 +1233,9 @@ class CorrelationWorker:
         ]
     ]:
         documents = list(transaction.documents)
+        total_authorities = set(transaction.fiscal_total_document_ids)
+        payment_authorities = set(transaction.fiscal_payment_document_ids)
+        line_authorities = set(transaction.fiscal_line_document_ids)
         sources = [document for document in documents if document.type in _SOURCE_TYPES]
         desired: list[
             tuple[
@@ -1239,11 +1284,25 @@ class CorrelationWorker:
                             "document_type": document.type.value,
                             "external_document_code": document.external_document_code,
                             "total": str(document.gross_total),
+                            "economic_authority": (
+                                document.id in total_authorities
+                                if document.type in _FISCAL_TYPES and total_authorities
+                                else True
+                            ),
                         },
                         document.lines,
                     )
                 )
-            if document.payments and document.type is not DocumentType.PAYMENT:
+            authoritative_payment_evidence = (
+                document.type not in _FISCAL_TYPES
+                or not payment_authorities
+                or document.id in payment_authorities
+            )
+            if (
+                document.payments
+                and document.type is not DocumentType.PAYMENT
+                and authoritative_payment_evidence
+            ):
                 desired.append(
                     (
                         _document_time(document),
@@ -1301,6 +1360,7 @@ class CorrelationWorker:
             document
             for document in documents
             if document.type in _FISCAL_TYPES and document.complete
+            and (not total_authorities or document.id in total_authorities)
         ]
         room_closures = [
             document
@@ -1311,14 +1371,22 @@ class CorrelationWorker:
                 or document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
             )
         ]
-        final_closures = sale_fiscals or room_closures
-        if prebill is not None and final_closures:
+        settlement_closures = sale_fiscals or room_closures
+        fiscal_line_closures = [
+            document
+            for document in documents
+            if document.type in _FISCAL_TYPES
+            and document.complete
+            and (not line_authorities or document.id in line_authorities)
+        ]
+        line_closures = fiscal_line_closures if sale_fiscals else room_closures
+        if prebill is not None and settlement_closures:
             # A split bill is one settlement outcome.  Comparing the prebill
             # with only its first 50 EUR receipt manufactures removals for all
             # lines paid by the second guest.
-            final_lines = tuple(line for document in final_closures for line in document.lines)
+            final_lines = tuple(line for document in line_closures for line in document.lines)
             final_document = max(
-                final_closures,
+                line_closures or settlement_closures,
                 key=lambda item: (_document_time(item), str(item.id)),
             )
             comparisons.append((prebill.lines, final_lines, final_document))
@@ -1343,9 +1411,9 @@ class CorrelationWorker:
                         after_lines,
                     )
                 )
-        if final_closures:
+        if settlement_closures:
             final = max(
-                final_closures,
+                settlement_closures,
                 key=lambda item: (_document_time(item), str(item.id)),
             )
             desired.append(
@@ -1363,7 +1431,7 @@ class CorrelationWorker:
                             else "COMMERCIAL_DOCUMENT"
                         ),
                     },
-                    final.lines,
+                    tuple(line for document in line_closures for line in document.lines),
                 )
             )
         desired.sort(key=lambda item: (item[0], item[1].value, str(item[2].id)))

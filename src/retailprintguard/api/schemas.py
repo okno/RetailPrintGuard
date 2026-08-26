@@ -93,6 +93,10 @@ class DashboardView(BaseModel):
     incomplete_jobs: int = 0
     false_positive_alerts: int = 0
     justified_alerts: int = 0
+    sold_product_quantity_bar: Decimal = Decimal("0")
+    sold_product_quantity_kitchen: Decimal = Decimal("0")
+    sold_product_quantity_pizzeria: Decimal = Decimal("0")
+    employee_discount_total: Decimal = Decimal("0")
 
 
 class SessionView(BaseModel):
@@ -221,7 +225,11 @@ class ReceiptHeaderView(BaseModel):
     phone: str | None = None
     tax_code: str | None = None
     vat_number: str | None = None
-    evidence: Literal["RCH_PRINTED_HEADER", "DEVICE_METADATA_CONFIGURED"]
+    evidence: Literal[
+        "RCH_PRINTED_HEADER",
+        "RCH_DGFE_EXPORT",
+        "DEVICE_METADATA_CONFIGURED",
+    ]
 
 
 class DocumentView(BaseModel):

@@ -35,6 +35,10 @@ def _timestamp_evidence(value: Any) -> str:
     labels = {
         "RCH_APPLICATION_PRINTED_TEXT": "testo applicativo stampato dalla RCH",
         "RCH_FOOTER_PRINTED_TEXT": "footer stampato dalla RCH",
+        "RCH_DGFE_EXPORT": "data/ora fiscale estratta dall'export DGFE",
+        "RCH_FISCAL_SUMMARY_EXPORT": (
+            "data/ora estratta dall'export della memoria fiscale riepilogo"
+        ),
         "ESC_POS_PRINTED_OPERATOR_LINE": "riga operatore stampata dal gestionale POS",
         "DEVICE_METADATA_CONFIGURED": (
             "metadato dispositivo configurato (non osservato nel flusso)"
@@ -50,6 +54,10 @@ def _serial_evidence(value: Any) -> str:
         "RCH_PRINTED_RT_PREFIX": "prefisso RT stampato dalla RCH",
         "RCH_PRINTED_BARE_SERIAL_AFTER_FOOTER": (
             "seriale stampato dopo il footer RCH"
+        ),
+        "RCH_DGFE_EXPORT": "matricola RT estratta dall'export DGFE",
+        "RCH_FISCAL_SUMMARY_EXPORT": (
+            "matricola RT estratta dall'export della memoria fiscale riepilogo"
         ),
         "DEVICE_METADATA_CONFIGURED": (
             "metadato dispositivo configurato (non osservato nel flusso)"
@@ -107,6 +115,7 @@ def _header_value(value: Any) -> str | None:
 def receipt_header_evidence_label(value: Any) -> str:
     labels = {
         "RCH_PRINTED_HEADER": "Osservata nel blocco iniziale stampato dalla RCH",
+        "RCH_DGFE_EXPORT": "Estratta dall'export della memoria fiscale DGFE",
         "DEVICE_METADATA_CONFIGURED": (
             "Configurata sul dispositivo (non osservata nel flusso)"
         ),
@@ -164,6 +173,7 @@ def rch_identity_text_lines(document: Any) -> list[str]:
     that it was not observed in the captured wire stream.
     """
 
+    document_timestamp = getattr(document, "document_timestamp", None)
     application = getattr(document, "application_timestamp", None)
     footer = getattr(document, "rch_footer_timestamp", None)
     serial = getattr(document, "rch_serial_number", None)
@@ -177,6 +187,19 @@ def rch_identity_text_lines(document: Any) -> list[str]:
         else _CONTROL_CHARACTER.sub("", str(serial)).strip() or NOT_OBSERVED_IN_FLOW
     )
     return [
+        "Ora documento fiscale: "
+        + _printed_timestamp(
+            document_timestamp,
+            getattr(document, "document_timestamp_precision", None),
+        ),
+        "  Provenienza: "
+        + (
+            _timestamp_evidence(
+                getattr(document, "document_timestamp_evidence", None)
+            )
+            if document_timestamp is not None
+            else NOT_OBSERVED_IN_FLOW
+        ),
         "Ora applicativa RCH: "
         + _printed_timestamp(
             application, getattr(document, "application_timestamp_precision", None)
@@ -255,13 +278,13 @@ def document_text_export(document: Any) -> str:
     body = receipt_text(str(source or ""))
     header = getattr(document, "receipt_header", None)
     evidence = _header_field(header, "evidence") if header is not None else None
-    configured_header = (
+    projected_header = (
         receipt_header_text_lines(document)
-        if evidence == "DEVICE_METADATA_CONFIGURED"
+        if evidence in {"DEVICE_METADATA_CONFIGURED", "RCH_DGFE_EXPORT"}
         else []
     )
     trailing_provenance = []
-    if evidence != "DEVICE_METADATA_CONFIGURED":
+    if evidence not in {"DEVICE_METADATA_CONFIGURED", "RCH_DGFE_EXPORT"}:
         trailing_provenance = [
             "",
             "PROVENIENZA INTESTAZIONE",
@@ -271,8 +294,8 @@ def document_text_export(document: Any) -> str:
         "RETAILPRINTGUARD - VISTA DERIVATA",
         "Il RAW immutabile resta autoritativo.",
         "",
-        *configured_header,
-        *(('',) if configured_header else ()),
+        *projected_header,
+        *(('',) if projected_header else ()),
         "TESTO DOCUMENTO",
         body or "Nessun testo documento disponibile.",
         *trailing_provenance,

@@ -32,6 +32,10 @@ export interface Dashboard {
   incomplete_jobs?: number
   false_positive_alerts?: number
   justified_alerts?: number
+  sold_product_quantity_bar?: string
+  sold_product_quantity_kitchen?: string
+  sold_product_quantity_pizzeria?: string
+  employee_discount_total?: string
   devices_online: number
   devices_offline: number
   spool_bytes: number
@@ -132,6 +136,7 @@ export interface DocumentLine {
 
 export type ReceiptHeaderEvidence =
   | 'RCH_PRINTED_HEADER'
+  | 'RCH_DGFE_EXPORT'
   | 'DEVICE_METADATA_CONFIGURED'
 
 export interface ReceiptHeaderRecord {

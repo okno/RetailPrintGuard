@@ -4,6 +4,8 @@ export function rchTimestampEvidenceLabel(value: string | null | undefined) {
   if (value === 'RCH_PRINTED_TEXT') return 'Testo stampato dalla cassa RCH'
   if (value === 'RCH_APPLICATION_PRINTED_TEXT') return 'Testo applicativo stampato dalla RCH'
   if (value === 'RCH_FOOTER_PRINTED_TEXT') return 'Footer stampato dalla RCH'
+  if (value === 'RCH_DGFE_EXPORT') return 'Data/ora fiscale estratta dall\'export DGFE'
+  if (value === 'RCH_FISCAL_SUMMARY_EXPORT') return 'Data/ora estratta dall\'export della memoria fiscale riepilogo'
   if (value === 'ESC_POS_PRINTED_OPERATOR_LINE') return 'Riga operatore stampata dal gestionale POS'
   if (value === 'DEVICE_METADATA_CONFIGURED') return 'Metadato dispositivo configurato (non osservato nel flusso)'
   return value ? `Evidenza dichiarata: ${value}` : NOT_OBSERVED_IN_FLOW
@@ -12,6 +14,8 @@ export function rchTimestampEvidenceLabel(value: string | null | undefined) {
 export function rchSerialEvidenceLabel(value: string | null | undefined) {
   if (value === 'RCH_PRINTED_RT_PREFIX') return 'Seriale osservato nel prefisso RT stampato dalla RCH'
   if (value === 'RCH_PRINTED_BARE_SERIAL_AFTER_FOOTER') return 'Seriale osservato dopo il footer stampato dalla RCH'
+  if (value === 'RCH_DGFE_EXPORT') return 'Matricola RT estratta dall\'export DGFE'
+  if (value === 'RCH_FISCAL_SUMMARY_EXPORT') return 'Matricola RT estratta dall\'export della memoria fiscale riepilogo'
   if (value === 'DEVICE_METADATA_CONFIGURED') return 'Metadato dispositivo configurato (non osservato nel flusso)'
   return value ? `Evidenza dichiarata: ${value}` : NOT_OBSERVED_IN_FLOW
 }

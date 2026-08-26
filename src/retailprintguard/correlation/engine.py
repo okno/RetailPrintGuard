@@ -22,13 +22,15 @@ from retailprintguard.common.domain import (
     PaymentRecord,
 )
 
-ALGORITHM_VERSION = "rpg-correlation-1.5.0"
+ALGORITHM_VERSION = "rpg-correlation-1.6.0"
 ZERO = Decimal("0.0000")
 HUNDRED = Decimal("100")
 _CROSS_DEPARTMENT_WINDOW_SECONDS = 30
 _KITCHEN_BASELINE_WINDOW_SECONDS = 30
 _SAME_TABLE_CHANGE_WINDOW_SECONDS = 300
 _TABLE_SALE_WINDOW_SECONDS = 300
+_DGFE_SOURCE_KIND = "rch.xtools.dgfe.v1"
+_DGFE_PROVENANCE = "RCH_DGFE_EXPORT"
 
 _SOURCE_TYPES = {
     DocumentType.ORDER,
@@ -124,6 +126,15 @@ class CorrelatedTransaction(BaseModel):
     split_payment: bool
     line_changes: tuple[LineChange, ...]
     timeline: tuple[TimelineEntry, ...]
+    # A fiscal-memory export and the live RCH stream can be two immutable
+    # evidences of the same fiscal document.  These per-dimension authorities
+    # let persistence/read models keep both documents without summing their
+    # economic content twice.  Separate dimensions preserve a useful stream
+    # fallback when an otherwise authoritative DGFE row omits lines/payments.
+    fiscal_total_document_ids: tuple[UUID, ...] = ()
+    fiscal_payment_document_ids: tuple[UUID, ...] = ()
+    fiscal_line_document_ids: tuple[UUID, ...] = ()
+    fiscal_evidence_mismatches: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def has_documents(self) -> CorrelatedTransaction:
@@ -368,6 +379,150 @@ def _printed_counter_suffix(value: str | None) -> str | None:
         return None
     match = re.search(r"(?:^|[-/])(?P<counter>\d{1,8})$", normalized)
     return match.group("counter") if match is not None else None
+
+
+def is_dgfe_fiscal_evidence(document: NormalizedDocument) -> bool:
+    """Return whether a normalized document came from the frozen DGFE adapter.
+
+    The parser name is the persisted ``SourceKind``.  The provenance marker is
+    retained as a compatibility check for append-only versions produced while
+    the importer architecture was being finalized.
+    """
+
+    metadata = document.raw_metadata
+    return document.parser_name == _DGFE_SOURCE_KIND or (
+        metadata.get("provenance") == _DGFE_PROVENANCE
+        and isinstance(metadata.get("fiscal_identity"), dict)
+    )
+
+
+def _fiscal_progressive_parts(value: str | None) -> tuple[int, int] | None:
+    normalized = _normalise(value)
+    if normalized is None:
+        return None
+    match = re.fullmatch(r"(?P<reset>\d{1,8})\s*[-/]\s*(?P<document>\d{1,8})", normalized)
+    if match is None:
+        return None
+    return int(match.group("reset")), int(match.group("document"))
+
+
+def dgfe_document_number(document: NormalizedDocument) -> str | None:
+    """Return the normalized DGFE document counter for candidate blocking."""
+
+    if not is_dgfe_fiscal_evidence(document):
+        return None
+    if (suffix := _printed_counter_suffix(document.external_document_code)) is not None:
+        return suffix
+    identity = document.raw_metadata.get("fiscal_identity")
+    if isinstance(identity, dict):
+        value = identity.get("numero_documento")
+        try:
+            return f"{int(str(value)):04d}" if value is not None else None
+        except ValueError:
+            return None
+    parts = _fiscal_progressive_parts(document.external_document_code)
+    return None if parts is None else str(parts[1])
+
+
+def _dgfe_identity(document: NormalizedDocument) -> tuple[str, int, int, str] | None:
+    if not is_dgfe_fiscal_evidence(document):
+        return None
+    identity = document.raw_metadata.get("fiscal_identity")
+    if not isinstance(identity, dict):
+        return None
+    serial = _normalise(
+        str(identity.get("matricola_rt"))
+        if identity.get("matricola_rt") is not None
+        else document.rch_serial_number
+    )
+    kind = _normalise(str(identity.get("kind"))) if identity.get("kind") is not None else None
+    try:
+        reset_number = int(str(identity["numero_azzeramento"]))
+        document_number = int(str(identity["numero_documento"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if serial is None or kind is None:
+        return None
+    return serial, reset_number, document_number, kind
+
+
+def _dgfe_pair_identity(
+    left: NormalizedDocument,
+    right: NormalizedDocument,
+) -> tuple[str, int] | None:
+    """Match two *evidences*, never two independent economic closures.
+
+    A full progressive is conclusive inside the same configured RCH device.
+    The live parser can alternatively expose only a sequence-confirmed status
+    suffix; that weaker bridge is accepted only inside the narrow sale window.
+    A conflicting observed serial always rejects the pair.
+    """
+
+    if (
+        left.type is not DocumentType.COMMERCIAL_DOCUMENT
+        or right.type is not DocumentType.COMMERCIAL_DOCUMENT
+    ):
+        return None
+    left_dgfe, right_dgfe = is_dgfe_fiscal_evidence(left), is_dgfe_fiscal_evidence(right)
+    if left_dgfe == right_dgfe:
+        return None
+    dgfe, stream = (left, right) if left_dgfe else (right, left)
+    identity = _dgfe_identity(dgfe)
+    if identity is None or dgfe.source_device_id != stream.source_device_id:
+        return None
+    serial, reset_number, document_number, _kind = identity
+    stream_serial = _normalise(stream.rch_serial_number)
+    if stream_serial is not None and stream_serial != serial:
+        return None
+    delta_seconds = int(abs((_document_time(stream) - _document_time(dgfe)).total_seconds()))
+    if _fiscal_progressive_parts(stream.external_document_code) == (
+        reset_number,
+        document_number,
+    ):
+        return "FULL_PROGRESSIVE", delta_seconds
+    suffix = stream.external_document_code_suffix
+    suffix_confirmed = (
+        suffix is not None
+        and stream.raw_metadata.get("external_document_code_suffix_evidence")
+        == "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+    )
+    if suffix_confirmed:
+        try:
+            same_counter = int(str(suffix)) == document_number
+        except ValueError:
+            same_counter = False
+        if same_counter and delta_seconds <= _TABLE_SALE_WINDOW_SECONDS:
+            return "SEQUENCE_CONFIRMED_SUFFIX", delta_seconds
+    return None
+
+
+def _payment_signature(document: NormalizedDocument) -> tuple[tuple[str, str, Decimal], ...]:
+    return tuple(
+        sorted(
+            (
+                _normalise(payment.method) or "",
+                _normalise(payment.currency) or "",
+                payment.amount,
+            )
+            for payment in document.payments
+        )
+    )
+
+
+def _line_economic_signature(
+    document: NormalizedDocument,
+) -> tuple[tuple[str, Decimal, Decimal | None, Decimal | None, Decimal | None], ...]:
+    aggregated = _aggregate_lines(document.lines)
+    return tuple(
+        (
+            key,
+            value["quantity"],
+            value["unit_price"],
+            value["discount"],
+            value["total"],
+        )
+        for key, value in sorted(aggregated.items())
+    )
 
 
 def _is_auxiliary(document: NormalizedDocument) -> bool:
@@ -1061,6 +1216,119 @@ class CorrelationEngine:
             criteria=criteria,
         )
 
+    def _dgfe_fiscal_evidence_pair(
+        self, left: NormalizedDocument, right: NormalizedDocument
+    ) -> _PairScore | None:
+        """Link live-stream and DGFE evidence for one fiscal identity.
+
+        Economic disagreements do not break the evidentiary link: hiding the
+        mismatch would be worse than retaining two disagreeing observations.
+        The identity criterion alone therefore establishes the edge, while
+        explicit zero-weight consistency criteria make every disagreement
+        auditable in the stored correlation explanation.
+        """
+
+        matched_identity = _dgfe_pair_identity(left, right)
+        if matched_identity is None:
+            return None
+        identity_kind, delta_seconds = matched_identity
+        if delta_seconds > self.time_window_seconds:
+            return None
+        dgfe, stream = (
+            (left, right) if is_dgfe_fiscal_evidence(left) else (right, left)
+        )
+        criteria: list[_Criterion] = [
+            _Criterion(
+                name="dgfe_fiscal_identity",
+                weight=100,
+                matched=True,
+                detail=(
+                    "stessa identita fiscale DGFE/stream tramite progressivo completo"
+                    if identity_kind == "FULL_PROGRESSIVE"
+                    else (
+                        "stessa identita fiscale DGFE/stream tramite contatore RCH "
+                        "osservato e confermato in sequenza"
+                    )
+                ),
+            ),
+            _Criterion(
+                name="dgfe_evidence_source",
+                weight=0,
+                matched=True,
+                detail="evidenze distinte conservate: stream RCH e memoria fiscale DGFE",
+            ),
+        ]
+        mismatches: list[str] = []
+        dgfe_total, stream_total = _total(dgfe), _total(stream)
+        if dgfe_total is not None and stream_total is not None:
+            totals_match = dgfe_total == stream_total
+            criteria.append(
+                _Criterion(
+                    name="dgfe_total_consistency",
+                    weight=0,
+                    matched=totals_match,
+                    detail=(
+                        f"totale coerente {dgfe_total}"
+                        if totals_match
+                        else f"totale DGFE {dgfe_total} diverso dallo stream {stream_total}"
+                    ),
+                )
+            )
+            if not totals_match:
+                mismatches.append("totale")
+        if dgfe.payments and stream.payments:
+            payments_match = _payment_signature(dgfe) == _payment_signature(stream)
+            criteria.append(
+                _Criterion(
+                    name="dgfe_payment_consistency",
+                    weight=0,
+                    matched=payments_match,
+                    detail=(
+                        "pagamenti coerenti"
+                        if payments_match
+                        else "pagamenti DGFE diversi dallo stream"
+                    ),
+                )
+            )
+            if not payments_match:
+                mismatches.append("pagamenti")
+        if dgfe.lines and stream.lines:
+            lines_match = _line_economic_signature(dgfe) == _line_economic_signature(stream)
+            criteria.append(
+                _Criterion(
+                    name="dgfe_line_consistency",
+                    weight=0,
+                    matched=lines_match,
+                    detail="righe coerenti" if lines_match else "righe DGFE diverse dallo stream",
+                )
+            )
+            if not lines_match:
+                mismatches.append("righe")
+        if mismatches:
+            criteria.append(
+                _Criterion(
+                    name="dgfe_evidence_mismatch",
+                    weight=0,
+                    matched=True,
+                    detail=f"mismatch DGFE/stream rilevato su: {', '.join(mismatches)}",
+                )
+            )
+        else:
+            criteria.append(
+                _Criterion(
+                    name="dgfe_evidence_consistent",
+                    weight=0,
+                    matched=True,
+                    detail="nessun mismatch nei campi economici osservabili da entrambe le fonti",
+                )
+            )
+        return _PairScore(
+            left_id=left.id,
+            right_id=right.id,
+            score=100,
+            criteria=tuple(criteria),
+        )
+
     def _device_response_pair(
         self, left: NormalizedDocument, right: NormalizedDocument
     ) -> _PairScore | None:
@@ -1107,6 +1375,9 @@ class CorrelationEngine:
         response_pair = self._device_response_pair(left, right)
         if response_pair is not None:
             return response_pair
+        dgfe_pair = self._dgfe_fiscal_evidence_pair(left, right)
+        if dgfe_pair is not None:
+            return dgfe_pair
         if (boundary := _episode_boundary_conflict(left, right)) is not None:
             return _rejected_pair(left, right, boundary)
         if (conflict := _identity_conflict(left, right)) is not None:
@@ -1340,12 +1611,87 @@ class CorrelationEngine:
             )
 
         fiscal_documents = [document for document in documents if document.type in _FISCAL_TYPES]
-        valid_fiscal_documents = [
-            document
-            for document in fiscal_documents
-            if document.complete and _total(document) is not None
+
+        # Build economic groups from explicit DGFE/stream identity edges.  A
+        # normal split payment remains one group per fiscal document; only two
+        # sources proving the same fiscal identity collapse into one economic
+        # projection.  The original documents remain untouched in ``documents``
+        # and ``timeline``.
+        fiscal_parent = {document.id: document.id for document in fiscal_documents}
+
+        def fiscal_find(value: UUID) -> UUID:
+            while fiscal_parent[value] != value:
+                fiscal_parent[value] = fiscal_parent[fiscal_parent[value]]
+                value = fiscal_parent[value]
+            return value
+
+        for index, left in enumerate(fiscal_documents):
+            for right in fiscal_documents[index + 1 :]:
+                edge = edges.get(frozenset((left.id, right.id)))
+                if edge is None or not any(
+                    criterion.name == "dgfe_fiscal_identity" and criterion.matched
+                    for criterion in edge.criteria
+                ):
+                    continue
+                left_root, right_root = fiscal_find(left.id), fiscal_find(right.id)
+                if left_root != right_root:
+                    first_root, second_root = sorted((left_root, right_root), key=str)
+                    fiscal_parent[second_root] = first_root
+
+        fiscal_groups_by_root: dict[UUID, list[NormalizedDocument]] = defaultdict(list)
+        for document in fiscal_documents:
+            fiscal_groups_by_root[fiscal_find(document.id)].append(document)
+        fiscal_groups = [
+            sorted(group, key=lambda item: (_document_time(item), str(item.id)))
+            for _, group in sorted(fiscal_groups_by_root.items(), key=lambda item: str(item[0]))
         ]
-        first_fiscal = valid_fiscal_documents[0] if valid_fiscal_documents else None
+
+        def preferred_evidence(
+            group: list[NormalizedDocument],
+            predicate: Any,
+        ) -> NormalizedDocument | None:
+            candidates = [
+                document
+                for document in group
+                if document.complete and predicate(document)
+            ]
+            return min(
+                candidates,
+                key=lambda item: (
+                    0 if is_dgfe_fiscal_evidence(item) else 1,
+                    -item.parse_confidence,
+                    _document_time(item),
+                    str(item.id),
+                ),
+                default=None,
+            )
+
+        fiscal_total_documents: list[NormalizedDocument] = []
+        fiscal_payment_documents: list[NormalizedDocument] = []
+        fiscal_line_documents: list[NormalizedDocument] = []
+        for group in fiscal_groups:
+            total_document = preferred_evidence(group, lambda item: _total(item) is not None)
+            if total_document is None:
+                continue
+            fiscal_total_documents.append(total_document)
+            payment_document = preferred_evidence(group, lambda item: bool(item.payments))
+            line_document = preferred_evidence(group, lambda item: bool(item.lines))
+            if payment_document is not None:
+                fiscal_payment_documents.append(payment_document)
+            if line_document is not None:
+                fiscal_line_documents.append(line_document)
+
+        fiscal_evidence_mismatches = tuple(
+            sorted(
+                {
+                    criterion.detail
+                    for edge in edges.values()
+                    for criterion in edge.criteria
+                    if criterion.name == "dgfe_evidence_mismatch" and criterion.matched
+                }
+            )
+        )
+        first_fiscal = fiscal_total_documents[0] if fiscal_total_documents else None
         prebill_candidates = [
             document
             for document in documents
@@ -1376,7 +1722,7 @@ class CorrelationEngine:
         # Refunds are post-close adjustments, not a lower value for the
         # original sale.  They remain immutable timeline evidence but do not
         # reduce the commercial aggregate compared with the prebill.
-        fiscal_total = sum((_total(document) or ZERO) for document in valid_fiscal_documents)
+        fiscal_total = sum((_total(document) or ZERO) for document in fiscal_total_documents)
         management_closures = [
             document
             for document in documents
@@ -1388,14 +1734,17 @@ class CorrelationEngine:
                 or document.raw_metadata.get("settlement_kind") == "ROOM_CHARGE"
             )
         ]
-        economic_closures = valid_fiscal_documents or management_closures
+        economic_closures = (
+            fiscal_line_documents if fiscal_total_documents else management_closures
+        )
         comparison_total = (
             fiscal_total
-            if valid_fiscal_documents
+            if fiscal_total_documents
             else sum((_total(document) or ZERO) for document in economic_closures)
         )
         payment_total = sum(
-            payment.amount for payment in _authoritative_payments(documents, valid_fiscal_documents)
+            payment.amount
+            for payment in _authoritative_payments(documents, fiscal_payment_documents)
         )
         difference = None if prebill_total is None else prebill_total - comparison_total
         difference_percent = (
@@ -1430,9 +1779,19 @@ class CorrelationEngine:
             payment_total=payment_total,
             difference_amount=difference,
             difference_percent=difference_percent,
-            split_payment=len(valid_fiscal_documents) > 1 and fiscal_total > ZERO,
+            split_payment=len(fiscal_total_documents) > 1 and fiscal_total > ZERO,
             line_changes=line_changes,
             timeline=timeline,
+            fiscal_total_document_ids=tuple(
+                document.id for document in fiscal_total_documents
+            ),
+            fiscal_payment_document_ids=tuple(
+                document.id for document in fiscal_payment_documents
+            ),
+            fiscal_line_document_ids=tuple(
+                document.id for document in fiscal_line_documents
+            ),
+            fiscal_evidence_mismatches=fiscal_evidence_mismatches,
         )
 
 
@@ -1453,5 +1812,7 @@ __all__ = [
     "TimelineEntry",
     "apply_order_change_lines",
     "compare_document_lines",
+    "dgfe_document_number",
+    "is_dgfe_fiscal_evidence",
     "numeric_suffix",
 ]

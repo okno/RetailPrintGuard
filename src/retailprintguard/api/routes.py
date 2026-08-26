@@ -483,7 +483,7 @@ def create_router(context: ApiContext) -> APIRouter:
         request: Request,
         user: Auditor,
         repo: Annotated[ApiRepository, Depends(repository)],
-        direction: Literal["request", "response"] = "request",
+        direction: Literal["request", "response", "source"] = "request",
         preview_bytes: Annotated[int | None, Query(ge=1, le=65_536)] = None,
     ) -> StreamingResponse:
         artifact = repo.get_document_raw(document_id, direction=direction)

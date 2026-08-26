@@ -51,6 +51,7 @@ from retailprintguard.db.models import StreamChunk as StoredChunk
 from retailprintguard.db.repository import (
     SqlAlchemyApiRepository,
     SqlAlchemyIngestionRepository,
+    _validated_management_employee_discount_total,
 )
 from retailprintguard.ingestion.dto import (
     ArtifactRole,
@@ -1103,6 +1104,418 @@ def test_dashboard_does_not_treat_non_economic_alert_difference_as_revenue_loss(
     assert dashboard.operational_alerts == 1
     assert dashboard.economic_reduction_episodes == 0
     assert dashboard.operational_economic_difference == Decimal("0.0000")
+    engine.dispose()
+
+
+def test_management_employee_discount_requires_adjacent_30_percent_and_balanced_total() -> None:
+    version = DocumentVersion(gross_total=Decimal("153.10"))
+    lines = (
+        DocumentLine(
+            sequence=1,
+            description="Coperti ed espresso non scontati",
+            line_total=Decimal("18.00"),
+        ),
+        DocumentLine(
+            sequence=2,
+            description="Articoli dipendenti",
+            line_total=Decimal("193.00"),
+        ),
+        DocumentLine(
+            sequence=3,
+            description="SCONTO DIPENDENTI 30% [-30%]",
+            line_total=Decimal("-57.90"),
+        ),
+        DocumentLine(sequence=4, description="TOT", line_total=Decimal("153.10")),
+        # Everything after the first exact total is outside the sale section.
+        DocumentLine(
+            sequence=5,
+            description="Carta di credito",
+            line_total=Decimal("153.10"),
+        ),
+        DocumentLine(
+            sequence=6,
+            description="A 10% 10% 139,18",
+            line_total=Decimal("13.92"),
+        ),
+    )
+    assert _validated_management_employee_discount_total(version, lines) == Decimal(
+        "57.90"
+    )
+
+    wrong_amount = (
+        *lines[:2],
+        DocumentLine(
+            sequence=3,
+            description="SCONTO DIPENDENTI 30% [-30%]",
+            line_total=Decimal("-57.80"),
+        ),
+        DocumentLine(sequence=4, description="TOT", line_total=Decimal("153.20")),
+        *lines[4:],
+    )
+    wrong_version = DocumentVersion(gross_total=Decimal("153.20"))
+    # The document still balances arithmetically, but -57.80 is not 30% of the
+    # immediately preceding 193.00 basis and is therefore not authorised KPI.
+    assert (
+        _validated_management_employee_discount_total(wrong_version, wrong_amount)
+        == Decimal("0.0000")
+    )
+    late_discount = (
+        *lines,
+        DocumentLine(
+            sequence=7,
+            description="SCONTO DIPENDENTI 30% [-30%]",
+            line_total=Decimal("-45.93"),
+        ),
+    )
+    assert (
+        _validated_management_employee_discount_total(version, late_discount)
+        == Decimal("0.0000")
+    )
+    for ambiguous_label in (
+        "SCONTO PROMO SPECIALE 30%",
+        "SCONTO DIPENDENTI 20% note 30%",
+    ):
+        ambiguous = (
+            *lines[:2],
+            DocumentLine(
+                sequence=3,
+                description=ambiguous_label,
+                line_total=Decimal("-57.90"),
+            ),
+            *lines[3:],
+        )
+        assert (
+            _validated_management_employee_discount_total(version, ambiguous)
+            == Decimal("0.0000")
+        )
+
+
+def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    kitchen_device_id = uuid4()
+    pizzeria_device_id = uuid4()
+
+    with factory.begin() as session:
+        session.add_all(
+            (
+                Device(
+                    id=kitchen_device_id,
+                    external_id="pos_2",
+                    name="POS cucina sintetica",
+                    device_type="pos",
+                    parser_kind="escpos",
+                    department=" cucina ",
+                    listen_ip="192.0.2.11",
+                    listen_port=9100,
+                    target_ip="192.0.2.21",
+                    target_port=9100,
+                ),
+                Device(
+                    id=pizzeria_device_id,
+                    external_id="pos_3",
+                    name="POS pizzeria sintetica",
+                    device_type="pos",
+                    parser_kind="escpos",
+                    department="PIZZERIA",
+                    listen_ip="192.0.2.12",
+                    listen_port=9100,
+                    target_ip="192.0.2.22",
+                    target_port=9100,
+                ),
+            )
+        )
+
+        def add_pos_line(
+            device_id,
+            document_type: str,
+            quantity: str,
+            *,
+            minute: int,
+            complete: bool = True,
+            cancelled: bool = False,
+        ) -> None:
+            document_id = uuid4()
+            session.add(
+                Document(
+                    id=document_id,
+                    device_id=device_id,
+                    session_id=ids["session"],
+                    job_id=ids["job"],
+                    source_document_key=f"department-sale-{document_id}",
+                    document_type=document_type,
+                    subtype=document_type,
+                    captured_at=NOW + timedelta(minutes=minute),
+                )
+            )
+            session.flush()
+            version = DocumentVersion(
+                document_id=document_id,
+                parser_version_id=ids["parser"],
+                raw_payload_id=ids["raw"],
+                version_sequence=1,
+                document_type=document_type,
+                subtype=document_type,
+                status="COMPLETE" if complete else "PARTIAL",
+                normalized_text=f"1x Prodotto sintetico {document_id}",
+                parse_confidence=100,
+                evidence_level="CONFIRMED",
+                source_manifest_sha256="a" * 64,
+                source_payload_sha256=hashlib.sha256(str(document_id).encode()).hexdigest(),
+                source_path=f"/spool/{document_id}.raw",
+                complete=complete,
+                chain_scope=f"document:{document_id}",
+                chain_sequence=1,
+                previous_record_hash="0" * 64,
+                record_hash=hashlib.sha256(f"record:{document_id}".encode()).hexdigest(),
+            )
+            session.add(version)
+            session.flush()
+            session.add(
+                DocumentLine(
+                    document_version_id=version.id,
+                    sequence=1,
+                    description="Prodotto sintetico ripetibile",
+                    quantity=Decimal(quantity),
+                    cancelled=cancelled,
+                )
+            )
+
+        # Equal descriptions are separate observed rows and therefore both
+        # count.  The signed change reduces the BAR total: 2 + 2 - 1 = 3.
+        add_pos_line(ids["device"], "KITCHEN_ORDER", "2", minute=1)
+        add_pos_line(ids["device"], "KITCHEN_ORDER", "2", minute=2)
+        add_pos_line(ids["device"], "ORDER_CHANGE", "-1", minute=3)
+        add_pos_line(ids["device"], "KITCHEN_ORDER", "100", minute=4, complete=False)
+        add_pos_line(kitchen_device_id, "ORDER", "3", minute=5)
+        add_pos_line(
+            kitchen_device_id,
+            "KITCHEN_ORDER",
+            "4",
+            minute=6,
+            cancelled=True,
+        )
+        add_pos_line(pizzeria_device_id, "KITCHEN_ORDER", "1.5", minute=9)
+        # The half-open upper bound must exclude this exact timestamp.
+        add_pos_line(pizzeria_device_id, "KITCHEN_ORDER", "9", minute=10)
+        # A partial range containing only a removal is clamped to zero.
+        add_pos_line(kitchen_device_id, "ORDER_CHANGE", "-5", minute=10)
+
+        stream_id, stream_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="MANAGEMENT_DOCUMENT",
+            total="5.10",
+            complete=True,
+            minute=7,
+            line_total="2.00",
+        )
+        dgfe_id, dgfe_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="COMMERCIAL_DOCUMENT",
+            total="5.10",
+            complete=True,
+            minute=8,
+            line_total="2.00",
+        )
+        twenty_id, twenty_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="COMMERCIAL_DOCUMENT",
+            total="1.60",
+            complete=True,
+            minute=9,
+            line_total="-0.40",
+        )
+        _unverified_id, unverified_version_id = _add_correlated_document(
+            session,
+            ids,
+            document_type="MANAGEMENT_DOCUMENT",
+            total="7.00",
+            complete=True,
+            minute=9,
+            line_total="10.00",
+        )
+        stream_document = session.get(Document, stream_id)
+        dgfe_document = session.get(Document, dgfe_id)
+        assert stream_document is not None and dgfe_document is not None
+        stream_document.external_document_code = "MGT-0042"
+        stream_document.commercial_reference_code = "0040-0001"
+        stream_document.table_code = None
+        dgfe_document.external_document_code = None
+        dgfe_document.external_document_code_suffix = "0001"
+        dgfe_document.table_code = None
+        stream_version = session.get(DocumentVersion, stream_version_id)
+        dgfe_version = session.get(DocumentVersion, dgfe_version_id)
+        assert stream_version is not None and dgfe_version is not None
+        stream_version.external_document_code = "MGT-0042"
+        stream_version.commercial_reference_code = "0040-0001"
+        stream_version.table_code = None
+        dgfe_version.external_document_code = None
+        dgfe_version.external_document_code_suffix = "0001"
+        dgfe_version.table_code = None
+        dgfe_version.raw_metadata = {
+            "provenance": "RCH_DGFE_EXPORT",
+            "external_document_code_suffix_evidence": (
+                "RCH_STATUS_RESPONSE_SUFFIX_SEQUENCE_CONFIRMED"
+            ),
+            "lines": [
+                {
+                    "description": "Espresso",
+                    "modifiers": [
+                        {"description": "Sconto", "sign": "-", "amount": "0.90"}
+                    ],
+                }
+            ],
+        }
+        session.flush()
+        stream_line = session.scalar(
+            select(DocumentLine).where(
+                DocumentLine.document_version_id == stream_version_id
+            )
+        )
+        dgfe_line = session.scalar(
+            select(DocumentLine).where(DocumentLine.document_version_id == dgfe_version_id)
+        )
+        twenty_line = session.scalar(
+            select(DocumentLine).where(DocumentLine.document_version_id == twenty_version_id)
+        )
+        unverified_line = session.scalar(
+            select(DocumentLine).where(
+                DocumentLine.document_version_id == unverified_version_id
+            )
+        )
+        assert (
+            stream_line is not None
+            and dgfe_line is not None
+            and twenty_line is not None
+            and unverified_line is not None
+        )
+        stream_line.description = "Espresso"
+        stream_line.raw_text = "Espresso 2,00"
+        stream_line.unit_price = Decimal("2.00")
+        stream_line.line_total = Decimal("2.00")
+        session.add_all(
+            (
+                DocumentLine(
+                    document_version_id=stream_version_id,
+                    sequence=2,
+                    description="Coperto",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("1.00"),
+                    line_total=Decimal("1.00"),
+                ),
+                DocumentLine(
+                    document_version_id=stream_version_id,
+                    sequence=3,
+                    description="Pasto dipendente",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("3.00"),
+                    line_total=Decimal("3.00"),
+                ),
+                DocumentLine(
+                    document_version_id=stream_version_id,
+                    sequence=4,
+                    description="SCONTO DIPENDENTI 30% [-30%]",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("-0.90"),
+                    line_total=Decimal("-0.90"),
+                    raw_text="SCONTO DIPENDENTI 30% [-30%] -0,90",
+                ),
+                DocumentLine(
+                    document_version_id=stream_version_id,
+                    sequence=5,
+                    description="TOT",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("5.10"),
+                    line_total=Decimal("5.10"),
+                ),
+                DocumentLine(
+                    document_version_id=stream_version_id,
+                    sequence=6,
+                    description="Carta di credito",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("5.10"),
+                    line_total=Decimal("5.10"),
+                ),
+            )
+        )
+        dgfe_line.description = "Espresso"
+        dgfe_line.discount = Decimal("0.90")
+        member = session.get(DocumentCorrelationMember, (ids["correlation"], dgfe_id))
+        assert member is not None
+        member.criteria = ["ECONOMIC_LINE_AUTHORITY"]
+        management_member = session.get(
+            DocumentCorrelationMember,
+            (ids["correlation"], stream_id),
+        )
+        assert management_member is not None
+        management_member.criteria = [
+            "order_code",
+            "time_proximity",
+            "amount_relationship",
+            "line_similarity",
+            "document_sequence",
+            "device_context",
+        ]
+        twenty_line.description = "SCONTO DIPENDENTI 20% [-20%]"
+        twenty_line.raw_text = "SCONTO DIPENDENTI 20% [-20%] -0,40"
+        twenty_line.unit_price = Decimal("-0.40")
+        twenty_line.line_total = Decimal("-0.40")
+        twenty_member = session.get(
+            DocumentCorrelationMember,
+            (ids["correlation"], twenty_id),
+        )
+        assert twenty_member is not None
+        twenty_member.criteria = ["ECONOMIC_LINE_AUTHORITY"]
+        unverified_line.description = "Pasto dipendente non correlato"
+        unverified_line.unit_price = Decimal("10.00")
+        unverified_line.line_total = Decimal("10.00")
+        session.add(
+            DocumentLine(
+                document_version_id=unverified_version_id,
+                sequence=2,
+                description="SCONTO DIPENDENTI 30% [-30%]",
+                quantity=Decimal("1"),
+                unit_price=Decimal("-3.00"),
+                line_total=Decimal("-3.00"),
+            )
+        )
+        session.add(
+            DocumentLine(
+                document_version_id=unverified_version_id,
+                sequence=3,
+                description="TOT",
+                quantity=Decimal("1"),
+                unit_price=Decimal("7.00"),
+                line_total=Decimal("7.00"),
+            )
+        )
+
+    repository = SqlAlchemyApiRepository(factory)
+    dashboard = repository.dashboard(
+        filters={"from": NOW, "to": NOW + timedelta(minutes=10)}
+    )
+    assert dashboard.sold_product_quantity_bar == Decimal("3.0000")
+    assert dashboard.sold_product_quantity_kitchen == Decimal("3.0000")
+    assert dashboard.sold_product_quantity_pizzeria == Decimal("1.5000")
+    # The management/pre-fiscal evidence carries the exact production -30%
+    # label and refers to the commercial document.  It counts once despite the
+    # generic DGFE modifier; the otherwise identical -20% row and the larger
+    # management singleton without a strong fiscal reference are excluded.
+    assert dashboard.employee_discount_total == Decimal("0.90")
+
+    outside = repository.dashboard(
+        filters={
+            "from": NOW + timedelta(minutes=10),
+            "to": NOW + timedelta(minutes=11),
+        }
+    )
+    assert outside.sold_product_quantity_bar == Decimal("0.0000")
+    assert outside.sold_product_quantity_kitchen == Decimal("0.0000")
+    assert outside.sold_product_quantity_pizzeria == Decimal("9.0000")
+    assert outside.employee_discount_total == Decimal("0")
     engine.dispose()
 
 
