@@ -8,7 +8,7 @@ import contextlib
 import signal
 from pathlib import Path
 
-from retailprintguard.common.config import Settings, load_settings
+from retailprintguard.common.config import DeviceType, Settings, load_settings
 from retailprintguard.common.logging import configure_structured_logging
 from retailprintguard.proxy.relay import RelayService
 
@@ -42,7 +42,7 @@ async def _run(config_path: Path, device_type: str | None) -> None:
 def cli() -> int:
     parser = argparse.ArgumentParser(description="RetailPrintGuard transparent proxy")
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--device-type", choices=("pos", "rch"))
+    parser.add_argument("--device-type", choices=tuple(kind.value for kind in DeviceType))
     parser.add_argument("--check-config", action="store_true")
     arguments = parser.parse_args()
     settings = _select_devices(load_settings(arguments.config), arguments.device_type)

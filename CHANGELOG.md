@@ -5,6 +5,114 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.5.5] — 2026-11-19
+
+### Added
+
+- Parser passivo EpsonFpMate SOAP/HTTP: rapporti X/Z/XZ nel modello documentale
+  comune a RCH, totale giornaliero distinto dalle vendite e offset RAW delle
+  evidenze. DirectIO e aperture cassetto restano comandi tecnici, non scontrini.
+- Messaggi Epson non supportati conservati come evidenze RAW; nessuna deduzione
+  di vendite, pagamenti o intestazioni dai comandi di configurazione.
+
+### Operations
+
+- Confermato per la prossima distribuzione nginx in ascolto su `0.0.0.0:8081`,
+  come già previsto dal template e richiesto in produzione. Non ripristinare
+  durante il deploy un precedente binding specifico del sito.
+
+### Changed
+
+- Intestazioni configurate mostrate con i soli contenuti in webapp, anteprima,
+  TXT e nuovi PDF: rimosse le diciture di configurazione. Provenienza strutturata
+  conservata nei metadati; renderer PDF `2.0.1`, archivi già prodotti immutati.
+
+## [0.5.4] — 2026-10-18
+
+### Added
+
+- Rianalisi dell'intero storico avviabile dalla webapp, con avanzamento,
+  ripresa, risultati immutabili e rapporto scaricabile JSON/CSV.
+- Vista degli sconti con documenti di origine, etichette osservate e verifica
+  aritmetica distinta dall'autorizzazione e dalla correlazione fiscale.
+- Lock condiviso dei processi di analisi per coordinare la rianalisi storica
+  con parser, correlazione e antifrode ordinari.
+- Esportazione degli ultimi dieci documenti completi validi, ordinati per
+  acquisizione e congelati nello storico con quantità effettiva.
+- Apertura degli archivi dalla webapp, elenco paginato e presentazione di un PDF
+  alla volta prima del download ZIP; anteprime dai byte originali verificati,
+  anche per archivi precedenti, senza rigenerare o modificare i file conservati.
+
+### Fixed
+
+- Le righe quantità/prezzo unitario RCH confermate dalla riga articolo
+  successiva non vengono più conteggiate come un secondo articolo.
+- Dashboard e navigazione usano la stessa classificazione documentale degli
+  archivi; dati assenti nel periodo e copertura storica sono espliciti.
+- Totali degli sconti dipendenti osservati separati dai casi generici e dai
+  totali vincolati alla presenza di una correlazione fiscale.
+
+## [0.5.3] — 2026-10-18
+
+### Fixed
+
+- Selezione PDF condivisa e versionata: risposte dispositivo, comandi tecnici,
+  corpi vuoti e frammenti privi di contenuto documentale restano evidenze
+  consultabili e non vengono esportati come scontrini.
+- Archivi distinti per documenti completi e documenti parziali da verificare;
+  appartenenza, motivi di esclusione e copertura temporale congelati nella richiesta.
+- Esportazione dell’intero storico senza estremi temporali artificiali e nomi ZIP
+  basati sulla copertura effettiva; date osservate e di acquisizione distinte.
+- Storico degli archivi precedenti conservato e riconoscibile come selezione
+  non filtrata; nessuna cancellazione o modifica delle evidenze originarie.
+- Timestamp delle voci dei nuovi ZIP ricavati dalle date congelate, con limiti
+  del formato dichiarati; ricostruzione degli archivi legacy invariata.
+- Lettura coerente delle versioni legacy con intestazione SQL NULL o JSON null.
+- Pulizia dei delimitatori OCR con scansione progressiva, per evitare rallentamenti
+  sui tag malformati senza modificare il testo degli scontrini esistenti.
+
+## [0.5.2] — 2026-10-17
+
+### Changed
+
+- PDF singoli e ZIP riproducono esclusivamente la vista web Scontrino, con
+  testo monospaziato, colonne e righe vuote conservati; nessun titolo tecnico,
+  dato aggiuntivo o piè di pagina inserito dal renderer.
+- Proiezione dello scontrino condivisa tra API, anteprima web ed esportazione;
+  renderer `2.0.0` con font Unicode incorporato.
+- Nomi PDF con data e numero disponibile del documento; gli ZIP aggiungono un
+  progressivo univoco. Numeri mancanti e date di acquisizione restano espliciti.
+- Archivi già pubblicati, documenti e RAW originali conservati immutati.
+
+## [0.5.1] — 2026-10-17
+
+### Fixed
+
+- Ingestione dello spool storico dopo un cambio IP tramite alias espliciti dei
+  target precedenti, usati solo per riconoscere le evidenze archiviate e mai
+  per aprire listener o connessioni proxy.
+- Renderer PDF `1.4.1`: intestazioni lunghe misurate con il font effettivo e
+  mandate a capo entro i margini; gli archivi già pubblicati restano immutati.
+
+## [0.5.0] — 2026-10-17
+
+### Added
+
+- Esportazioni per intervallo di date e dispositivo, con un PDF per documento,
+  archivio ZIP verificabile, snapshot immutabile e storico persistente.
+- Worker export dedicato, recupero dopo riavvio, autorizzazione ADMIN/AUDITOR,
+  limiti espliciti e backup degli archivi derivati.
+- Relay Epson opzionale con cattura RAW bidirezionale e parser conservativo
+  `opaque_raw`: la semantica fiscale richiede validazione del protocollo reale.
+
+### Changed
+
+- Nomi dei dispositivi nella UI letti dalla configurazione persistita.
+- Porte Epson aggiuntive opzionali sullo stesso dispositivo e nello stesso
+  processo di cattura, senza duplicare lo storico.
+- Migrazione solo additiva per le richieste di esportazione; documenti e RAW
+  storici conservati.
+
 ## [0.4.9] — 2026-08-26
 
 ### Added

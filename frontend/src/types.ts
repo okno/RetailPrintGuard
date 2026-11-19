@@ -14,8 +14,85 @@ export interface Page<T> {
   offset: number
 }
 
+export type DocumentPdfCategory = 'complete' | 'partial' | 'excluded'
+export type DocumentScope = 'complete' | 'partial' | 'all'
+export type ExportDocumentScope = Exclude<DocumentScope, 'all'>
+export type ExportScope = 'all_history' | 'date_range' | 'latest_10'
+
+export interface ExportSelectionMetadata {
+  schema_version: number
+  policy_version: string
+  scope: ExportScope
+  document_scope: ExportDocumentScope
+  scanned_documents: number
+  selected_documents: number
+  excluded_documents: number
+  exclusion_counts: Record<string, number>
+  category_counts: Record<DocumentPdfCategory, number>
+  coverage_from: string | null
+  coverage_to: string | null
+  document_date_count: number
+  capture_date_count: number
+  selection_basis?: string
+  selection_order?: string
+  requested_limit?: number
+  candidate_documents?: number
+  unscanned_documents?: number
+  selection_capture_from?: string | null
+  selection_capture_to?: string | null
+}
+
+export interface ArchiveDocument {
+  archive_sequence: number
+  document_id: string
+  document_version_id: string
+  device_id: string
+  type: string
+  filename: string
+  pdf_bytes: number
+  pdf_sha256: string
+  document_timestamp: string | null
+  captured_at: string
+  complete: boolean
+  preview_url: string
+}
+
+export interface ArchiveDocuments extends Page<ArchiveDocument> {
+  legacy: boolean
+  renderer_version: string
+  export_id: string
+}
+
+export interface ExportRequest {
+  id: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  date_from: string | null
+  date_to: string | null
+  scope?: ExportScope
+  document_scope?: ExportDocumentScope | 'legacy_all'
+  selection_metadata?: ExportSelectionMetadata | null
+  archive_filename?: string
+  timezone: string
+  device_ids: string[]
+  requested_by: string
+  created_at: string
+  started_at?: string | null
+  completed_at?: string | null
+  total_documents: number
+  completed_documents: number
+  archive_bytes?: number | null
+  archive_sha256?: string | null
+  error?: string | null
+  download_url?: string | null
+}
+
 export interface Dashboard {
   documents: number
+  complete_documents?: number
+  partial_documents?: number
+  excluded_evidence?: number
+  total_evidence?: number
+  complete_document_type_counts?: Record<string, number>
   orders: number
   pre_bills: number
   management_documents: number
@@ -36,6 +113,12 @@ export interface Dashboard {
   sold_product_quantity_kitchen?: string
   sold_product_quantity_pizzeria?: string
   employee_discount_total?: string
+  observed_employee_discount_total?: string
+  observed_employee_discount_count?: number
+  observed_generic_30_discount_total?: string
+  observed_generic_30_discount_count?: number
+  arithmetic_reconciled_employee_discount_total?: string
+  arithmetic_reconciled_employee_discount_count?: number
   devices_online: number
   devices_offline: number
   spool_bytes: number
@@ -47,6 +130,7 @@ export interface Dashboard {
 export interface Device {
   id: string
   name: string
+  display_name?: string
   type: string
   mac_address?: string
   department?: string
@@ -55,6 +139,7 @@ export interface Device {
   online: boolean
   listen_endpoint: string
   target_endpoint: string
+  additional_ports?: number[]
   last_connection_at?: string
   last_print_at?: string
   last_response_at?: string
@@ -109,7 +194,7 @@ export interface DocumentLine {
   item_code?: string
   description?: string
   quantity?: string
-  unit_price?: string
+  unit_price?: string | null
   original_unit_price?: string
   modified_unit_price?: string
   discount?: string
@@ -119,12 +204,12 @@ export interface DocumentLine {
   removed: boolean
   cancelled: boolean
   raw_text?: string
-  derived_unit_price?: string
-  derived_price_source?: string
+  derived_unit_price?: string | null
+  derived_price_source?: string | null
   price_attributions?: Array<{
     id: string
     source_kind: string
-    observed_unit_price?: string
+    observed_unit_price?: string | null
     observed_line_total?: string
     confidence: string
     status: string
@@ -189,6 +274,13 @@ export interface DocumentRecord {
   status: string
   normalized_text: string
   receipt_text?: string
+  /** Shared preview used by the receipt tab and PDF; optional for older APIs. */
+  receipt_preview?: string | null
+  /** Server-selected name shared by the individual PDF and ZIP entry. */
+  pdf_filename?: string | null
+  pdf_category?: DocumentPdfCategory
+  pdf_reason_code?: string
+  pdf_policy_version?: string
   /** Structured header projection; absent during rolling upgrades of the API. */
   receipt_header?: ReceiptHeaderRecord | null
   parser_name: string

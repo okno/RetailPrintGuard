@@ -1,0 +1,46 @@
+[Unit]
+Description=RetailPrintGuard persistent PDF and ZIP export worker
+Wants=mariadb.service
+After=mariadb.service
+PartOf=retailprintguard.target
+
+[Service]
+Type=simple
+User=retailprintguard-api
+Group=retailprintguard-api
+UMask=0027
+Environment=PYTHONUNBUFFERED=1
+Environment=RPG_EXPORT_ROOT=/var/lib/retailprintguard/exports
+Environment=RPG_CONFIG=/etc/retailprintguard/config.yaml
+EnvironmentFile=/etc/retailprintguard/database.env
+ExecStart=/opt/retailprintguard/current/.venv/bin/retailprintguard-export --config /etc/retailprintguard/config.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+Nice=10
+CPUQuota=50%
+MemoryMax=512M
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadOnlyPaths=/etc/retailprintguard
+ReadWritePaths=/var/lib/retailprintguard/exports
+
+[Install]
+WantedBy=retailprintguard.target

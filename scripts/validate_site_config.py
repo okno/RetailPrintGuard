@@ -99,6 +99,11 @@ def cli() -> int:
     parser.add_argument("--require-assigned-listeners", action="store_true")
     parser.add_argument("--require-deployment-layout", action="store_true")
     parser.add_argument(
+        "--has-enabled-type",
+        choices=("pos", "rch", "epson"),
+        help="Exit 0 when this device family is enabled, otherwise 1 (systemd condition).",
+    )
+    parser.add_argument(
         "--list-device-directories",
         action="store_true",
         help=(
@@ -108,6 +113,12 @@ def cli() -> int:
     )
     arguments = parser.parse_args()
     try:
+        if arguments.has_enabled_type:
+            settings = load_settings(arguments.config)
+            return 0 if any(
+                device.enabled and device.type.value == arguments.has_enabled_type
+                for device in settings.devices
+            ) else 1
         result = validate(
             arguments.config,
             require_assigned_listeners=arguments.require_assigned_listeners,

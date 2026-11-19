@@ -27,8 +27,25 @@ from retailprintguard.db.models import (
     SystemEvent,
 )
 from retailprintguard.db.session import create_db_engine, session_factory
+from retailprintguard.parser import epson as epson_parser
 from retailprintguard.parser import escpos as escpos_parser
 from retailprintguard.parser import rch as rch_parser
+
+PARSERS_BY_KIND = {
+    "escpos": escpos_parser,
+    "rch_observed": rch_parser,
+    # Keep the deployed capture/configuration contract unchanged. The passive
+    # Epson adapter retains opaque evidence for every unsupported protocol.
+    "opaque_raw": epson_parser,
+}
+UNSUPPORTED_PARSER_HASH = hashlib.sha256(b"unsupported-parser-kind-v1").hexdigest()
+
+
+def _parser_name_for_kind(kind: str) -> str:
+    module = PARSERS_BY_KIND.get(kind)
+    if module is None:
+        raise ParserRepositoryError(f"unknown parser kind: {kind}")
+    return module.PARSER_NAME
 
 
 class ParserRepositoryError(RuntimeError):
@@ -43,13 +60,19 @@ class SqlAlchemyParserRepository:
     def from_url(cls, database_url: str) -> SqlAlchemyParserRepository:
         return cls(session_factory(create_db_engine(database_url)))
 
-    def pending_jobs(self, *, limit: int, reparse: bool = False) -> tuple[str, ...]:
+    def pending_jobs(
+        self, *, limit: int, reparse: bool = False, device_id: str | None = None
+    ) -> tuple[str, ...]:
         if not 1 <= limit <= 10_000:
             raise ValueError("parser batch limit must be between 1 and 10000")
+        if device_id is not None and not reparse:
+            raise ValueError("device filter is available only for explicit historical reparse")
         session = self._factory()
         try:
-            esc_hash = _parser_build_sha256(escpos_parser.PARSER_NAME)
-            rch_hash = _parser_build_sha256(rch_parser.PARSER_NAME)
+            hashes = {
+                kind: _parser_build_sha256(module.PARSER_NAME)
+                for kind, module in PARSERS_BY_KIND.items()
+            }
             statuses = (
                 ("IMPORTED", "PARSE_RETRY", "PARSED", "PARSE_EMPTY", "PARSE_FAILED")
                 if reparse
@@ -66,41 +89,33 @@ class SqlAlchemyParserRepository:
                 )
                 .exists()
             )
-            esc_version_exists = (
-                select(DocumentVersion.id)
-                .join(Document, Document.id == DocumentVersion.document_id)
-                .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
-                .where(
-                    Document.job_id == PrintJob.id,
-                    ParserVersion.name == escpos_parser.PARSER_NAME,
-                    ParserVersion.build_sha256 == esc_hash,
+            version_exists = [
+                and_(
+                    Device.parser_kind == kind,
+                    select(DocumentVersion.id)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
+                    .where(
+                        Document.job_id == PrintJob.id,
+                        ParserVersion.name == module.PARSER_NAME,
+                        ParserVersion.build_sha256 == hashes[kind],
+                    )
+                    .exists(),
                 )
-                .exists()
-            )
-            rch_version_exists = (
-                select(DocumentVersion.id)
-                .join(Document, Document.id == DocumentVersion.document_id)
-                .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
-                .where(
-                    Document.job_id == PrintJob.id,
-                    ParserVersion.name == rch_parser.PARSER_NAME,
-                    ParserVersion.build_sha256 == rch_hash,
-                )
-                .exists()
-            )
+                for kind, module in PARSERS_BY_KIND.items()
+            ]
             empty_exists = (
                 select(SystemEvent.id)
                 .where(
                     SystemEvent.job_id == PrintJob.id,
                     SystemEvent.service == "parser",
                     SystemEvent.event_type == "PARSER_NO_DOCUMENTS",
-                    SystemEvent.correlation_id.in_((esc_hash, rch_hash)),
+                    SystemEvent.correlation_id.in_(tuple(hashes.values())),
                 )
                 .exists()
             )
             current_processed = or_(
-                and_(Device.parser_kind == "escpos", esc_version_exists),
-                and_(Device.parser_kind == "rch_observed", rch_version_exists),
+                *version_exists,
                 empty_exists,
             )
             statement = (
@@ -109,6 +124,8 @@ class SqlAlchemyParserRepository:
                 .where(PrintJob.import_status.in_(statuses), raw_exists)
                 .order_by(PrintJob.captured_at, PrintJob.id)
             )
+            if device_id is not None:
+                statement = statement.where(Device.external_id == device_id)
             statement = statement.where(
                 ~current_processed if reparse else ~document_exists
             ).limit(limit if reparse else min(10_000, limit * 8))
@@ -124,7 +141,7 @@ class SqlAlchemyParserRepository:
                     SystemEvent.job_id.in_(rows),
                     SystemEvent.service == "parser",
                     SystemEvent.event_type == "PARSER_FAILED",
-                    SystemEvent.correlation_id.in_((esc_hash, rch_hash)),
+                    SystemEvent.correlation_id.in_((*hashes.values(), UNSUPPORTED_PARSER_HASH)),
                 )
                 .group_by(SystemEvent.job_id)
             ).all()
@@ -226,6 +243,9 @@ class SqlAlchemyParserRepository:
                     select(RawPayload).where(RawPayload.job_id == job.id)
                 ).all()
                 raw_by_sha = {payload.sha256: payload for payload in raw_payloads}
+                raw_by_source = {
+                    (payload.source_path, payload.sha256): payload for payload in raw_payloads
+                }
                 for parsed in documents:
                     source_key = str(parsed.id)
                     document = session.scalar(
@@ -334,7 +354,11 @@ class SqlAlchemyParserRepository:
                         "previous_hash": previous_hash,
                     }
                     record_hash = chained_hash(version_payload, previous_hash)
-                    source_raw = raw_by_sha.get(parsed.source_payload_sha256) or request_raw
+                    source_raw = (
+                        raw_by_source.get((parsed.source_path, parsed.source_payload_sha256))
+                        or raw_by_sha.get(parsed.source_payload_sha256)
+                        or request_raw
+                    )
                     version = DocumentVersion(
                         document_id=document.id,
                         parser_version_id=parser.id,
@@ -458,9 +482,7 @@ class SqlAlchemyParserRepository:
                             severity="WARNING",
                             event_type="PARSER_NO_DOCUMENTS",
                             correlation_id=_parser_build_sha256(
-                                escpos_parser.PARSER_NAME
-                                if str(device.parser_kind) == "escpos"
-                                else rch_parser.PARSER_NAME
+                                _parser_name_for_kind(str(device.parser_kind))
                             ),
                             message="Nessun documento semanticamente riconosciuto; RAW conservato",
                             details={},
@@ -481,12 +503,14 @@ class SqlAlchemyParserRepository:
                 job = session.get(PrintJob, job_id)
                 if job is not None:
                     device = session.get(Device, job.device_id)
-                    parser_name = (
-                        escpos_parser.PARSER_NAME
-                        if device is not None and str(device.parser_kind) == "escpos"
-                        else rch_parser.PARSER_NAME
+                    if device is None:
+                        raise ParserRepositoryError("parser device disappeared")
+                    parser_module = PARSERS_BY_KIND.get(str(device.parser_kind))
+                    build_hash = (
+                        _parser_build_sha256(parser_module.PARSER_NAME)
+                        if parser_module is not None
+                        else UNSUPPORTED_PARSER_HASH
                     )
-                    build_hash = _parser_build_sha256(parser_name)
                     attempts = int(
                         session.scalar(
                             select(func.count(SystemEvent.id)).where(
@@ -527,10 +551,7 @@ def create_parser_repository(settings: Settings) -> SqlAlchemyParserRepository:
 
 
 def _parser_build_sha256(parser_name: str) -> str:
-    modules = {
-        escpos_parser.PARSER_NAME: escpos_parser,
-        rch_parser.PARSER_NAME: rch_parser,
-    }
+    modules = {module.PARSER_NAME: module for module in PARSERS_BY_KIND.values()}
     module = modules.get(parser_name)
     if module is None or module.__file__ is None:
         raise ParserRepositoryError(f"unknown parser implementation: {parser_name}")

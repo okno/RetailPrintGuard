@@ -12,8 +12,6 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-_OCR_BLOCK = re.compile(r"<OCR:[^>]+>(.*?)</OCR:[^>]+>", re.DOTALL)
-_TECHNICAL_TOKEN = re.compile(r"<(?:ESC/POS|BYTE):[^>]*>")
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _ROME = ZoneInfo("Europe/Rome")
 NOT_OBSERVED_IN_FLOW = "Non osservato nel flusso"
@@ -116,9 +114,7 @@ def receipt_header_evidence_label(value: Any) -> str:
     labels = {
         "RCH_PRINTED_HEADER": "Osservata nel blocco iniziale stampato dalla RCH",
         "RCH_DGFE_EXPORT": "Estratta dall'export della memoria fiscale DGFE",
-        "DEVICE_METADATA_CONFIGURED": (
-            "Configurata sul dispositivo (non osservata nel flusso)"
-        ),
+        "DEVICE_METADATA_CONFIGURED": "",
     }
     if value is None:
         return RECEIPT_HEADER_NOT_AVAILABLE
@@ -158,10 +154,9 @@ def receipt_header_text_lines(document: Any) -> list[str]:
         value = _header_value(_header_field(header, name))
         if value:
             lines.append(f"{label}: {value}")
-    lines.append(
-        "Provenienza intestazione: "
-        + receipt_header_evidence_label(_header_field(header, "evidence"))
-    )
+    provenance = receipt_header_evidence_label(_header_field(header, "evidence"))
+    if provenance:
+        lines.append("Provenienza intestazione: " + provenance)
     return lines
 
 
@@ -239,6 +234,62 @@ def rch_identity_text_lines(document: Any) -> list[str]:
     ]
 
 
+def _unwrap_ocr_blocks(source: str) -> str:
+    """Preserve the legacy non-greedy OCR projection with a forward-only scan.
+
+    Tags need nonempty labels, but labels need not match: both properties retain
+    the original regex semantics, including malformed or nested annotations.
+    With no closing tag, leave the remaining source intact instead of retrying
+    every nested opener against the same suffix.
+    """
+    fragments: list[str] = []
+    cursor = search_from = 0
+    while (start := source.find("<OCR:", search_from)) >= 0:
+        opening_end = source.find(">", start + 5)
+        if opening_end < 0:
+            break
+        if opening_end == start + 5:
+            search_from = opening_end + 1
+            continue
+        closing_start = source.find("</OCR:", opening_end + 1)
+        while closing_start >= 0:
+            closing_end = source.find(">", closing_start + 6)
+            if closing_end < 0:
+                closing_start = -1
+                break
+            if closing_end > closing_start + 6:
+                break
+            closing_start = source.find("</OCR:", closing_end + 1)
+        if closing_start < 0:
+            break
+        fragments.append(source[cursor:start])
+        fragments.append(source[opening_end + 1:closing_start])
+        cursor = search_from = closing_end + 1
+    fragments.append(source[cursor:])
+    return "".join(fragments)
+
+
+def _strip_technical_tokens(source: str) -> str:
+    """Remove complete legacy ESC/POS/BYTE annotations without suffix rescans.
+
+    Empty labels and nested token-like text retain the regex's first-">"
+    semantics. An unterminated annotation remains printable, as before.
+    """
+    fragments: list[str] = []
+    cursor = search_from = 0
+    while (start := source.find("<", search_from)) >= 0:
+        if not source.startswith(("<ESC/POS:", "<BYTE:"), start):
+            search_from = start + 1
+            continue
+        end = source.find(">", start + 1)
+        if end < 0:
+            break
+        fragments.append(source[cursor:start])
+        cursor = search_from = end + 1
+    fragments.append(source[cursor:])
+    return "".join(fragments)
+
+
 def receipt_text(normalized_text: str, *, maximum_characters: int = 250_000) -> str:
     """Return a bounded, readable projection while preserving printable text.
 
@@ -251,8 +302,8 @@ def receipt_text(normalized_text: str, *, maximum_characters: int = 250_000) -> 
         raise ValueError("maximum_characters must be positive")
     source = normalized_text[:maximum_characters]
     source = source.replace("\r\n", "\n").replace("\r", "\n")
-    source = _OCR_BLOCK.sub(lambda match: match.group(1), source)
-    source = _TECHNICAL_TOKEN.sub("", source)
+    source = _unwrap_ocr_blocks(source)
+    source = _strip_technical_tokens(source)
     source = _CONTROL_CHARACTER.sub("", source)
 
     output: list[str] = []
@@ -303,6 +354,42 @@ def document_text_export(document: Any) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def receipt_preview_text(document: Any) -> str:
+    """Return exactly the web Scontrino projection, without normalizing its text.
+
+    This mirrors configuredReceiptHeaderText and the receipt/normalized/fallback
+    selection in DocumentDetailPage. Existing TXT evidence formatting deliberately
+    remains separate. In particular, whitespace-only values, columns, empty
+    address lines and trailing newlines are significant here.
+    """
+    body = (
+        _header_field(document, "receipt_text")
+        or _header_field(document, "normalized_text")
+        or "Nessun testo documento disponibile."
+    )
+    header = _header_field(document, "receipt_header")
+    evidence = _header_field(header, "evidence")
+    if evidence not in {"DEVICE_METADATA_CONFIGURED", "RCH_DGFE_EXPORT"}:
+        return body
+    lines = (
+        ["INTESTAZIONE DOCUMENTO (MEMORIA FISCALE DGFE)"]
+        if evidence == "RCH_DGFE_EXPORT" else []
+    )
+    for name in ("merchant_name", "legal_name"):
+        value = _header_field(header, name)
+        if value:
+            lines.append(value)
+    lines.extend(_header_field(header, "address_lines") or [])
+    for prefix, name in (("Telefono ", "phone"), ("C.F. ", "tax_code"), ("P.IVA ", "vat_number")):
+        value = _header_field(header, name)
+        if value:
+            lines.append(prefix + value)
+    provenance = receipt_header_evidence_label(evidence)
+    if provenance:
+        lines.extend(("", provenance))
+    return "\n".join(lines) + "\n\n" + body
+
+
 __all__ = [
     "NOT_OBSERVED_IN_FLOW",
     "RECEIPT_HEADER_NOT_AVAILABLE",
@@ -310,5 +397,6 @@ __all__ = [
     "rch_identity_text_lines",
     "receipt_header_evidence_label",
     "receipt_header_text_lines",
+    "receipt_preview_text",
     "receipt_text",
 ]

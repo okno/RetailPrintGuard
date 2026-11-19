@@ -98,6 +98,12 @@ merge_evidence_fail_closed \
     "${stage}/evidence/archive" "${RPG_ARCHIVE_ROOT}" \
     "retailprintguard-worker:retailprintguard-spool"
 
+if [[ -d "${stage}/derived/exports" ]]; then
+    install -d -m 0750 -o retailprintguard-api -g retailprintguard-api -- "${RPG_EXPORT_ROOT}"
+    merge_evidence_fail_closed "${stage}/derived/exports" "${RPG_EXPORT_ROOT}" \
+        "retailprintguard-api:retailprintguard-api"
+fi
+
 # Restore the per-device ownership contract used by the two isolated proxy
 # identities. There intentionally is no shared `retailprintguard-proxy` user.
 chown root:retailprintguard-spool "${RPG_SPOOL_ROOT}"
@@ -112,6 +118,7 @@ while IFS=$'\t' read -r device_type device_id; do
     case "${device_type}" in
         pos) device_owner=retailprintguard-pos-proxy ;;
         rch) device_owner=retailprintguard-rch-proxy ;;
+        epson) device_owner=retailprintguard-epson-proxy ;;
         *) rpg_die "unsupported validated device type during restore: ${device_type}" ;;
     esac
     [[ "${device_id}" =~ ^[a-z][a-z0-9_-]{1,63}$ ]] || \
@@ -142,7 +149,7 @@ unset RPG_DATABASE_URL
 
 for service in retailprintguard-ingestion.service retailprintguard-parser.service \
     retailprintguard-correlation.service retailprintguard-fraud.service \
-    retailprintguard-api.service; do
+    retailprintguard-api.service retailprintguard-export.service retailprintguard-analysis.service; do
     if systemctl is-enabled --quiet "${service}"; then
         systemctl restart "${service}"
     fi

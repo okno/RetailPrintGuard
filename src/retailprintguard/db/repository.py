@@ -14,6 +14,7 @@ import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -21,11 +22,22 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import Select, and_, case, func, or_, select, text
+from sqlalchemy import JSON, Select, and_, case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, sessionmaker
 
+from retailprintguard.analysis.discounts import (
+    aggregate_document_discounts,
+)
 from retailprintguard.api.auth import PasswordService
+from retailprintguard.api.discounts import (
+    DISCOUNT_SALE_DOCUMENT_TYPES,
+    DiscountAnalysisView,
+    DiscountDocumentView,
+    DiscountPage,
+    DiscountSummary,
+    analyze_sale_document_discounts,
+)
 from retailprintguard.api.repository import RawArtifact, RepositoryUnavailable
 from retailprintguard.api.schemas import (
     AlertUpdate,
@@ -102,6 +114,7 @@ from retailprintguard.ingestion.repository import (
     RepositoryImportResult,
 )
 from retailprintguard.pricing.service import PRICE_ATTRIBUTION_ALGORITHM
+from retailprintguard.render.eligibility import PdfEligibilityDecision, classify_pdf_document
 from retailprintguard.render.text import receipt_text
 
 MONEY_ZERO = Decimal("0.0000")
@@ -220,7 +233,10 @@ def _version_column(version_column: Any, legacy_column: Any) -> Any:
         (
             and_(
                 *(
-                    getattr(DocumentVersion, name).is_(None)
+                    or_(
+                        DocumentVersion.receipt_header.is_(None),
+                        DocumentVersion.receipt_header == JSON.NULL,
+                    ) if name == "receipt_header" else getattr(DocumentVersion, name).is_(None)
                     for name in _VERSION_SEMANTIC_FIELDS
                 )
             ),
@@ -389,6 +405,20 @@ def _operator_visible_document() -> Any:
         semantic_type != DocumentType.DEVICE_RESPONSE.value,
         or_(DocumentVersion.complete.is_(True), _document_has_business_content()),
     )
+
+
+def document_pdf_decision(
+    document_type: str | None, subtype: str | None, normalized_text: str, complete: bool
+) -> PdfEligibilityDecision:
+    """Use the exact API projection with only the policy's four source columns."""
+
+    return classify_pdf_document({
+        "type": document_type,
+        "subtype": subtype,
+        "normalized_text": normalized_text,
+        "receipt_text": receipt_text(normalized_text),
+        "complete": complete,
+    })
 
 
 def _job_has_operator_relevant_content() -> Any:
@@ -1349,6 +1379,14 @@ class SqlAlchemyApiRepository:
             session.close()
 
     @contextmanager
+    def _snapshot_read(self) -> Iterator[Session]:
+        # One reporting response must not mix old/new active parser versions.
+        with self._read() as session:
+            if session.get_bind().dialect.name in {"mysql", "mariadb"}:
+                session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            yield session
+
+    @contextmanager
     def _write(self) -> Iterator[Session]:
         session = self._factory()
         try:
@@ -1398,7 +1436,7 @@ class SqlAlchemyApiRepository:
 
     def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView:
         filters = filters or {}
-        with self._read() as session:
+        with self._snapshot_read() as session:
             document_period = []
             occurrence = _latest_transaction_occurrences()
             archive_occurrence = _historical_correlation_occurrences()
@@ -1456,6 +1494,28 @@ class SqlAlchemyApiRepository:
                 occurrence=occurrence,
                 episode_period=episode_period,
             )
+            discount_documents, _ = self._discount_documents(session, filters=filters)
+            observed_discounts = aggregate_document_discounts(discount_documents)
+            category_counts = {"complete": 0, "partial": 0, "excluded": 0}
+            complete_type_counts: dict[str, int] = {}
+            for kind, subtype, body, complete in session.execute(
+                select(
+                    semantic_type,
+                    _version_column(DocumentVersion.subtype, Document.subtype),
+                    DocumentVersion.normalized_text,
+                    DocumentVersion.complete,
+                )
+                .select_from(DocumentVersion)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(DocumentVersion.id == _latest_version_id(), *document_period)
+            ):
+                category = document_pdf_decision(kind, subtype, body, complete).category
+                category_counts[category] += 1
+                if category == "complete":
+                    complete_type_counts[kind] = complete_type_counts.get(kind, 0) + 1
+            available_from, available_to = session.execute(
+                select(func.min(Document.captured_at), func.max(Document.captured_at))
+            ).one()
             open_alerts = (
                 session.scalar(
                     select(func.count())
@@ -1649,6 +1709,14 @@ class SqlAlchemyApiRepository:
                 ).all()
             ]
             return DashboardView(
+                **asdict(observed_discounts),
+                complete_documents=category_counts["complete"],
+                partial_documents=category_counts["partial"],
+                excluded_evidence=category_counts["excluded"],
+                total_evidence=sum(category_counts.values()),
+                complete_document_type_counts=complete_type_counts,
+                available_data_from=available_from,
+                available_data_to=available_to,
                 documents=documents,
                 orders=orders,
                 pre_bills=type_counts.get(DocumentType.PRE_BILL.value, 0),
@@ -2186,7 +2254,11 @@ class SqlAlchemyApiRepository:
             )
 
     def _document_views(
-        self, session: Session, documents: Sequence[Document]
+        self,
+        session: Session,
+        documents: Sequence[Document],
+        *,
+        version_ids: Sequence[UUID] | None = None,
     ) -> list[DocumentView]:
         if not documents:
             return []
@@ -2196,7 +2268,11 @@ class SqlAlchemyApiRepository:
             .join(Document, Document.id == DocumentVersion.document_id)
             .where(
                 Document.id.in_(document_ids),
-                DocumentVersion.id == _latest_version_id(),
+                (
+                    DocumentVersion.id.in_(version_ids)
+                    if version_ids is not None
+                    else DocumentVersion.id == _latest_version_id()
+                ),
             )
         ).all()
         version_by_document = {version.document_id: version for version in versions}
@@ -2712,11 +2788,108 @@ class SqlAlchemyApiRepository:
         views = self._document_views(session, [document])
         return views[0] if views else None
 
+    def _discount_documents(
+        self, session: Session, *, filters: dict[str, Any]
+    ) -> tuple[list[DocumentView], list[DiscountDocumentView]]:
+        """Read explicit sale discounts from one pinned version per document."""
+        kind = filters.get("kind", "all")
+        reconciliation = filters.get("reconciliation", "all")
+        if kind not in {"all", "employee_30", "generic_30", "other"}:
+            raise ValueError("invalid discount kind")
+        if reconciliation not in {"all", "verified", "review"}:
+            raise ValueError("invalid discount reconciliation")
+        semantic_type = _version_column(DocumentVersion.document_type, Document.document_type)
+        discount_line = (
+            select(DocumentLine.id)
+            .where(
+                DocumentLine.document_version_id == DocumentVersion.id,
+                or_(
+                    DocumentLine.description.ilike("%scont%"),
+                    DocumentLine.raw_text.ilike("%scont%"),
+                ),
+            )
+            .exists()
+        )
+        statement = (
+            select(Document, DocumentVersion.id, Device.name)
+            .join(Device, Device.id == Document.device_id)
+            .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+            .where(
+                DocumentVersion.id == _latest_version_id(),
+                semantic_type.in_(sorted(DISCOUNT_SALE_DOCUMENT_TYPES)),
+                discount_line,
+            )
+            .order_by(Document.captured_at.desc(), Document.id)
+        )
+        if filters.get("from") is not None:
+            statement = statement.where(Document.captured_at >= filters["from"])
+        if filters.get("to") is not None:
+            statement = statement.where(Document.captured_at < filters["to"])
+        if filters.get("device_id"):
+            statement = statement.where(Device.external_id == filters["device_id"])
+        selected = session.execute(statement).all()
+        documents: list[DocumentView] = []
+        items: list[DiscountDocumentView] = []
+        # Bounded hydration avoids huge IN clauses while keeping exact totals.
+        for start in range(0, len(selected), 200):
+            batch = selected[start:start + 200]
+            versions = {document.id: version_id for document, version_id, _ in batch}
+            names = {document.id: name for document, _, name in batch}
+            views = self._document_views(
+                session, [document for document, _, _ in batch], version_ids=list(versions.values())
+            )
+            for view in views:
+                decision = document_pdf_decision(
+                    view.type, view.subtype, view.normalized_text, view.complete
+                )
+                if decision.category == "excluded":
+                    continue
+                analysis = analyze_sale_document_discounts(view)
+                if not analysis.observations:
+                    continue
+                if kind != "all" and not any(row.kind == kind for row in analysis.observations):
+                    continue
+                if reconciliation != "all" and analysis.arithmetic_reconciled != (
+                    reconciliation == "verified"
+                ):
+                    continue
+                documents.append(view)
+                items.append(DiscountDocumentView(
+                    document_id=view.id,
+                    document_version_id=versions[view.id],
+                    device_id=view.device_id,
+                    device_name=names[view.id] or view.device_id,
+                    type=view.type,
+                    complete=view.complete,
+                    captured_at=view.captured_at,
+                    document_timestamp=view.document_timestamp,
+                    external_document_code=view.external_document_code,
+                    commercial_reference_code=view.commercial_reference_code,
+                    order_code=view.order_code,
+                    pdf_category=decision.category,
+                    discounts=DiscountAnalysisView(**asdict(analysis)),
+                ))
+        return documents, items
+
+    def list_discounts(
+        self, *, limit: int, offset: int, filters: dict[str, Any]
+    ) -> DiscountPage:
+        limit, offset = _page(limit, offset, maximum=200)
+        with self._snapshot_read() as session:
+            documents, items = self._discount_documents(session, filters=filters)
+            return DiscountPage(
+                items=items[offset:offset + limit], total=len(items), limit=limit, offset=offset,
+                summary=DiscountSummary(**asdict(aggregate_document_discounts(documents))),
+            )
+
     def list_documents(
         self, *, limit: int, offset: int, filters: dict[str, Any]
     ) -> tuple[list[DocumentView], int]:
         limit, offset = _page(limit, offset)
         with self._read() as session:
+            document_scope = filters.get("document_scope", "all")
+            if document_scope not in {"all", "complete", "partial"}:
+                raise ValueError("invalid document scope")
             semantic_type = _version_column(
                 DocumentVersion.document_type,
                 Document.document_type,
@@ -2747,11 +2920,11 @@ class SqlAlchemyApiRepository:
                 statement = statement.where(semantic_type == str(filters["type"]))
             elif filters.get("exclude_type"):
                 statement = statement.where(semantic_type != str(filters["exclude_type"]))
-            elif not filters.get("include_technical"):
+            elif document_scope == "all" and not filters.get("include_technical"):
                 statement = statement.where(
                     semantic_type != DocumentType.DEVICE_RESPONSE.value
                 )
-            if not filters.get("include_technical"):
+            if document_scope == "all" and not filters.get("include_technical"):
                 statement = statement.where(
                     or_(
                         DocumentVersion.complete.is_(True),
@@ -2782,6 +2955,47 @@ class SqlAlchemyApiRepository:
                 statement = statement.where(Document.captured_at >= filters["from"])
             if filters.get("to") is not None:
                 statement = statement.where(Document.captured_at < filters["to"])
+            if document_scope != "all":
+                # A classified category has the same boundary flag as its scope.
+                # The exact policy is evaluated on lightweight immutable columns;
+                # only the selected page loads correlations, line prices and views.
+                candidates = (
+                    statement.where(DocumentVersion.complete.is_(document_scope == "complete"))
+                    .with_only_columns(
+                        Document.id,
+                        DocumentVersion.id,
+                        semantic_type,
+                        _version_column(DocumentVersion.subtype, Document.subtype),
+                        DocumentVersion.normalized_text,
+                        DocumentVersion.complete,
+                        maintain_column_froms=True,
+                    )
+                    .order_by(Document.captured_at.desc(), Document.id)
+                )
+                selected_ids: list[UUID] = []
+                selected_versions: list[UUID] = []
+                count = 0
+                for (
+                    document_id, version_id, kind, subtype, body, complete
+                ) in session.execute(candidates):
+                    decision = document_pdf_decision(kind, subtype, body, complete)
+                    if decision.category != document_scope:
+                        continue
+                    if offset <= count < offset + limit:
+                        selected_ids.append(document_id)
+                        selected_versions.append(version_id)
+                    count += 1
+                by_id = {
+                    item.id: item
+                    for item in session.scalars(
+                        select(Document).where(Document.id.in_(selected_ids))
+                    )
+                } if selected_ids else {}
+                documents = [by_id[document_id] for document_id in selected_ids]
+                views = self._document_views(
+                    session, documents, version_ids=selected_versions
+                ) if documents else []
+                return views, count
             count = (
                 session.scalar(
                     select(func.count()).select_from(statement.order_by(None).subquery())

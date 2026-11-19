@@ -1036,6 +1036,142 @@ class AnalysisWatermark(Base):
     )
 
 
+class ExportRequest(Base):
+    """Persistent accounting export; no expiry or deletion of source evidence."""
+
+    __tablename__ = "export_requests"
+    __table_args__ = (
+        Index("ix_export_requests_status_created", "status", "created_at"),
+        Index("ix_export_requests_created", "created_at", "id"),
+        CheckConstraint(
+            "status IN ('queued','running','completed','failed')", name="export_status"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid4)
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    date_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    date_to: Mapped[date | None] = mapped_column(Date, nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    device_ids: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[Any] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+    started_at: Mapped[Any | None] = mapped_column(UTCDateTime())
+    completed_at: Mapped[Any | None] = mapped_column(UTCDateTime())
+    total_documents: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_documents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    archive_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    archive_sha256: Mapped[str | None] = mapped_column(SHA256)
+    renderer_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    error: Mapped[str | None] = mapped_column(String(1024))
+    selection_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
+
+
+class ExportItem(Base):
+    """Frozen document membership and complete rendering input for an export."""
+
+    __tablename__ = "export_items"
+    __table_args__ = (UniqueConstraint("export_id", "document_id"),)
+
+    export_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("export_requests.id", ondelete="RESTRICT"), primary_key=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("documents.id", ondelete="RESTRICT"), nullable=False
+    )
+    document_version_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("document_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    snapshot_sha256: Mapped[str] = mapped_column(SHA256, nullable=False)
+    date_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class AnalysisRequest(Base):
+    """Persistent whole-history reanalysis; completed reports are immutable."""
+
+    __tablename__ = "analysis_requests"
+    __table_args__ = (
+        UniqueConstraint("active_slot"),
+        Index("ix_analysis_requests_status_created", "status", "created_at"),
+        CheckConstraint(
+            "status IN ('queued','running','completed','failed')", name="analysis_status"
+        ),
+        CheckConstraint(
+            "(status IN ('queued','running') AND active_slot IS NOT NULL AND active_slot = 1) OR "
+            "(status IN ('completed','failed') AND active_slot IS NULL)",
+            name="analysis_active_slot",
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(UUIDBinary(), primary_key=True, default=uuid4)
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    active_slot: Mapped[int | None] = mapped_column(Integer)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[Any] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+    started_at: Mapped[Any | None] = mapped_column(UTCDateTime())
+    completed_at: Mapped[Any | None] = mapped_column(UTCDateTime())
+    total_jobs: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_jobs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_jobs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_documents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_documents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    parser_versions: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    checkpoints: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))
+    error: Mapped[str | None] = mapped_column(String(1024))
+
+
+class AnalysisInput(Base):
+    """Frozen RAW membership and pre-run interpretation identities."""
+
+    __tablename__ = "analysis_inputs"
+    __table_args__ = (UniqueConstraint("analysis_id", "sequence"),)
+    analysis_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("analysis_requests.id", ondelete="RESTRICT"), primary_key=True
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("print_jobs.id", ondelete="RESTRICT"), primary_key=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    snapshot_sha256: Mapped[str] = mapped_column(SHA256, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    outcome: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))
+
+
+class AnalysisResult(Base):
+    """Pinned interpretation plus immutable discount observations for one run."""
+
+    __tablename__ = "analysis_results"
+    __table_args__ = (UniqueConstraint("analysis_id", "sequence"),)
+    analysis_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("analysis_requests.id", ondelete="RESTRICT"), primary_key=True
+    )
+    document_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("documents.id", ondelete="RESTRICT"), primary_key=True
+    )
+    document_version_id: Mapped[UUID] = mapped_column(
+        UUIDBinary(), ForeignKey("document_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    snapshot_sha256: Mapped[str] = mapped_column(SHA256, nullable=False)
+    result_sha256: Mapped[str] = mapped_column(SHA256, nullable=False)
+
+
 # Apply the same physical storage contract to every MariaDB table, including
 # tables that define their own constraints and indexes above.
 for _table in Base.metadata.tables.values():
@@ -1047,6 +1183,9 @@ for _table in Base.metadata.tables.values():
 __all__ = [
     "ActiveParserVersion",
     "AnalysisWatermark",
+    "AnalysisRequest",
+    "AnalysisInput",
+    "AnalysisResult",
     "AuditLog",
     "Device",
     "DeviceStatus",
@@ -1055,6 +1194,8 @@ __all__ = [
     "DocumentCorrelationMember",
     "DocumentLine",
     "DocumentVersion",
+    "ExportItem",
+    "ExportRequest",
     "FraudAlert",
     "FraudAlertEvidence",
     "FraudAlertHistory",

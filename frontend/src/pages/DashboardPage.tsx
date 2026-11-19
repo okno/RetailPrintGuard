@@ -13,7 +13,7 @@ import {
   ShieldOutlined,
   WarningAmberOutlined,
 } from '@mui/icons-material'
-import { Alert, Box, Button, Card, CardContent, Grid, LinearProgress, List, ListItem, ListItemText, Paper, Stack, Typography } from '@mui/material'
+import { Alert, Box, Button, Card, CardContent, Chip, Grid, LinearProgress, List, ListItem, ListItemText, Paper, Stack, Typography } from '@mui/material'
 import { alpha, useTheme } from '@mui/material/styles'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
@@ -24,6 +24,8 @@ import { StatCard } from '../components/StatCard'
 import { ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
 import { operationalReductionQuery, operationalReductionTransactionsPath } from '../dashboardDrilldown'
+import { deviceLabel } from '../documentPresentation'
+import { discountDrilldownPath, discountMoney } from '../discountPresentation'
 import { shortDateTime } from '../format'
 import { apiPeriodParams } from '../period'
 import { transactionDetailPath } from '../routes'
@@ -66,6 +68,10 @@ export function DashboardPage() {
   if (dashboard.isLoading) return <LoadingState />
   if (dashboard.error || !dashboard.data) return <ErrorState error={dashboard.error} />
   const data = dashboard.data
+  const documentCount = data.complete_documents ?? data.documents
+  const types = data.complete_document_type_counts
+  const preBills = types ? types.PRE_BILL ?? 0 : data.pre_bills
+  const orders = types ? (types.ORDER ?? 0) + (types.ORDER_CHANGE ?? 0) + (types.KITCHEN_ORDER ?? 0) : data.orders
   const operationalAlerts = data.operational_alerts ?? data.open_alerts
   const economicDifference = data.operational_economic_difference ?? data.economic_difference
   const reductionEpisodes = data.economic_reduction_episodes ?? (Number(economicDifference) > 0 ? 1 : 0)
@@ -81,8 +87,23 @@ export function DashboardPage() {
           <PeriodPicker params={params} onChange={setParams} defaultPreset="week" />
         </Box>}
       />
+      {documentCount === 0 && (period.has('from') || period.has('to')) && <Alert severity="info" sx={{ mb: 2 }} action={<Button onClick={() => {
+        const next = new URLSearchParams(params)
+        next.set('period', 'all')
+        next.delete('from')
+        next.delete('to')
+        next.delete('offset')
+        setParams(next)
+      }}>Mostra intero storico</Button>}>
+        Il periodo selezionato non contiene documenti completi. I dati precedenti restano consultabili nello storico.
+      </Alert>}
+      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 2 }}>
+        {data.partial_documents !== undefined && <Chip component={Link} clickable to={routeWithPeriod('/documenti', period, { document_scope: 'partial' })} variant="outlined" color="warning" label={`${data.partial_documents} parziali da verificare`} />}
+        {data.total_evidence !== undefined && <Chip component={Link} clickable to={routeWithPeriod('/documenti', period, { document_scope: 'all' })} variant="outlined" label={`${data.total_evidence} evidenze totali`} />}
+        {data.excluded_evidence !== undefined && <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center' }}>{data.excluded_evidence} evidenze escluse dai PDF</Typography>}
+      </Box>
       <Grid container spacing={2.2}>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Documenti acquisiti" value={data.documents} helper={`${data.pre_bills} preconti nel periodo`} icon={<DescriptionOutlined />} to={routeWithPeriod('/documenti', period)} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Documenti completi" value={documentCount} helper={`${preBills} preconti completi nel periodo`} icon={<DescriptionOutlined />} to={routeWithPeriod('/documenti', period, { document_scope: 'complete' })} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Segnalazioni operative" value={operationalAlerts} helper={`${data.critical_alerts} critiche; consultazione di supporto`} icon={<ShieldOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con possibile ammanco" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ammanco potenziale totale" value={euros.format(Number(economicDifference))} helper="somma unica degli episodi del periodo" icon={<EuroOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
@@ -90,16 +111,22 @@ export function DashboardPage() {
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Storico non operativo" value={archivedKnown ? archived : '—'} helper="falsi positivi e giustificati" icon={<HistoryOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'archive' })} /></Grid>
         <Grid size={{ xs: 12 }} sx={{ mt: 1 }}>
           <Box>
-            <Typography variant="h2">Vendite per reparto</Typography>
+            <Typography variant="h2">Quantità nelle comande per reparto</Typography>
             <Typography color="text.secondary" sx={{ mt: 0.5 }}>
-              Quantità nette delle righe prodotto nel periodo selezionato; le variazioni negative riducono il totale.
+              Quantità nette delle righe prodotto osservate nelle comande; le variazioni negative riducono il totale. Non rappresentano una riconciliazione delle vendite fiscali.
             </Typography>
           </Box>
         </Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Prodotti BAR" value={quantities.format(Number(data.sold_product_quantity_bar ?? 0))} helper="quantità netta venduta" icon={<LocalCafeOutlined />} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Prodotti CUCINA" value={quantities.format(Number(data.sold_product_quantity_kitchen ?? 0))} helper="quantità netta venduta" icon={<RestaurantOutlined />} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Prodotti PIZZERIA" value={quantities.format(Number(data.sold_product_quantity_pizzeria ?? 0))} helper="quantità netta venduta" icon={<LocalPizzaOutlined />} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 3 }}><StatCard label="Sconti dipendenti -30%" value={euros.format(Number(data.employee_discount_total ?? 0))} helper="autorizzati; esclusi dal rischio antifrode" icon={<PercentOutlined />} tone={theme.palette.success.main} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Prodotti BAR" value={quantities.format(Number(data.sold_product_quantity_bar ?? 0))} helper="quantità netta nelle comande" icon={<LocalCafeOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Prodotti CUCINA" value={quantities.format(Number(data.sold_product_quantity_kitchen ?? 0))} helper="quantità netta nelle comande" icon={<RestaurantOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Prodotti PIZZERIA" value={quantities.format(Number(data.sold_product_quantity_pizzeria ?? 0))} helper="quantità netta nelle comande" icon={<LocalPizzaOutlined />} /></Grid>
+        <Grid size={{ xs: 12 }} sx={{ mt: 1 }}>
+          <Typography variant="h2">Sconti osservati nei documenti</Typography>
+          <Typography color="text.secondary" sx={{ mt: .5 }}>Importi presenti nelle stampe selezionate. La verifica aritmetica non prova l’autorizzazione dello sconto e non chiude gli alert antifrode. Copie diverse possono riferirsi alla stessa vendita.</Typography>
+        </Grid>
+        <Grid size={{ xs: 12, md: 4 }}><StatCard label="Dipendenti 30% esplicito · osservati" value={discountMoney(data.observed_employee_discount_total)} helper={data.observed_employee_discount_count === undefined ? 'Conteggio documenti non disponibile' : `${data.observed_employee_discount_count} documenti · apri le evidenze`} icon={<PercentOutlined />} to={discountDrilldownPath(period, 'employee_30')} /></Grid>
+        <Grid size={{ xs: 12, md: 4 }}><StatCard label="Dipendenti 30% · documento riconciliato" value={discountMoney(data.arithmetic_reconciled_employee_discount_total)} helper={data.arithmetic_reconciled_employee_discount_count === undefined ? 'Conteggio documenti non disponibile' : `${data.arithmetic_reconciled_employee_discount_count} documenti · autorizzazione da verificare`} icon={<PercentOutlined />} to={discountDrilldownPath(period, 'employee_30', 'verified')} /></Grid>
+        <Grid size={{ xs: 12, md: 4 }}><StatCard label="30% generico · osservati" value={discountMoney(data.observed_generic_30_discount_total)} helper={data.observed_generic_30_discount_count === undefined ? 'Conteggio documenti non disponibile' : `${data.observed_generic_30_discount_count} documenti · nessuna attribuzione ai dipendenti`} icon={<PercentOutlined />} to={discountDrilldownPath(period, 'generic_30')} /></Grid>
         <Grid size={{ xs: 12 }}>
           <Card
             sx={{
@@ -183,18 +210,18 @@ export function DashboardPage() {
         <Grid size={{ xs: 12, lg: 7 }}>
           <Card><CardContent><Typography variant="h2" sx={{ mb: 2 }}>Copertura documentale</Typography>
             {[
-              ['Comande e ordini', data.orders, data.documents],
-              ['Documenti gestionali', data.management_documents, data.documents],
-              ['Documenti commerciali', data.commercial_documents, data.documents],
-              ['Report di fine turno', data.shift_end_reports ?? 0, data.documents],
-              ['Fatture', data.invoices ?? 0, data.documents],
+              ['Comande e ordini completi', orders, documentCount],
+              ['Documenti gestionali completi', types ? types.MANAGEMENT_DOCUMENT ?? 0 : data.management_documents, documentCount],
+              ['Documenti commerciali completi', types ? types.COMMERCIAL_DOCUMENT ?? 0 : data.commercial_documents, documentCount],
+              ['Report di fine turno completi', types ? types.SHIFT_END_REPORT ?? 0 : data.shift_end_reports ?? 0, documentCount],
+              ['Fatture complete', types ? types.INVOICE ?? 0 : data.invoices ?? 0, documentCount],
             ].map(([label, value, total]) => <Box key={String(label)} sx={{ mb: 2 }}><Box sx={{ display: 'flex', justifyContent: 'space-between', mb: .75 }}><Typography>{label}</Typography><Typography fontWeight={700}>{value}</Typography></Box><LinearProgress variant="determinate" value={Number(total) ? Math.min(100, Number(value) / Number(total) * 100) : 0} sx={{ height: 8, borderRadius: 4 }} /></Box>)}
             <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mt: 3, color: data.parse_errors ? 'warning.main' : 'success.main' }}><WarningAmberOutlined fontSize="small" /><Typography variant="body2">{data.parse_errors ? `${data.parse_errors} job richiedono verifica tecnica` : 'Nessun errore di parsing aperto'}</Typography></Box>
           </CardContent></Card>
         </Grid>
         <Grid size={{ xs: 12, lg: 5 }}>
           <Card><CardContent><Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}><Typography variant="h2">Dispositivi</Typography><DevicesOutlined color="action" /></Box>
-            {devices.isLoading ? <LoadingState label="Stato dispositivi…" /> : devices.error ? <ErrorState error={devices.error} /> : <List disablePadding>{devices.data?.map((device) => <ListItem key={device.id} disableGutters secondaryAction={<StatusChip value={device.online ? 'ONLINE' : 'OFFLINE'} />}><ListItemText primary={device.name} secondary={`${device.type.toUpperCase()} · ${device.pending_jobs} job in attesa`} /></ListItem>)}</List>}
+            {devices.isLoading ? <LoadingState label="Stato dispositivi…" /> : devices.error ? <ErrorState error={devices.error} /> : <List disablePadding>{devices.data?.map((device) => <ListItem key={device.id} disableGutters secondaryAction={<StatusChip value={device.online ? 'ONLINE' : 'OFFLINE'} />}><ListItemText primary={deviceLabel(device.id, devices.data)} secondary={`${device.type.toUpperCase()} · ${device.pending_jobs} job in attesa`} /></ListItem>)}</List>}
           </CardContent></Card>
         </Grid>
       </Grid>

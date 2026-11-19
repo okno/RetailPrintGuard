@@ -7,6 +7,10 @@ Le release applicative sono installate in directory content-addressed sotto
 atomicamente. Il frontend usa lo stesso schema in `/var/www`. Configurazione,
 spool, database e backup non sono dentro la release.
 
+Il listener web richiesto è `0.0.0.0:8081`, già applicato manualmente in
+produzione e presente nel template nginx. Le prossime distribuzioni devono
+mantenerlo: non reintrodurre un precedente override con indirizzo specifico.
+
 ## 1. Preparare la release fuori produzione
 
 ```bash
@@ -242,12 +246,19 @@ registrato per quella release e riavvia i servizi abilitati. Se uno switch o il
 restart fallisce tenta di ripristinare entrambi i link. Non esegue downgrade del
 database.
 
-`rollback.sh` non è un rollback “control-plane-only”: può riavviare i proxy.
-Quando è obbligatorio preservarne i PID, eseguire invece dalla sorgente della
-release precedente approvata `scripts/update.sh --control-plane-only`, purché il
-gate data plane e la compatibilità dello schema siano stati verificati. Se ciò
-non è possibile, fermarsi e pianificare una finestra ordinaria; non aggirare il
-controllo modificando script o unità installate.
+Per tornare alla release precedente senza riavviare POS, RCH o Epson:
+
+```bash
+su -c '/opt/retailprintguard/current/scripts/rollback.sh --control-plane-only'
+```
+
+Questa modalità verifica prima il codice e le unità dei tre proxy rispetto alla
+release precedente, poi cambia applicazione e frontend, riavvia soltanto i
+servizi di analisi/API e ricarica nginx. Controlla nuovamente PID, invocazione,
+timestamp di avvio, listener, unità e configurazione dei proxy. Conserva lo
+schema e tutti i dati: usarla soltanto quando la release precedente supporta lo
+schema attivo. Se il gate della closure data plane non passa, non forzare il
+rollback e pianificare una finestra di manutenzione.
 
 ## Rollback dati/schema
 

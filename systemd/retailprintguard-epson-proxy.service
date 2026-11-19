@@ -1,0 +1,51 @@
+[Unit]
+Description=RetailPrintGuard transparent Epson fiscal proxy
+Wants=network-online.target
+After=network-online.target
+PartOf=retailprintguard.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=retailprintguard-epson-proxy
+Group=retailprintguard-spool
+UMask=0027
+Environment=PYTHONUNBUFFERED=1
+Environment=RPG_CONFIG=/etc/retailprintguard/config.yaml
+UnsetEnvironment=RPG_DATABASE_URL RPG_JWT_SECRET_FILE
+ExecCondition=/opt/retailprintguard/current/.venv/bin/python /opt/retailprintguard/current/scripts/validate_site_config.py --config /etc/retailprintguard/config.yaml --has-enabled-type epson
+ExecStartPre=/opt/retailprintguard/current/.venv/bin/retailprintguard-proxy --config /etc/retailprintguard/config.yaml --device-type epson --check-config
+ExecStart=/opt/retailprintguard/current/.venv/bin/retailprintguard-proxy --config /etc/retailprintguard/config.yaml --device-type epson
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/lib/retailprintguard/spool /var/log/retailprintguard/proxy
+LimitNOFILE=65536
+
+[Install]
+WantedBy=retailprintguard.target

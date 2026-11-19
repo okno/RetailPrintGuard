@@ -10,7 +10,7 @@ export function receiptHeaderEvidenceLabel(evidence: ReceiptHeaderEvidence | str
     return 'Estratta dall\'export della memoria fiscale DGFE'
   }
   if (evidence === 'DEVICE_METADATA_CONFIGURED') {
-    return 'Configurata sul dispositivo (non osservata nel flusso)'
+    return ''
   }
   return RECEIPT_HEADER_NOT_AVAILABLE
 }
@@ -24,16 +24,16 @@ export function receiptHeaderSummary(header: ReceiptHeaderRecord | null | undefi
 
 export function configuredReceiptHeaderText(header: ReceiptHeaderRecord | null | undefined) {
   if (!header || !['DEVICE_METADATA_CONFIGURED', 'RCH_DGFE_EXPORT'].includes(header.evidence)) return null
-  const title = header.evidence === 'RCH_DGFE_EXPORT'
-    ? 'INTESTAZIONE DOCUMENTO (MEMORIA FISCALE DGFE)'
-    : 'INTESTAZIONE DOCUMENTO (CONFIGURATA)'
-  const lines = [title]
+  const lines = header.evidence === 'RCH_DGFE_EXPORT'
+    ? ['INTESTAZIONE DOCUMENTO (MEMORIA FISCALE DGFE)']
+    : []
   if (header.merchant_name) lines.push(header.merchant_name)
   if (header.legal_name) lines.push(header.legal_name)
   lines.push(...header.address_lines)
   if (header.phone) lines.push(`Telefono ${header.phone}`)
   if (header.tax_code) lines.push(`C.F. ${header.tax_code}`)
   if (header.vat_number) lines.push(`P.IVA ${header.vat_number}`)
-  lines.push('', receiptHeaderEvidenceLabel(header.evidence))
+  const provenance = receiptHeaderEvidenceLabel(header.evidence)
+  if (provenance) lines.push('', provenance)
   return lines.join('\n')
 }

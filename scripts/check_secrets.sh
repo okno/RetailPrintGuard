@@ -24,6 +24,7 @@ git rev-parse --is-inside-work-tree >/dev/null
 "${python_bin}" - <<'PY'
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import re
 import subprocess
@@ -64,6 +65,9 @@ placeholder_passwords = {
 }
 
 findings: list[str] = []
+reviewed_font_path = "src/retailprintguard/render/fonts/DejaVuSansMono.ttf"
+reviewed_font_sha256 = "54bf827eb99404e8f430c330ad30f063334f637eba0109b6a18d4f566a8e9dd8"
+reviewed_font_license_sha256 = "e180b3d65bf650dffffd71dd21b6180767b469a18dd87e1d8552be69bb9ecdf0"
 for relative in paths:
     if relative.suffix.lower() in forbidden_suffixes:
         findings.append(f"private artifact extension: {relative.as_posix()}")
@@ -78,6 +82,21 @@ for relative in paths:
         data = path.read_bytes()
     except OSError as exc:
         findings.append(f"cannot inspect {relative.as_posix()}: {exc}")
+        continue
+    # Only this reviewed, unmodified open font is allowed as binary source.
+    # Never broaden this to all fonts or trust a caller-supplied checksum.
+    if relative.as_posix() == reviewed_font_path:
+        license_path = path.with_name("LICENSE-DejaVu.txt")
+        try:
+            license_sha256 = hashlib.sha256(license_path.read_bytes()).hexdigest()
+        except OSError:
+            license_sha256 = None
+        if (
+            data[:4] != b"\x00\x01\x00\x00"
+            or hashlib.sha256(data).hexdigest() != reviewed_font_sha256
+            or license_sha256 != reviewed_font_license_sha256
+        ):
+            findings.append(f"unverified embedded font: {relative.as_posix()}")
         continue
     if b"\0" in data:
         findings.append(f"unexpected binary candidate: {relative.as_posix()}")

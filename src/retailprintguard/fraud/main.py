@@ -13,9 +13,12 @@ from dataclasses import asdict
 from pathlib import Path
 from threading import Event
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from retailprintguard import __version__
 from retailprintguard.common.config import load_settings
 from retailprintguard.common.logging import StructuredLoggingRuntime, configure_structured_logging
+from retailprintguard.common.pipeline_lock import run_pipeline_once, safe_worker_error
 from retailprintguard.db.session import create_db_engine, session_factory
 from retailprintguard.fraud.worker import FraudWorker
 
@@ -73,6 +76,7 @@ def _log_report(report: object) -> None:
 def run_cli(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     runtime: StructuredLoggingRuntime | None = None
+    engine = None
     if args.json_logs:
         runtime = configure_structured_logging("fraud")
     try:
@@ -88,10 +92,13 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         )
         if args.once:
             _print_report(
-                worker.run_once(max_transactions=args.max_transactions),
+                run_pipeline_once(
+                    engine,
+                    lambda: worker.run_once(max_transactions=args.max_transactions),
+                    required=True,
+                ),
                 json_output=args.json,
             )
-            engine.dispose()
             return 0
 
         stop = Event()
@@ -104,7 +111,12 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         interval = args.poll_interval or settings.ingestion.scan_interval_seconds
         while not stop.is_set():
             try:
-                report = worker.run_once(max_transactions=args.max_transactions)
+                report = run_pipeline_once(
+                    engine, lambda: worker.run_once(max_transactions=args.max_transactions)
+                )
+                if report is None:
+                    stop.wait(interval)
+                    continue
                 if runtime is None:
                     _print_report(report, json_output=args.json)
                 else:
@@ -118,7 +130,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
                                 "service": "fraud",
                                 "event": "worker_iteration_failed",
                                 "error": type(exc).__name__,
-                                "message": str(exc),
+                                "message": safe_worker_error(exc),
                             },
                             ensure_ascii=False,
                             sort_keys=True,
@@ -131,25 +143,26 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
                         "fraud iteration failed",
                         extra={
                             "event": "worker_iteration_failed",
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": safe_worker_error(exc),
                         },
                     )
             stop.wait(interval)
-        engine.dispose()
         return 0
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError, SQLAlchemyError) as exc:
         if runtime is None:
-            print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"ERROR: {safe_worker_error(exc)}", file=sys.stderr)
         else:
             LOGGER.error(
                 "fraud service failed",
                 extra={
                     "event": "fraud_service_failed",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": safe_worker_error(exc),
                 },
             )
         return 2
     finally:
+        if engine is not None:
+            engine.dispose()
         if runtime is not None:
             runtime.stop()
 

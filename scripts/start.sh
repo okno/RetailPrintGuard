@@ -11,6 +11,7 @@ rpg_acquire_lock
 systemctl reset-failed "${RPG_SERVICES[@]}" retailprintguard.target
 systemctl start mariadb.service nginx.service retailprintguard.target
 for service in "${RPG_SERVICES[@]}"; do
+    rpg_service_configured "${service}" || continue
     systemctl is-active --quiet "${service}" || rpg_die "service failed to start: ${service}"
 done
 rpg_note "All RetailPrintGuard application services are active."

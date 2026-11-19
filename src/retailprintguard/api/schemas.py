@@ -8,7 +8,14 @@ from enum import StrEnum
 from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+
+from retailprintguard.render.eligibility import (
+    DOCUMENT_PDF_POLICY_VERSION,
+    classify_pdf_document,
+)
+from retailprintguard.render.naming import document_pdf_filename
+from retailprintguard.render.text import receipt_preview_text
 
 T = TypeVar("T")
 
@@ -59,6 +66,7 @@ class DeviceView(BaseModel):
     online: bool
     listen_endpoint: str
     target_endpoint: str
+    additional_ports: list[int] = Field(default_factory=list)
     last_connection_at: datetime | None = None
     last_print_at: datetime | None = None
     last_response_at: datetime | None = None
@@ -97,6 +105,19 @@ class DashboardView(BaseModel):
     sold_product_quantity_kitchen: Decimal = Decimal("0")
     sold_product_quantity_pizzeria: Decimal = Decimal("0")
     employee_discount_total: Decimal = Decimal("0")
+    observed_employee_discount_total: Decimal = Decimal("0")
+    observed_employee_discount_count: int = 0
+    observed_generic_30_discount_total: Decimal = Decimal("0")
+    observed_generic_30_discount_count: int = 0
+    arithmetic_reconciled_employee_discount_total: Decimal = Decimal("0")
+    arithmetic_reconciled_employee_discount_count: int = 0
+    complete_documents: int = 0
+    partial_documents: int = 0
+    excluded_evidence: int = 0
+    total_evidence: int = 0
+    complete_document_type_counts: dict[str, int] = Field(default_factory=dict)
+    available_data_from: datetime | None = None
+    available_data_to: datetime | None = None
 
 
 class SessionView(BaseModel):
@@ -233,6 +254,9 @@ class ReceiptHeaderView(BaseModel):
 
 
 class DocumentView(BaseModel):
+    # Snapshots may contain read-only computed projections; derive them from base fields.
+    model_config = ConfigDict(extra="ignore")
+
     id: UUID
     device_id: str
     job_id: UUID
@@ -281,6 +305,32 @@ class DocumentView(BaseModel):
     lines: list[DocumentLineView] = Field(default_factory=list)
     payments: list[dict[str, Any]] = Field(default_factory=list)
     correlations: list[dict[str, Any]] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def receipt_preview(self) -> str:
+        return receipt_preview_text(self)
+
+    @computed_field
+    @property
+    def pdf_filename(self) -> str:
+        filename = document_pdf_filename(self)
+        return filename[:-4] + "_parziale.pdf" if self.pdf_category == "partial" else filename
+
+    @computed_field
+    @property
+    def pdf_category(self) -> Literal["complete", "partial", "excluded"]:
+        return classify_pdf_document(self).category
+
+    @computed_field
+    @property
+    def pdf_reason_code(self) -> str:
+        return classify_pdf_document(self).reason_code
+
+    @computed_field
+    @property
+    def pdf_policy_version(self) -> str:
+        return DOCUMENT_PDF_POLICY_VERSION
 
 
 class OrderView(BaseModel):

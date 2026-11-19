@@ -21,7 +21,8 @@ import { PageHeader } from '../components/PageHeader'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
 import { formatDateTime } from '../format'
-import type { Page, ProxySession } from '../types'
+import { deviceLabel } from '../documentPresentation'
+import type { Device, Page, ProxySession } from '../types'
 
 const bytes = new Intl.NumberFormat('it-IT', { notation: 'compact', style: 'unit', unit: 'byte' })
 
@@ -52,6 +53,7 @@ export function SessionsPage() {
     placeholderData: keepPreviousData,
     refetchInterval: 15_000,
   })
+  const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), staleTime: 30_000 })
 
   async function download(item: ProxySession, direction: 'request' | 'response') {
     setDownloadError(undefined)
@@ -82,7 +84,7 @@ export function SessionsPage() {
           <TableHead><TableRow><TableCell>Apertura</TableCell><TableCell>Dispositivo</TableCell><TableCell>Sorgente → destinazione</TableCell><TableCell>Durata</TableCell><TableCell>Stato</TableCell><TableCell align="right">Request</TableCell><TableCell align="right">Response</TableCell><TableCell>Azioni</TableCell></TableRow></TableHead>
           <TableBody>{query.data.items.map((item) => <TableRow key={item.id} hover>
             <TableCell><Typography variant="body2">{formatDateTime(item.opened_at)}</Typography><Typography variant="caption" color="text.secondary">{item.id}</Typography></TableCell>
-            <TableCell>{item.device_id}</TableCell>
+            <TableCell>{deviceLabel(item.device_id, devices.data)}<Typography variant="caption" display="block">{item.device_id}</Typography></TableCell>
             <TableCell>{item.source_endpoint}<br />{item.target_endpoint}</TableCell>
             <TableCell>{duration(item)}</TableCell>
             <TableCell><StatusChip value={item.complete ? 'COMPLETE' : (item.close_reason ?? 'INCOMPLETE')} /></TableCell>

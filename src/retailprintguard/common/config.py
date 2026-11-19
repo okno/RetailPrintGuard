@@ -24,11 +24,22 @@ MAC_ADDRESS_PATTERNS = (
 class DeviceType(StrEnum):
     POS = "pos"
     RCH = "rch"
+    EPSON = "epson"
 
 
 class ParserKind(StrEnum):
     ESCPOS = "escpos"
     RCH_OBSERVED = "rch_observed"
+    OPAQUE_RAW = "opaque_raw"
+
+
+class HistoricalTargetConfig(BaseModel):
+    """An operator-approved former endpoint used only to identify captured evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ip: IPv4Address
+    port: Annotated[int, Field(strict=True, ge=1, le=65535)]
 
 
 class DeviceConfig(BaseModel):
@@ -44,6 +55,12 @@ class DeviceConfig(BaseModel):
     listen_port: Annotated[int, Field(ge=1, le=65535)]
     target_ip: IPv4Address
     target_port: Annotated[int, Field(ge=1, le=65535)]
+    additional_ports: Annotated[
+        tuple[Annotated[int, Field(strict=True, ge=1, le=65535)], ...], Field(max_length=8)
+    ] = ()
+    historical_targets: Annotated[
+        tuple[HistoricalTargetConfig, ...], Field(max_length=32)
+    ] = ()
     parser: ParserKind
     bidirectional: bool = True
     enabled: bool = True
@@ -84,7 +101,20 @@ class DeviceConfig(BaseModel):
             raise ValueError("POS devices require parser=escpos")
         if self.type is DeviceType.RCH and self.parser is not ParserKind.RCH_OBSERVED:
             raise ValueError("RCH devices require parser=rch_observed")
-        if self.listen_ip == self.target_ip and self.listen_port == self.target_port:
+        if self.type is DeviceType.EPSON and self.parser is not ParserKind.OPAQUE_RAW:
+            raise ValueError("Epson fiscal devices require parser=opaque_raw")
+        if len(self.historical_targets) != len(set(self.historical_targets)):
+            raise ValueError("historical_targets must be unique")
+        if self.additional_ports:
+            if self.type is not DeviceType.EPSON:
+                raise ValueError("additional_ports are supported only for Epson devices")
+            if len(self.additional_ports) != len(set(self.additional_ports)):
+                raise ValueError("additional_ports must be unique")
+            if {self.listen_port, self.target_port}.intersection(self.additional_ports):
+                raise ValueError("additional_ports must differ from both primary ports")
+        if self.listen_ip == self.target_ip and (
+            self.listen_port == self.target_port or self.additional_ports
+        ):
             raise ValueError("listen and target endpoint must differ")
         if not self.bidirectional:
             raise ValueError("all configured transparent relays must be bidirectional")
@@ -232,10 +262,14 @@ class Settings(BaseModel):
             raise ValueError("at least one device is required")
         ids = [device.id for device in self.devices]
         endpoints = [
-            (device.listen_ip, device.listen_port) for device in self.devices if device.enabled
+            (device.listen_ip, port)
+            for device in self.devices if device.enabled
+            for port in (device.listen_port, *device.additional_ports)
         ]
         targets = [
-            (device.target_ip, device.target_port) for device in self.devices if device.enabled
+            (device.target_ip, port)
+            for device in self.devices if device.enabled
+            for port in (device.target_port, *device.additional_ports)
         ]
         if len(ids) != len(set(ids)):
             raise ValueError("device ids must be unique")
@@ -243,6 +277,20 @@ class Settings(BaseModel):
             raise ValueError("enabled listener endpoints must be unique")
         if len(targets) != len(set(targets)):
             raise ValueError("enabled target endpoints must be unique")
+        target_owners = {
+            (device.target_ip, port): device.id
+            for device in self.devices if device.enabled
+            for port in (device.target_port, *device.additional_ports)
+        }
+        for device in self.devices:
+            if not device.enabled:
+                continue
+            for target in device.historical_targets:
+                owner = target_owners.setdefault((target.ip, target.port), device.id)
+                if owner != device.id:
+                    raise ValueError(
+                        "historical target endpoints must map to one enabled device"
+                    )
         if len({self.spool_root, self.archive_root, self.log_root}) != 3:
             raise ValueError("spool, archive and log roots must differ")
         if any(endpoint in endpoints for endpoint in targets):

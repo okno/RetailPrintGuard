@@ -1,3 +1,5 @@
+import type { Device, DocumentLine, DocumentScope } from './types'
+
 export const TECHNICAL_DOCUMENT_TYPE = 'DEVICE_RESPONSE'
 export const ALL_EVIDENCE_FILTER = '__ALL__'
 
@@ -15,22 +17,29 @@ const DOCUMENT_TYPE_LABELS: Record<string, string> = {
   REFUND: 'RIMBORSO',
   REPRINT: 'RISTAMPA',
   PAYMENT: 'PAGAMENTO',
-  DEVICE_RESPONSE: 'RISPOSTA TECNICA RCH',
+  DEVICE_RESPONSE: 'RISPOSTA TECNICA DISPOSITIVO',
   UNKNOWN: 'SCONOSCIUTO',
-}
-
-const POS_DEVICE_LABELS: Record<string, string> = {
-  pos_1: 'BAR',
-  pos_2: 'CUCINA',
-  pos_3: 'PIZZERIA',
 }
 
 export function documentTypeLabel(value: string) {
   return DOCUMENT_TYPE_LABELS[value] ?? value.replaceAll('_', ' ')
 }
 
-export function deviceLabel(value: string) {
-  return POS_DEVICE_LABELS[value.toLowerCase()] ?? value
+export function isEpsonDailyReport(document: Pick<{
+  type: string
+  subtype: string
+}, 'type' | 'subtype'>) {
+  return document.type === 'SHIFT_END_REPORT'
+    && /^EPSON_(?:X|Z|XZ)_REPORT_OBSERVED$/.test(document.subtype)
+}
+
+export function documentPreviewTabLabel(document: Pick<{ type: string }, 'type'>) {
+  return document.type === 'SHIFT_END_REPORT' ? 'Rapporto' : 'Scontrino'
+}
+
+export function deviceLabel(value: string, devices?: readonly Pick<Device, 'id' | 'name' | 'display_name'>[]) {
+  const device = devices?.find((candidate) => candidate.id === value)
+  return device?.display_name?.trim() || device?.name?.trim() || value
 }
 
 export function documentTimestampEvidenceLabel(value?: string) {
@@ -39,47 +48,35 @@ export function documentTimestampEvidenceLabel(value?: string) {
   return value ? 'Osservata nel documento' : undefined
 }
 
-/**
- * Keep the UI-only "all evidence" value out of the backend query. During a
- * rolling update the client also applies this filter, so an older API cannot
- * accidentally mix protocol responses into the primary document view.
- */
+export function selectedDocumentScope(params: URLSearchParams): DocumentScope {
+  const scope = params.get('document_scope')
+  if (scope === 'complete' || scope === 'partial' || scope === 'all') return scope
+  // Preserve links saved before content and document type became separate filters.
+  if (params.get('type') === ALL_EVIDENCE_FILTER || params.get('type') === TECHNICAL_DOCUMENT_TYPE || params.get('include_technical') === 'true') return 'all'
+  return 'complete'
+}
+
 export function documentApiSearchParams(uiParams: URLSearchParams) {
   const apiParams = new URLSearchParams(uiParams)
   apiParams.delete('period')
-  const selectedType = apiParams.get('type') ?? ''
-  if (selectedType === ALL_EVIDENCE_FILTER) {
-    apiParams.delete('type')
-    apiParams.delete('exclude_type')
-    apiParams.set('include_technical', 'true')
-  } else if (!selectedType) {
-    apiParams.delete('type')
-    apiParams.set('exclude_type', TECHNICAL_DOCUMENT_TYPE)
-    apiParams.delete('include_technical')
-  } else if (selectedType === TECHNICAL_DOCUMENT_TYPE) {
-    apiParams.delete('exclude_type')
-    apiParams.set('include_technical', 'true')
-  } else {
-    apiParams.delete('exclude_type')
-    apiParams.delete('include_technical')
-  }
+  apiParams.delete('exclude_type')
+  const scope = selectedDocumentScope(uiParams)
+  apiParams.set('document_scope', scope)
+  if (apiParams.get('type') === ALL_EVIDENCE_FILTER || !apiParams.get('type')) apiParams.delete('type')
+  if (scope === 'all') apiParams.set('include_technical', 'true')
+  else apiParams.delete('include_technical')
   return apiParams
-}
-
-/**
- * Hide only device protocol responses in the primary view. Never collapse
- * equal hashes or different job IDs: repeated prints remain distinct evidence.
- */
-export function presentedDocuments<T extends { type: string }>(
-  documents: readonly T[],
-  selectedType: string,
-) {
-  if (selectedType) return [...documents]
-  return documents.filter((document) => document.type !== TECHNICAL_DOCUMENT_TYPE)
 }
 
 export function confidencePercent(value: number | undefined) {
   if (value === undefined || !Number.isFinite(value)) return undefined
   const percent = value <= 1 ? value * 100 : value
   return Math.round(percent * 10) / 10
+}
+
+/** API null means unobserved; it must not become a zero price or lose provenance. */
+export function documentLinePrice(line: Pick<DocumentLine, 'unit_price' | 'derived_unit_price'>) {
+  if (line.unit_price != null) return { value: line.unit_price, derived: false }
+  if (line.derived_unit_price != null) return { value: line.derived_unit_price, derived: true }
+  return undefined
 }

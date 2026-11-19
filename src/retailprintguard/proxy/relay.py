@@ -1,4 +1,4 @@
-"""Generic byte-exact TCP relays for POS and RCH devices.
+"""Generic byte-exact TCP relays for configured printer devices.
 
 This module has no parser or database dependency.  It connects to the physical
 device before it starts reading from the client, relays both directions with
@@ -117,7 +117,7 @@ class _ActivityClock:
 
 
 class RelayService:
-    """Run one independent listener per enabled configured device."""
+    """Run the configured listeners with one capture manager per service."""
 
     def __init__(self, settings: Settings, capture_manager: CaptureManager | None = None) -> None:
         self.settings = settings
@@ -169,25 +169,46 @@ class RelayService:
             for device in self.settings.devices:
                 if not device.enabled:
                     continue
-                target = (str(device.target_ip), device.target_port)
-                if target in self._target_locks:
-                    raise RelayError(f"duplicate enabled target endpoint: {target[0]}:{target[1]}")
-                self._target_locks[target] = asyncio.Lock()
-                server = await asyncio.start_server(
-                    lambda reader, writer, route=device: self._handle_client(route, reader, writer),
-                    host=str(device.listen_ip),
-                    port=device.listen_port,
-                    start_serving=True,
-                )
-                self._servers[device.id] = server
-                started.append(server)
-                self._log(
-                    logging.INFO,
-                    "listener_started",
-                    device,
-                    listen=f"{device.listen_ip}:{device.listen_port}",
-                    target=f"{device.target_ip}:{device.target_port}",
-                )
+                routes = [(device.id, device)] + [
+                    (
+                        f"{device.id}:{port}",
+                        device.model_copy(
+                            update={
+                                "listen_port": port,
+                                "target_port": port,
+                                "additional_ports": (),
+                            }
+                        ),
+                    )
+                    for port in device.additional_ports
+                ]
+                for listener_id, route in routes:
+                    target = (str(route.target_ip), route.target_port)
+                    if target in self._target_locks:
+                        raise RelayError(
+                            f"duplicate enabled target endpoint: {target[0]}:{target[1]}"
+                        )
+                    self._target_locks[target] = asyncio.Lock()
+                    server = await asyncio.start_server(
+                        lambda reader, writer, route=route: self._handle_client(
+                            route, reader, writer
+                        ),
+                        host=str(route.listen_ip),
+                        port=route.listen_port,
+                        start_serving=False,
+                    )
+                    self._servers[listener_id] = server
+                    started.append(server)
+                    self._log(
+                        logging.INFO,
+                        "listener_started",
+                        route,
+                        listen=f"{route.listen_ip}:{route.listen_port}",
+                        target=f"{route.target_ip}:{route.target_port}",
+                    )
+            # Bind all routes before accepting clients, including when an
+            # additional port conflicts with an existing process.
+            await asyncio.gather(*(server.start_serving() for server in started))
         except BaseException:
             for server in started:
                 server.close()

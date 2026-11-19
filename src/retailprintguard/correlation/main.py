@@ -13,9 +13,12 @@ from dataclasses import asdict
 from pathlib import Path
 from threading import Event
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from retailprintguard import __version__
 from retailprintguard.common.config import load_settings
 from retailprintguard.common.logging import StructuredLoggingRuntime, configure_structured_logging
+from retailprintguard.common.pipeline_lock import run_pipeline_once, safe_worker_error
 from retailprintguard.correlation.worker import CorrelationWorker, activate_parser_version
 from retailprintguard.db.session import create_db_engine, session_factory
 
@@ -82,6 +85,7 @@ def _log_report(report: object) -> None:
 def run_cli(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     runtime: StructuredLoggingRuntime | None = None
+    engine = None
     if args.json_logs:
         runtime = configure_structured_logging("correlation")
     try:
@@ -100,13 +104,17 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
                 "--activation-reason must be provided together"
             )
         if all(activation_values):
-            activated_id = activate_parser_version(
-                factory,
-                parser_name=args.activate_parser,
-                parser_version=args.parser_version,
-                build_sha256=args.build_sha256,
-                reason=args.activation_reason,
-                rewind=not args.no_rewind,
+            activated_id = run_pipeline_once(
+                engine,
+                lambda: activate_parser_version(
+                    factory,
+                    parser_name=args.activate_parser,
+                    parser_version=args.parser_version,
+                    build_sha256=args.build_sha256,
+                    reason=args.activation_reason,
+                    rewind=not args.no_rewind,
+                ),
+                required=True,
             )
             activation = {
                 "parser_name": args.activate_parser,
@@ -136,10 +144,13 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         )
         if args.once:
             _print_report(
-                worker.run_once(max_documents=args.max_documents),
+                run_pipeline_once(
+                    engine,
+                    lambda: worker.run_once(max_documents=args.max_documents),
+                    required=True,
+                ),
                 json_output=args.json,
             )
-            engine.dispose()
             return 0
 
         stop = Event()
@@ -152,7 +163,12 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         interval = args.poll_interval or settings.ingestion.scan_interval_seconds
         while not stop.is_set():
             try:
-                report = worker.run_once(max_documents=args.max_documents)
+                report = run_pipeline_once(
+                    engine, lambda: worker.run_once(max_documents=args.max_documents)
+                )
+                if report is None:
+                    stop.wait(interval)
+                    continue
                 if runtime is None:
                     _print_report(report, json_output=args.json)
                 else:
@@ -166,7 +182,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
                                 "service": "correlation",
                                 "event": "worker_iteration_failed",
                                 "error": type(exc).__name__,
-                                "message": str(exc),
+                                "message": safe_worker_error(exc),
                             },
                             ensure_ascii=False,
                             sort_keys=True,
@@ -179,25 +195,26 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
                         "correlation iteration failed",
                         extra={
                             "event": "worker_iteration_failed",
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": safe_worker_error(exc),
                         },
                     )
             stop.wait(interval)
-        engine.dispose()
         return 0
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError, SQLAlchemyError) as exc:
         if runtime is None:
-            print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"ERROR: {safe_worker_error(exc)}", file=sys.stderr)
         else:
             LOGGER.error(
                 "correlation service failed",
                 extra={
                     "event": "correlation_service_failed",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": safe_worker_error(exc),
                 },
             )
         return 2
     finally:
+        if engine is not None:
+            engine.dispose()
         if runtime is not None:
             runtime.stop()
 

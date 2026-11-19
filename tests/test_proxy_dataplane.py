@@ -185,7 +185,7 @@ def _route(
         "listen_port": _unused_port(),
         "target_ip": "127.0.0.1",
         "target_port": target_port,
-        "parser": "rch_observed" if device_type == "rch" else "escpos",
+        "parser": {"pos": "escpos", "rch": "rch_observed", "epson": "opaque_raw"}[device_type],
         "bidirectional": True,
         "enabled": True,
         "allowed_clients": ["127.0.0.1"],
@@ -258,6 +258,124 @@ class FailingCaptureManager:
 
 
 @pytest.mark.asyncio
+async def test_epson_additional_port_preserves_full_duplex_and_one_device_identity(
+    tmp_path: Path,
+) -> None:
+    native = FakeDevice(banner=b"\x02READY\x03", response=lambda data: b"\x06" + data)
+    http = FakeDevice(banner=b"HTTP-READY", response=lambda data: b"HTTP-REPLY:" + data)
+    await native.start()
+    await http.start()
+    native_port, http_port = native.port, http.port
+    historical_port = _unused_port()
+    route = _route("epson_multi", native_port, device_type="epson")
+    route.update(
+        listen_ip="127.0.0.2", listen_port=native_port, additional_ports=[http_port],
+        historical_targets=[{"ip": "198.51.100.45", "port": historical_port}],
+    )
+    service = RelayService(_settings(tmp_path, [route]))
+    await service.start()
+    barrier = asyncio.Barrier(2)
+
+    async def exchange(listener_id: str, fake: FakeDevice, fragments: list[bytes]) -> bytes:
+        reader, writer = await asyncio.open_connection(*service.listener_endpoints[listener_id])
+        try:
+            # Both target ports must respond before either client sends any bytes.
+            assert await asyncio.wait_for(reader.readexactly(len(fake.banner)), 2) == fake.banner
+            await asyncio.wait_for(barrier.wait(), 2)
+            for fragment in fragments:
+                writer.write(fragment)
+                await writer.drain()
+                await asyncio.sleep(0.01)
+            await _half_close(writer)
+            return fake.banner + await asyncio.wait_for(reader.read(), 3)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    native_fragments = [b"\x02\x00native", b"\xff\x03", b"next-command\x00"]
+    http_fragments = [b"POST /cgi-bin/fpmate.cgi HTTP/1.1\r\n", b"\r\n", b"<synthetic/>\x00"]
+    try:
+        assert set(service.listener_endpoints) == {"epson_multi", f"epson_multi:{http_port}"}
+        # Historical aliases authorize ingestion only: no listener or target lock.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unused_history:
+            unused_history.bind(("127.0.0.2", historical_port))
+        assert ("198.51.100.45", historical_port) not in service._target_locks
+        responses = await asyncio.gather(
+            exchange("epson_multi", native, native_fragments),
+            exchange(f"epson_multi:{http_port}", http, http_fragments),
+        )
+        await _wait_for_jobs(service, 2)
+    finally:
+        await service.stop()
+        await native.stop()
+        await http.stop()
+
+    expected = {
+        native_port: (b"".join(native_fragments), responses[0]),
+        http_port: (b"".join(http_fragments), responses[1]),
+    }
+    assert native.received == [expected[native_port][0]]
+    assert http.received == [expected[http_port][0]]
+    assert responses == [
+        native.banner + native.response(expected[native_port][0]),
+        http.banner + http.response(expected[http_port][0]),
+    ]
+    assert len(service.published_jobs) == 2
+    for published in service.published_jobs:
+        manifest = _manifest(published.job_path)
+        session = manifest["session"]
+        assert session["device_id"] == "epson_multi"
+        assert session["device_type"] == "epson"
+        assert session["parser"] == "opaque_raw"
+        port = session["target_endpoint"]["port"]
+        assert session["listener_endpoint"] == {"host": "127.0.0.2", "port": port}
+        assert session["target_endpoint"] == {"host": "127.0.0.1", "port": port}
+        assert (published.job_path / "client.raw").read_bytes() == expected[port][0]
+        assert (published.job_path / "device.raw").read_bytes() == expected[port][1]
+        assert manifest["status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_additional_port_bind_failure_and_restart_release_all_listeners(
+    tmp_path: Path,
+) -> None:
+    target = FakeDevice()
+    await target.start()
+    route = _route("epson_restart", _unused_port(), device_type="epson")
+    route.update(listen_ip="127.0.0.2", additional_ports=[target.port])
+    service = RelayService(_settings(tmp_path, [route]))
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("127.0.0.2", target.port))
+            occupied.listen()
+            with pytest.raises(OSError):
+                await service.start()
+            assert not service.listener_endpoints
+            assert not service._target_locks
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as released:
+                released.bind(("127.0.0.2", route["listen_port"]))
+
+        for cycle in range(2):
+            await service.start()
+            await service.start()  # Idempotent even with multiple listeners.
+            assert len(service.listener_endpoints) == 2
+            payload = f"restart-{cycle}".encode()
+            assert await _exchange(
+                service.listener_endpoints[f"epson_restart:{target.port}"], [payload]
+            ) == b"ACK:" + payload
+            await _wait_for_jobs(service, cycle + 1)
+            await service.stop()
+            assert not service.listener_endpoints
+            assert not service._target_locks
+            assert not service._active_sessions
+            assert not service._capture_finalizers
+    finally:
+        await service.stop()
+        await target.stop()
+    assert target.received == [b"restart-0", b"restart-1"]
+
+
+@pytest.mark.asyncio
 async def test_database_offline_does_not_block_forwarding_or_spool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -285,10 +403,15 @@ async def test_database_offline_does_not_block_forwarding_or_spool(
 
 
 @pytest.mark.asyncio
-async def test_fragmented_and_malformed_stream_is_forwarded_byte_exact(tmp_path: Path) -> None:
+@pytest.mark.parametrize("device_type", ["pos", "epson"])
+async def test_fragmented_and_malformed_stream_is_forwarded_byte_exact(
+    tmp_path: Path, device_type: str
+) -> None:
     device = FakeDevice(response=lambda _payload: b"\xff\x00RCH?\x1b")
     await device.start()
-    settings = _settings(tmp_path, [_route("pos_binary", device.port)])
+    settings = _settings(
+        tmp_path, [_route("pos_binary", device.port, device_type=device_type)]
+    )
     service = RelayService(settings)
     await service.start()
     fragments = [
@@ -386,7 +509,7 @@ async def test_fragmentation_fuzz_preserves_payload_and_digest_for_every_partiti
 
 
 @pytest.mark.asyncio
-async def test_four_devices_concurrently_remain_isolated_and_rch_is_full_duplex(
+async def test_five_devices_remain_isolated_with_rch_and_epson_full_duplex(
     tmp_path: Path,
 ) -> None:
     devices = [
@@ -394,7 +517,8 @@ async def test_four_devices_concurrently_remain_isolated_and_rch_is_full_duplex(
         for marker in (b"P1:", b"P2:", b"P3:")
     ]
     rch = FakeDevice(banner=b"RCH-READY|", response=lambda payload: b"RCH-ACK:" + payload)
-    all_devices = [*devices, rch]
+    epson = FakeDevice(banner=b"\xffEPS-READY|", response=lambda payload: b"EPS-ACK:" + payload)
+    all_devices = [*devices, rch, epson]
     for fake in all_devices:
         await fake.start()
     routes = [
@@ -402,6 +526,7 @@ async def test_four_devices_concurrently_remain_isolated_and_rch_is_full_duplex(
         _route("pos_two", devices[1].port),
         _route("pos_three", devices[2].port),
         _route("rch_one", rch.port, device_type="rch"),
+        _route("epson_one", epson.port, device_type="epson"),
     ]
     settings = _settings(tmp_path, routes)
     service = RelayService(settings)
@@ -411,6 +536,7 @@ async def test_four_devices_concurrently_remain_isolated_and_rch_is_full_duplex(
         "pos_two": b"bar-two\xff",
         "pos_three": b"secondary-three\x1dV",
         "rch_one": b"rch-request\x00\x1b",
+        "epson_one": b"epson-request\x00\x1b\xff",
     }
     try:
         responses = await asyncio.gather(
@@ -419,7 +545,7 @@ async def test_four_devices_concurrently_remain_isolated_and_rch_is_full_duplex(
                 for device_id, payload in payloads.items()
             )
         )
-        await _wait_for_jobs(service, 4)
+        await _wait_for_jobs(service, 5)
     finally:
         await service.stop()
         for fake in all_devices:
@@ -430,12 +556,14 @@ async def test_four_devices_concurrently_remain_isolated_and_rch_is_full_duplex(
         b"P2:" + payloads["pos_two"],
         b"P3:" + payloads["pos_three"],
         b"RCH-READY|RCH-ACK:" + payloads["rch_one"],
+        b"\xffEPS-READY|EPS-ACK:" + payloads["epson_one"],
     ]
     assert [fake.received for fake in all_devices] == [
         [payloads["pos_one"]],
         [payloads["pos_two"]],
         [payloads["pos_three"]],
         [payloads["rch_one"]],
+        [payloads["epson_one"]],
     ]
     jobs_by_device = {
         _manifest(published.job_path)["session"]["device_id"]: published.job_path
@@ -445,6 +573,10 @@ async def test_four_devices_concurrently_remain_isolated_and_rch_is_full_duplex(
     for device_id, payload in payloads.items():
         assert (jobs_by_device[device_id] / "client.raw").read_bytes() == payload
     assert (jobs_by_device["rch_one"] / "device.raw").read_bytes() == responses[3]
+    assert (jobs_by_device["epson_one"] / "device.raw").read_bytes() == responses[4]
+    epson_manifest = _manifest(jobs_by_device["epson_one"])
+    assert epson_manifest["session"]["device_type"] == "epson"
+    assert epson_manifest["session"]["parser"] == "opaque_raw"
 
 
 @pytest.mark.asyncio
@@ -556,19 +688,30 @@ async def test_capture_start_failure_continues_only_when_configured(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_physical_target_lock_rejects_a_concurrent_client(tmp_path: Path) -> None:
+@pytest.mark.parametrize("additional_port", [False, True])
+async def test_physical_target_lock_rejects_a_concurrent_client(
+    tmp_path: Path, additional_port: bool
+) -> None:
     device = HoldingDevice()
     await device.start()
-    settings = _settings(tmp_path, [_route("pos_exclusive", device.port)])
+    route = _route("pos_exclusive", device.port)
+    listener_id = "pos_exclusive"
+    if additional_port:
+        route.update(
+            type="epson", parser="opaque_raw", listen_ip="127.0.0.2",
+            target_port=_unused_port(), additional_ports=[device.port],
+        )
+        listener_id = f"pos_exclusive:{device.port}"
+    settings = _settings(tmp_path, [route])
     service = RelayService(settings)
     await service.start()
     first_reader, first_writer = await asyncio.open_connection(
-        *service.listener_endpoints["pos_exclusive"]
+        *service.listener_endpoints[listener_id]
     )
     await asyncio.wait_for(device.connected.wait(), timeout=2)
 
     second_reader, second_writer = await asyncio.open_connection(
-        *service.listener_endpoints["pos_exclusive"]
+        *service.listener_endpoints[listener_id]
     )
     try:
         with contextlib.suppress(ConnectionError, OSError):

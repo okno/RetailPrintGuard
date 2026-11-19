@@ -1,7 +1,7 @@
 # RetailPrintGuard
 
 RetailPrintGuard è un monorepo Python/React per acquisire in modo trasparente i
-flussi di tre stampanti POS e di una stampante RCH, conservare le evidenze
+flussi di stampanti POS, RCH ed Epson, conservare le evidenze
 originali, normalizzare i documenti, correlare le transazioni e applicare
 regole antifrode deterministiche.
 
@@ -10,7 +10,7 @@ le direzioni e non importa parser, API o database. La cattura usa una coda
 limitata e uno spool locale; un guasto del control plane non deve trasformarsi
 in una dipendenza sincrona della stampa.
 
-> Stato: release `0.4.9`. I test software sintetici coprono relay,
+> Stato: release `0.5.4`. I test software sintetici coprono relay,
 > spool, configurazione, import, correlazione, regole, modelli e API. Il collaudo
 > su hardware reale, il confronto PCAP direct-vs-proxy e l'installazione sul
 > target Debian 12 non sono ancora attestati da questo repository. Consultare
@@ -18,7 +18,7 @@ in una dipendenza sincrona della stampa.
 
 ## Componenti
 
-- `retailprintguard-proxy`: relay TCP byte-exact per route POS e RCH, con
+- `retailprintguard-proxy`: relay TCP byte-exact per route POS, RCH ed Epson, con
   isolamento per dispositivo e spool bidirezionale append-only;
 - `retailprintguard-ingestion`: validazione e importazione asincrona degli
   spool, con retry e contratto di idempotenza;
@@ -36,6 +36,8 @@ in una dipendenza sincrona della stampa.
 - `retailprintguard-fraud`: worker DB per regole spiegabili e versionate, evidenze,
   storia alert e whitelist documentate;
 - `retailprintguard-api`: API FastAPI versionate, autenticazione e RBAC;
+- `retailprintguard-export`: creazione asincrona di PDF per documento e ZIP,
+  con snapshot, manifesto di integrità e storico richieste;
 - `retailprintguard-admin`: bootstrap interattivo e auditato del solo primo
   amministratore;
 - `frontend/`: applicazione React/TypeScript in italiano, con temi persistenti
@@ -116,6 +118,10 @@ RetailPrintGuard/
 ```
 
 ## Documentazione
+
+- [Esportazioni contabili PDF/ZIP](docs/ESPORTAZIONI_CONTABILI.md)
+- [Rianalisi dello storico e sconti osservati](docs/RIANALISI_E_SCONTI.md)
+- [Epson: relay trasparente e limiti di interpretazione](docs/EPSON_FISCAL.md)
 
 - [Analisi iniziale](docs/ANALISI_INIZIALE.md)
 - [Inventario del sistema](docs/SYSTEM_INVENTORY.md)

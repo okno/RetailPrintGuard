@@ -144,11 +144,11 @@ done
 
 rpg_note "Creating least-privilege service identities"
 for group in retailprintguard-config retailprintguard-db retailprintguard-spool \
-    retailprintguard-pos-proxy retailprintguard-rch-proxy \
+    retailprintguard-pos-proxy retailprintguard-rch-proxy retailprintguard-epson-proxy \
     retailprintguard-worker retailprintguard-api; do
     getent group "${group}" >/dev/null || groupadd --system "${group}"
 done
-for proxy_identity in retailprintguard-pos-proxy retailprintguard-rch-proxy; do
+for proxy_identity in retailprintguard-pos-proxy retailprintguard-rch-proxy retailprintguard-epson-proxy; do
     if ! id "${proxy_identity}" >/dev/null 2>&1; then
         useradd --system --gid "${proxy_identity}" --home-dir /nonexistent \
             --shell /usr/sbin/nologin "${proxy_identity}"
@@ -172,6 +172,8 @@ install -d -m 0755 -o root -g root -- "${RPG_APP_ROOT}" "${RPG_RELEASES_DIR}"
 install -d -m 0750 -o root -g retailprintguard-spool -- "${RPG_SPOOL_ROOT}"
 install -d -m 2770 -o retailprintguard-worker -g retailprintguard-spool -- \
     "${RPG_ARCHIVE_ROOT}"
+install -d -m 0750 -o retailprintguard-api -g retailprintguard-api -- \
+    "${RPG_EXPORT_ROOT}"
 install -d -m 0750 -o retailprintguard-worker -g retailprintguard-worker -- \
     "${RPG_STATE_ROOT}"
 install -d -m 0700 -o root -g root -- "${RPG_BACKUP_ROOT}"
@@ -256,7 +258,7 @@ if [[ ! -d "${release_path}" ]]; then
     chmod -R a+rX,go-w "${release_path}"
     for entrypoint in alembic retailprintguard-api retailprintguard-correlate \
         retailprintguard-fraud retailprintguard-ingestion retailprintguard-parser \
-        retailprintguard-proxy; do
+        retailprintguard-proxy retailprintguard-export retailprintguard-analysis; do
         entrypoint_path="${release_path}/.venv/bin/${entrypoint}"
         [[ -x "${entrypoint_path}" ]] || rpg_die "installed entrypoint is missing: ${entrypoint}"
         IFS= read -r entrypoint_shebang <"${entrypoint_path}"
@@ -267,7 +269,7 @@ if [[ ! -d "${release_path}" ]]; then
     done
     chmod 0755 "${release_path}"/scripts/*.sh \
         "${release_path}/scripts/validate_site_config.py"
-    for service_identity in retailprintguard-pos-proxy retailprintguard-rch-proxy; do
+    for service_identity in retailprintguard-pos-proxy retailprintguard-rch-proxy retailprintguard-epson-proxy; do
         runuser -u "${service_identity}" -- \
             "${release_path}/.venv/bin/python" -c \
             'import retailprintguard; assert retailprintguard.__version__' || \
@@ -293,6 +295,7 @@ while IFS=$'\t' read -r device_type device_id; do
     case "${device_type}" in
         pos) device_owner=retailprintguard-pos-proxy ;;
         rch) device_owner=retailprintguard-rch-proxy ;;
+        epson) device_owner=retailprintguard-epson-proxy ;;
         *) rpg_die "unsupported validated device type: ${device_type}" ;;
     esac
     [[ "${device_id}" =~ ^[a-z][a-z0-9_-]{1,63}$ ]] || \
@@ -475,7 +478,7 @@ rpg_note "Installing hardened systemd, nginx and logrotate definitions"
 for unit in "${SOURCE_ROOT}"/systemd/*; do
     unit_name="$(basename -- "${unit}")"
     installed_unit="/etc/systemd/system/${unit_name}"
-    if [[ "${control_plane_only}" == yes && "${unit_name}" =~ ^retailprintguard-(pos|rch)-proxy\.service$ ]]; then
+    if [[ "${control_plane_only}" == yes && "${unit_name}" =~ ^retailprintguard-(pos|rch|epson)-proxy\.service$ ]]; then
         [[ -f "${installed_unit}" && ! -L "${installed_unit}" ]] || \
             rpg_die "installed proxy unit is missing or unsafe: ${installed_unit}"
         cmp -s -- "${unit}" "${installed_unit}" || \
@@ -503,11 +506,18 @@ systemctl enable --now retailprintguard-backup.timer
 systemctl enable nginx.service
 if [[ "${control_plane_only}" != yes ]]; then
     systemctl restart retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service
+    if rpg_service_configured retailprintguard-epson-proxy.service; then
+        systemctl restart retailprintguard-epson-proxy.service
+    fi
 fi
 systemctl restart retailprintguard-ingestion.service retailprintguard-parser.service \
     retailprintguard-correlation.service \
-    retailprintguard-fraud.service retailprintguard-api.service
-systemctl reload nginx.service
+    retailprintguard-fraud.service retailprintguard-api.service retailprintguard-export.service retailprintguard-analysis.service
+if systemctl is-active --quiet nginx.service; then
+    systemctl reload nginx.service
+else
+    systemctl start nginx.service
+fi
 
 if [[ "${control_plane_only}" == yes ]]; then
     [[ "$(systemctl show retailprintguard-pos-proxy.service -p MainPID --value)" == \

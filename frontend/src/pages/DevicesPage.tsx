@@ -7,6 +7,8 @@ import { ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
 import type { Device } from '../types'
 import { formatDateTime } from '../format'
+import { deviceLabel } from '../documentPresentation'
+import { additionalDeviceEndpoints } from '../deviceEndpoints'
 
 const bytes = new Intl.NumberFormat('it-IT', { notation: 'compact', style: 'unit', unit: 'byte' })
 
@@ -14,7 +16,7 @@ export function DevicesPage() {
   const query = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), refetchInterval: 10_000 })
   return (
     <>
-      <PageHeader title="Stato dispositivi" subtitle="Connettività, code locali e ultime attività delle tre POS e della RCH." />
+      <PageHeader title="Stato dispositivi" subtitle="Connettività, code locali e ultime attività delle stampanti comande e fiscali configurate." />
       {query.isLoading ? <LoadingState /> : query.error ? <ErrorState error={query.error} /> : (
         <Grid container spacing={2.2}>
           {query.data?.map((device) => (
@@ -26,7 +28,7 @@ export function DevicesPage() {
                       {device.type === 'rch' ? <DnsOutlined /> : <PrintOutlined />}
                     </Box>
                     <Box sx={{ flex: 1 }}>
-                      <Typography variant="h2">{device.name}</Typography>
+                      <Typography variant="h2">{deviceLabel(device.id, query.data)}</Typography>
                       <Typography variant="body2" color="text.secondary">{device.id} · {device.type.toUpperCase()}</Typography>
                       {(device.department || device.role) && <Typography variant="body2" color="text.secondary">
                         {[device.department, device.role].filter(Boolean).join(' · ')}
@@ -36,8 +38,16 @@ export function DevicesPage() {
                   </Box>
                   {device.last_error && <Alert severity="warning" sx={{ mb: 2 }}>{device.last_error}</Alert>}
                   <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
-                    <Box><Typography variant="caption" color="text.secondary">Listener virtuale</Typography><Typography>{device.listen_endpoint}</Typography></Box>
-                    <Box><Typography variant="caption" color="text.secondary">Stampante fisica</Typography><Typography>{device.target_endpoint}</Typography></Box>
+                    <Box>
+                      <Typography variant="caption" color="text.secondary">Listener virtuale</Typography>
+                      <Typography>{device.listen_endpoint}</Typography>
+                      {additionalDeviceEndpoints(device.listen_endpoint, device.additional_ports).map((endpoint) => <Typography key={endpoint} variant="body2" color="text.secondary">Porta aggiuntiva: {endpoint}</Typography>)}
+                    </Box>
+                    <Box>
+                      <Typography variant="caption" color="text.secondary">Stampante fisica</Typography>
+                      <Typography>{device.target_endpoint}</Typography>
+                      {additionalDeviceEndpoints(device.target_endpoint, device.additional_ports).map((endpoint) => <Typography key={endpoint} variant="body2" color="text.secondary">Porta aggiuntiva: {endpoint}</Typography>)}
+                    </Box>
                     <Box><Typography variant="caption" color="text.secondary">Ultima connessione</Typography><Typography>{formatDateTime(device.last_connection_at)}</Typography></Box>
                     <Box><Typography variant="caption" color="text.secondary">Ultima risposta</Typography><Typography>{formatDateTime(device.last_response_at)}</Typography></Box>
                     {device.mac_address && <Box><Typography variant="caption" color="text.secondary">MAC dispositivo</Typography><Typography sx={{ fontFamily: 'monospace' }}>{device.mac_address}</Typography></Box>}

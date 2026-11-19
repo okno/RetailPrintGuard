@@ -9,6 +9,7 @@ source "${SCRIPT_DIR}/lib.sh"
 rpg_require_root
 rpg_acquire_lock
 rpg_stop_control_plane
-systemctl stop retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service
+systemctl stop retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service \
+    retailprintguard-epson-proxy.service
 systemctl stop retailprintguard.target
 rpg_note "RetailPrintGuard application services stopped; MariaDB and nginx were left running."

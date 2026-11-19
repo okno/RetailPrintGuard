@@ -174,11 +174,21 @@ def _read_hmac_key(path: Path | None) -> bytes | None:
 
 
 def _device_map(settings: Settings) -> dict[tuple[str, int], str]:
-    return {
-        (str(device.target_ip), device.target_port): device.id
+    devices = {
+        (str(device.target_ip), port): device.id
         for device in settings.devices
         if device.enabled
+        for port in (device.target_port, *device.additional_ports)
     }
+    devices.update(
+        {
+            (str(target.ip), target.port): device.id
+            for device in settings.devices
+            if device.enabled
+            for target in device.historical_targets
+        }
+    )
+    return devices
 
 
 def build_adapters(args: argparse.Namespace, settings: Settings) -> tuple[SourceAdapter, ...]:

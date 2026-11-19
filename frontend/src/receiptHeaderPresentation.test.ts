@@ -12,7 +12,7 @@ describe('receipt header presentation', () => {
       'Osservata nel blocco iniziale stampato dalla RCH',
     )
     expect(receiptHeaderEvidenceLabel('DEVICE_METADATA_CONFIGURED')).toBe(
-      'Configurata sul dispositivo (non osservata nel flusso)',
+      '',
     )
     expect(receiptHeaderEvidenceLabel('RCH_DGFE_EXPORT')).toBe(
       'Estratta dall\'export della memoria fiscale DGFE',
@@ -38,11 +38,13 @@ describe('receipt header presentation', () => {
     expect(receiptHeaderSummary(configured)).toBe('SYNTHETIC HOSPITALITY S.R.L.')
     expect(receiptHeaderSummary({ ...configured, merchant_name: 'LAB HOTEL' })).toBe('LAB HOTEL')
     expect(configuredReceiptHeaderText(configured)).toContain(
-      'INTESTAZIONE DOCUMENTO (CONFIGURATA)\nSYNTHETIC HOSPITALITY S.R.L.',
+      'SYNTHETIC HOSPITALITY S.R.L.\nVIA DEL LABORATORIO 1',
     )
-    expect(configuredReceiptHeaderText(configured)).toContain(
+    expect(configuredReceiptHeaderText(configured)).not.toContain(
       'Configurata sul dispositivo (non osservata nel flusso)',
     )
+    expect(configuredReceiptHeaderText(configured)).not.toContain('INTESTAZIONE DOCUMENTO (CONFIGURATA)')
+    expect(configured.evidence).toBe('DEVICE_METADATA_CONFIGURED')
     expect(configuredReceiptHeaderText({
       ...configured,
       evidence: 'RCH_PRINTED_HEADER',

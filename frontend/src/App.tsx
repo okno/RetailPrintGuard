@@ -5,7 +5,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { clearSession, session, subscribeSession } from './api/client'
 import { Layout } from './components/Layout'
 import { LoginPage } from './pages/LoginPage'
-import { DOCUMENT_DETAIL_ROUTE, TRANSACTION_DETAIL_ROUTE } from './routes'
+import { ANALYSIS_DETAIL_ROUTE, DOCUMENT_DETAIL_ROUTE, EXPORT_DETAIL_ROUTE, TRANSACTION_DETAIL_ROUTE } from './routes'
 import type { User } from './types'
 
 const AlertsPage = lazy(() => import('./pages/AlertsPage').then((module) => ({ default: module.AlertsPage })))
@@ -14,6 +14,11 @@ const DevicesPage = lazy(() => import('./pages/DevicesPage').then((module) => ({
 const DocumentDetailPage = lazy(() => import('./pages/DocumentDetailPage').then((module) => ({ default: module.DocumentDetailPage })))
 const DocumentsPage = lazy(() => import('./pages/DocumentsPage').then((module) => ({ default: module.DocumentsPage })))
 const ImportsPage = lazy(() => import('./pages/ImportsPage').then((module) => ({ default: module.ImportsPage })))
+const ExportsPage = lazy(() => import('./pages/ExportsPage').then((module) => ({ default: module.ExportsPage })))
+const ExportArchivePage = lazy(() => import('./pages/ExportArchivePage').then((module) => ({ default: module.ExportArchivePage })))
+const ReanalysisPage = lazy(() => import('./pages/ReanalysisPage').then((module) => ({ default: module.ReanalysisPage })))
+const AnalysisDetailPage = lazy(() => import('./pages/ReanalysisPage').then((module) => ({ default: module.AnalysisDetailPage })))
+const DiscountsPage = lazy(() => import('./pages/DiscountsPage').then((module) => ({ default: module.DiscountsPage })))
 const IncompleteJobsPage = lazy(() => import('./pages/IncompleteJobsPage').then((module) => ({ default: module.IncompleteJobsPage })))
 const RulesPage = lazy(() => import('./pages/RulesPage').then((module) => ({ default: module.RulesPage })))
 const SearchPage = lazy(() => import('./pages/SearchPage').then((module) => ({ default: module.SearchPage })))
@@ -57,6 +62,11 @@ export default function App() {
         <Route path="/diagnostica" element={<DiagnosticsPage />} />
         <Route path="/incompleti" element={<IncompleteJobsPage />} />
         <Route path="/importazioni" element={<ImportsPage />} />
+        <Route path="/esportazioni" element={<ExportsPage />} />
+        <Route path={EXPORT_DETAIL_ROUTE} element={<ExportArchivePage />} />
+        <Route path="/rianalisi" element={<ReanalysisPage />} />
+        <Route path={ANALYSIS_DETAIL_ROUTE} element={<AnalysisDetailPage />} />
+        <Route path="/sconti" element={<DiscountsPage />} />
         <Route path="/login" element={<Navigate to="/" replace />} />
         <Route path="*" element={<Alert severity="warning" action={<Button href="/">Dashboard</Button>}>Pagina non trovata.</Alert>} />
       </Routes>

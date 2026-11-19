@@ -31,6 +31,7 @@ if command -v systemd-analyze >/dev/null 2>&1; then
         -e 's#^SupplementaryGroups=.*#SupplementaryGroups=#' \
         -e 's#^EnvironmentFile=.*#EnvironmentFile=-/tmp/nonexistent.env#' \
         -e 's#^ExecStartPre=.*#ExecStartPre=/bin/true#' \
+        -e 's#^ExecCondition=.*#ExecCondition=/bin/true#' \
         -e 's#^ExecStart=.*#ExecStart=/bin/true#' \
         -e 's#^ReadWritePaths=.*#ReadWritePaths=-/tmp#' \
         -e 's#^ReadOnlyPaths=.*#ReadOnlyPaths=-/tmp#' \

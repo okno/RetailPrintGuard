@@ -35,7 +35,8 @@ import { PeriodPicker } from '../components/PeriodPicker'
 import { EmptyState, ErrorState, LoadingState } from '../components/State'
 import { StatusChip } from '../components/StatusChip'
 import { formatDateTime } from '../format'
-import type { JobRecord, Page } from '../types'
+import { deviceLabel } from '../documentPresentation'
+import type { Device, JobRecord, Page } from '../types'
 
 type ReviewAction = 'VERIFY_USABLE' | 'EXCLUDE_FROM_ANALYSIS' | 'REOPEN_REVIEW'
 
@@ -76,6 +77,7 @@ export function IncompleteJobsPage() {
     queryKey: scopedQueryKey('jobs', 'incomplete', apiParams.toString()),
     queryFn: () => api<Page<JobRecord>>(`/jobs?${apiParams.toString()}`),
   })
+  const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), staleTime: 30_000 })
   const review = useMutation({
     mutationFn: (body: { action: ReviewAction; reason: string; confirmation_password: string }) =>
       api<JobRecord>(`/jobs/${selected?.id}/review`, {
@@ -167,7 +169,7 @@ export function IncompleteJobsPage() {
           <TableCell>Acquisito</TableCell><TableCell>Dispositivo / job</TableCell><TableCell>Capture</TableCell><TableCell>Parser</TableCell><TableCell>Byte</TableCell><TableCell>Revisione</TableCell><TableCell align="right">Azioni</TableCell>
         </TableRow></TableHead><TableBody>{query.data.items.map((job) => <TableRow key={job.id} hover>
           <TableCell>{formatDateTime(job.captured_at)}</TableCell>
-          <TableCell><Typography fontWeight={700}>{job.device_id}</Typography><Typography variant="caption" sx={{ fontFamily: 'monospace' }}>{job.external_job_id}</Typography></TableCell>
+          <TableCell><Typography fontWeight={700}>{deviceLabel(job.device_id, devices.data)}</Typography><Typography variant="caption" display="block">{job.device_id}</Typography><Typography variant="caption" sx={{ fontFamily: 'monospace' }}>{job.external_job_id}</Typography></TableCell>
           <TableCell><StatusChip value={job.status} /></TableCell>
           <TableCell><StatusChip value={job.parser_status ?? 'NON_IMPORTATO'} /></TableCell>
           <TableCell>{new Intl.NumberFormat('it-IT').format(job.request_bytes + job.response_bytes)}</TableCell>
@@ -194,7 +196,7 @@ export function IncompleteJobsPage() {
       <DialogTitle>Revisione job incompleto</DialogTitle>
       <DialogContent dividers>
         {selected && <>
-          <Typography fontWeight={700}>{selected.device_id} · {selected.external_job_id}</Typography>
+          <Typography fontWeight={700}>{deviceLabel(selected.device_id, devices.data)} ({selected.device_id}) · {selected.external_job_id}</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>{formatDateTime(selected.captured_at)} · SHA-256 {selected.manifest_sha256}</Typography>
           {selected.warnings.length > 0 && <Alert severity="warning" sx={{ mb: 2 }}>{selected.warnings.join(' · ')}</Alert>}
           {selected.review_reason && <Alert severity="info" sx={{ mb: 2 }}>Ultima motivazione: {selected.review_reason}</Alert>}

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from retailprintguard.common.config import Settings
+from retailprintguard.common.config import DeviceType, ParserKind, Settings
 from retailprintguard.proxy.legacy_config import (
     LegacyConfigError,
     compile_legacy_configs,
@@ -72,6 +72,16 @@ def test_compiler_emits_positional_pos_and_single_rch_without_secrets(tmp_path: 
     assert "DATABASE" not in combined
     assert "password" not in combined.lower()
     assert "token" not in combined.lower()
+
+
+def test_legacy_compiler_never_silently_omits_epson_route(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    devices = list(settings.devices)
+    devices[-1] = devices[-1].model_copy(
+        update={"type": DeviceType.EPSON, "parser": ParserKind.OPAQUE_RAW}
+    )
+    with pytest.raises(LegacyConfigError, match="require the native"):
+        compile_legacy_configs(settings.model_copy(update={"devices": tuple(devices)}))
 
 
 def test_compiler_writes_atomically_and_refuses_implicit_overwrite(tmp_path: Path) -> None:

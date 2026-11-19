@@ -16,7 +16,8 @@ esac
 rpg_require_root
 rpg_acquire_lock
 if [[ "${force}" != yes ]]; then
-    for service in retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service; do
+    for service in retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service \
+        retailprintguard-epson-proxy.service; do
         pid="$(systemctl show --property MainPID --value "${service}" 2>/dev/null || true)"
         if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && \
            ss -Htnp state established 2>/dev/null | grep -Fq "pid=${pid},"; then
@@ -26,10 +27,14 @@ if [[ "${force}" != yes ]]; then
 fi
 rpg_stop_control_plane
 systemctl restart retailprintguard-pos-proxy.service retailprintguard-rch-proxy.service
+if rpg_service_configured retailprintguard-epson-proxy.service; then
+    systemctl restart retailprintguard-epson-proxy.service
+fi
 systemctl start retailprintguard-ingestion.service retailprintguard-parser.service \
     retailprintguard-correlation.service retailprintguard-fraud.service \
-    retailprintguard-api.service
+    retailprintguard-api.service retailprintguard-export.service retailprintguard-analysis.service
 for service in "${RPG_SERVICES[@]}"; do
+    rpg_service_configured "${service}" || continue
     systemctl is-active --quiet "${service}" || rpg_die "service failed after restart: ${service}"
 done
 rpg_note "RetailPrintGuard restarted successfully."

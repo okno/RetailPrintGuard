@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from retailprintguard.analysis import discounts as discount_analysis
 from retailprintguard.common.domain import (
     DocumentLine,
     DocumentType,
@@ -22,7 +23,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.6.0"
+PARSER_VERSION = "1.7.1"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -107,6 +108,10 @@ _HEADER_BOUNDARY_RE = re.compile(
     r"PRECONTO|COMANDA|DESCRIZIONE|TOTALE?|TOT\b|ORDINE\s*:|TAVOLO\s*:)",
     re.IGNORECASE,
 )
+_HEADER_RECIPIENT_BOUNDARY_RE = re.compile(
+    r"^\s*(?:DESTINATARIO|CLIENTE|DATI\s+(?:DEL\s+)?CLIENTE)\s*(?::|$)",
+    re.IGNORECASE,
+)
 _HEADER_LEGAL_NAME_RE = re.compile(
     r"\b(?:S\.?\s*R\.?\s*L\.?|S\.?\s*P\.?\s*A\.?|S\.?\s*A\.?\s*S\.?|"
     r"S\.?\s*N\.?\s*C\.?|SOC(?:IETA|IETÀ)|COOPERATIVA)(?!\w)",
@@ -131,6 +136,13 @@ _HEADER_VAT_RE = re.compile(
     r"(?P<value>[A-Z0-9]{8,32})\b",
     re.IGNORECASE,
 )
+
+
+def parser_runtime_fingerprint() -> str:
+    """Include the shared quantity interpretation in append-only build identity."""
+
+    implementation = Path(discount_analysis.__file__).read_bytes()
+    return "quantity-context-sha256:" + hashlib.sha256(implementation).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,6 +614,11 @@ def _printed_receipt_header(draft: _Draft) -> _PrintedReceiptHeader:
             break
         if (
             _HEADER_BOUNDARY_RE.match(value)
+            # A recipient can have the same legal/address/VAT layout as the
+            # merchant. Stop before its explicit label so it cannot supply
+            # either merchant fields or corroboration for preceding text.
+            # Match labels only, not names such as "Cliente S.R.L.".
+            or _HEADER_RECIPIENT_BOUNDARY_RE.match(value)
             or _PRINTED_MONEY_RE.search(value)
             or _PRINTED_TIMESTAMP_RE.search(value)
             or _DOCUMENT_CODE_RE.search(value)
@@ -823,6 +840,45 @@ def _draft_document(
         for line in draft.lines
         if line.source is None or line.source.frame_id not in header_frame_ids
     )
+    quantity_observations: list[dict[str, object]] = []
+    if draft.kind == "management":
+        projected_lines = list(economic_lines)
+        for context in discount_analysis.confirmed_quantity_contexts(economic_lines):
+            detail = economic_lines[context.context_index]
+            product = economic_lines[context.product_index]
+            # Keep both printed rows and RAW spans. The quantity/unit row
+            # explains the following product; it is not another sold item.
+            projected_lines[context.context_index] = detail.model_copy(
+                update={
+                    "quantity": None,
+                    "unit_price": None,
+                    "line_total": None,
+                    "state": "QUANTITY_CONTEXT",
+                }
+            )
+            projected_lines[context.product_index] = product.model_copy(
+                update={
+                    "quantity": context.quantity,
+                    "unit_price": context.unit_price,
+                }
+            )
+            quantity_observations.append(
+                {
+                    "evidence": "RCH_QUANTITY_UNIT_CONFIRMED_BY_NEXT_LINE_TOTAL",
+                    "context_line_sequence": detail.sequence,
+                    "product_line_sequence": product.sequence,
+                    "quantity": str(context.quantity),
+                    "unit_price": str(context.unit_price),
+                    "line_total": str(context.line_total),
+                    "context_source": detail.source.model_dump(mode="json")
+                    if detail.source
+                    else None,
+                    "product_source": product.source.model_dump(mode="json")
+                    if product.source
+                    else None,
+                }
+            )
+        economic_lines = tuple(projected_lines)
     printed_identity = _printed_rch_identity(
         draft,
         captured_at=captured_at,
@@ -1007,6 +1063,7 @@ def _draft_document(
                 else "NOT_OBSERVED_IN_CAPTURE"
             ),
             "semantic_evidence": "INFERRED_FROM_CAPTURE",
+            "quantity_context_observations": quantity_observations,
             "economic_close": (
                 draft.kind == "management"
                 and "CORRISPETTIVO NON RISCOSSO" in text.upper()

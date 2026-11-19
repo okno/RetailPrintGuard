@@ -7,7 +7,8 @@ from uuid import uuid4
 
 from retailprintguard.common.domain import DocumentType
 from retailprintguard.parser.rch import PARSER_VERSION, parse_rch
-from retailprintguard.render.pdf import _generic_lines
+from retailprintguard.render.pdf import _layout_preview
+from retailprintguard.render.text import receipt_preview_text
 
 CAPTURED_AT = datetime(2042, 8, 20, 20, 18, 30, tzinfo=UTC)
 MANIFEST_HASH = hashlib.sha256(b"synthetic-taxonomy-manifest").hexdigest()
@@ -61,7 +62,7 @@ def test_shift_end_report_signature_wins_over_aggregate_invoice_row() -> None:
     assert document.type is DocumentType.SHIFT_END_REPORT
     assert document.subtype == "RCH_REPORT_FINE_TURNO_LITERAL"
     assert document.parse_confidence == 98
-    assert document.parser_version == PARSER_VERSION == "1.6.0"
+    assert document.parser_version == PARSER_VERSION == "1.7.1"
 
 
 def test_invoice_requires_a_strong_singular_document_signature() -> None:
@@ -112,8 +113,8 @@ def test_commercial_wire_is_not_reclassified_by_printed_invoice_wording() -> Non
     assert document.type is DocumentType.COMMERCIAL_DOCUMENT
 
 
-def test_pdf_renderer_uses_operator_labels_for_non_sale_document_types() -> None:
-    for document_type, expected_label in (
+def test_pdf_renderer_keeps_printed_non_sale_title_without_extra_taxonomy_labels() -> None:
+    for document_type, printed_label in (
         ("SHIFT_END_REPORT", "REPORT DI FINE TURNO"),
         ("INVOICE", "FATTURA"),
     ):
@@ -142,9 +143,9 @@ def test_pdf_renderer_uses_operator_labels_for_non_sale_document_types() -> None
             payments=(),
             warnings=(),
             sha256=hashlib.sha256(document_type.encode()).hexdigest(),
+            receipt_text=printed_label + "\nTesto sintetico",
         )
 
-        lines = _generic_lines(document, "testo sintetico")
+        lines = _layout_preview(receipt_preview_text(document)).lines
 
-        assert lines[0].text == expected_label
-        assert lines[1].text == expected_label
+        assert lines == (printed_label, "Testo sintetico")

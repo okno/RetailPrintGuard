@@ -12,15 +12,19 @@ from collections.abc import Sequence
 from pathlib import Path
 from threading import Event
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from retailprintguard import __version__
-from retailprintguard.common.config import DeviceType, load_settings
+from retailprintguard.common.config import DEVICE_ID_RE, DeviceType, load_settings
 from retailprintguard.common.logging import StructuredLoggingRuntime, configure_structured_logging
+from retailprintguard.common.pipeline_lock import run_pipeline_once, safe_worker_error
+from retailprintguard.db.session import create_db_engine, session_factory
 from retailprintguard.parser.beeper import (
     PosBeeperConfiguration,
     PosBeeperDispatcher,
     PosBeeperTarget,
 )
-from retailprintguard.parser.repository import ParserRepositoryError, create_parser_repository
+from retailprintguard.parser.repository import ParserRepositoryError, SqlAlchemyParserRepository
 from retailprintguard.parser.spool_beeper import PosSpoolBeeperWatcher
 from retailprintguard.parser.worker import ParserRunReport, ParserWorker
 
@@ -45,6 +49,10 @@ def _parser() -> argparse.ArgumentParser:
         "--reparse-all",
         action="store_true",
         help="append outputs for the current parser build to historical jobs",
+    )
+    parser.add_argument(
+        "--device-id",
+        help="with --once --reparse-all, limit the append-only reparse to one configured device",
     )
     parser.add_argument("--limit", type=_limit, default=100)
     parser.add_argument("--interval-seconds", type=float, default=0.25)
@@ -91,14 +99,23 @@ def cli(argv: Sequence[str] | None = None) -> int:
     runtime: StructuredLoggingRuntime | None = None
     beeper: PosBeeperDispatcher | None = None
     spool_beeper: PosSpoolBeeperWatcher | None = None
+    engine = None
     if args.json_logs:
         runtime = configure_structured_logging("parser")
     try:
         if args.reparse_all and not args.once:
             raise ValueError("--reparse-all requires --once")
+        if args.device_id is not None and not (args.reparse_all and args.once):
+            raise ValueError("--device-id requires --once --reparse-all")
+        if args.device_id is not None and not DEVICE_ID_RE.fullmatch(args.device_id):
+            raise ValueError("--device-id must be a valid device id")
         settings = load_settings(args.config)
+        if args.device_id is not None and args.device_id not in {
+            device.id for device in settings.devices
+        }:
+            raise ValueError("--device-id is not present in the site configuration")
         beeper_configuration = PosBeeperConfiguration.from_environment()
-        if beeper_configuration.enabled:
+        if beeper_configuration.enabled and not args.reparse_all:
             pos_targets = tuple(
                 PosBeeperTarget(
                     device_id=device.id,
@@ -125,13 +142,25 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 poll_seconds=beeper_configuration.spool_poll_seconds,
             )
             spool_beeper.start()
+        engine = create_db_engine(settings.database_url().get_secret_value())
         worker = ParserWorker(
-            create_parser_repository(settings),
+            SqlAlchemyParserRepository(session_factory(engine)),
             timezone_name=settings.timezone,
             beeper=beeper,
         )
         if args.once:
-            report = worker.run_once(limit=args.limit, reparse=args.reparse_all)
+            run_options: dict[str, object] = {
+                "limit": args.limit, "reparse": args.reparse_all,
+            }
+            if args.device_id is not None:
+                run_options["device_id"] = args.device_id
+            report = run_pipeline_once(
+                engine,
+                lambda: worker.run_once(**run_options),
+                required=True,
+            )
+            if report is None:
+                raise RuntimeError("Parser cycle did not execute")
             if beeper is not None and not beeper.drain(timeout=30):
                 LOGGER.warning(
                     "POS beeper drain timed out; parser output remains valid",
@@ -146,35 +175,30 @@ def cli(argv: Sequence[str] | None = None) -> int:
 
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGTERM, request_stop)
-        if runtime is None:
-            worker.run_forever(
-                stop,
-                interval_seconds=args.interval_seconds,
-                limit=args.limit,
-            )
-        else:
-            while not stop.is_set():
-                try:
-                    _log_report(worker.run_once(limit=args.limit))
-                except ParserRepositoryError as exc:
-                    LOGGER.error(
-                        "parser iteration failed",
-                        extra={
-                            "event": "parser_iteration_failed",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        },
-                    )
-                stop.wait(args.interval_seconds)
+        while not stop.is_set():
+            try:
+                report = run_pipeline_once(engine, lambda: worker.run_once(limit=args.limit))
+                if report is not None and runtime is not None:
+                    _log_report(report)
+            except (ParserRepositoryError, RuntimeError, SQLAlchemyError) as exc:
+                LOGGER.error(
+                    "parser iteration failed",
+                    extra={
+                        "event": "parser_iteration_failed",
+                        "error": safe_worker_error(exc),
+                    },
+                )
+            stop.wait(args.interval_seconds)
         return 0
-    except (OSError, ParserRepositoryError, RuntimeError, ValueError) as exc:
+    except (OSError, ParserRepositoryError, RuntimeError, ValueError, SQLAlchemyError) as exc:
         if runtime is None:
-            print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"ERROR: {safe_worker_error(exc)}", file=sys.stderr)
         else:
             LOGGER.error(
                 "parser service failed",
                 extra={
                     "event": "parser_service_failed",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": safe_worker_error(exc),
                 },
             )
         return 2
@@ -183,6 +207,8 @@ def cli(argv: Sequence[str] | None = None) -> int:
             spool_beeper.close()
         if beeper is not None:
             beeper.close()
+        if engine is not None:
+            engine.dispose()
         if runtime is not None:
             runtime.stop()
 

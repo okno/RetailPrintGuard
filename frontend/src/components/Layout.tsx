@@ -6,10 +6,13 @@ import {
   DescriptionOutlined,
   FactCheckOutlined,
   FileUploadOutlined,
+  FileDownloadOutlined,
   LogoutOutlined,
   LanOutlined,
   MenuOutlined,
   MonitorHeartOutlined,
+  ManageSearchOutlined,
+  PercentOutlined,
   SearchOutlined,
   SettingsSuggestOutlined,
   ShieldOutlined,
@@ -34,6 +37,8 @@ import {
 import { useState, type ReactNode } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import type { Role, User } from '../types'
+import { EXPORT_ROLES } from '../exports'
+import { ANALYSIS_ROLES } from '../analyses'
 import { ThemeSwitcher } from './ThemeSwitcher'
 
 const drawerWidth = 252
@@ -42,6 +47,9 @@ const navigation: Array<{ label: string; path: string; icon: ReactNode; roles?: 
   { label: 'Dashboard', path: '/', icon: <DashboardOutlined /> },
   { label: 'Transazioni', path: '/transazioni', icon: <AccountTreeOutlined /> },
   { label: 'Documenti', path: '/documenti', icon: <DescriptionOutlined /> },
+  { label: 'Esportazioni', path: '/esportazioni', icon: <FileDownloadOutlined />, roles: EXPORT_ROLES },
+  { label: 'Rianalisi', path: '/rianalisi', icon: <ManageSearchOutlined />, roles: ANALYSIS_ROLES },
+  { label: 'Sconti', path: '/sconti', icon: <PercentOutlined /> },
   { label: 'Alert antifrode', path: '/alert', icon: <ShieldOutlined /> },
   { label: 'Regole', path: '/regole', icon: <SettingsSuggestOutlined /> },
   { label: 'Ricerca', path: '/ricerca', icon: <SearchOutlined /> },

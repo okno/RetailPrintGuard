@@ -20,11 +20,14 @@ SCRIPTS = ROOT / "scripts"
 SERVICE_NAMES = {
     "retailprintguard-pos-proxy.service",
     "retailprintguard-rch-proxy.service",
+    "retailprintguard-epson-proxy.service",
     "retailprintguard-ingestion.service",
     "retailprintguard-parser.service",
     "retailprintguard-correlation.service",
     "retailprintguard-fraud.service",
     "retailprintguard-api.service",
+    "retailprintguard-export.service",
+    "retailprintguard-analysis.service",
 }
 BACKUP_SERVICE = "retailprintguard-backup.service"
 
@@ -52,7 +55,7 @@ def test_expected_services_are_separate_and_hardened() -> None:
     assert "ExecStart=/opt/retailprintguard/current/scripts/backup.sh" in backup
     assert "NoNewPrivileges=yes" in backup
     assert "ProtectSystem=strict" in backup
-    assert "SupplementaryGroups=retailprintguard-spool" in backup
+    assert "SupplementaryGroups=retailprintguard-spool retailprintguard-api\n" in backup
     assert "RestrictSUIDSGID=yes" in backup
     assert "CapabilityBoundingSet=\n" in backup
     timer = (SYSTEMD / "retailprintguard-backup.timer").read_text(encoding="utf-8")
@@ -61,13 +64,17 @@ def test_expected_services_are_separate_and_hardened() -> None:
 
     pos = (SYSTEMD / "retailprintguard-pos-proxy.service").read_text(encoding="utf-8")
     rch = (SYSTEMD / "retailprintguard-rch-proxy.service").read_text(encoding="utf-8")
+    epson = (SYSTEMD / "retailprintguard-epson-proxy.service").read_text(encoding="utf-8")
     assert "--device-type pos" in pos
     assert "--device-type rch" in rch
-    for proxy in (pos, rch):
+    assert "--device-type epson" in epson
+    assert "ExecCondition=" in epson and "--has-enabled-type epson" in epson
+    for proxy in (pos, rch, epson):
         assert "EnvironmentFile=/etc/retailprintguard/database.env" not in proxy
         assert "UnsetEnvironment=RPG_DATABASE_URL" in proxy
     assert "User=retailprintguard-pos-proxy" in pos
     assert "User=retailprintguard-rch-proxy" in rch
+    assert "User=retailprintguard-epson-proxy" in epson
     ingestion = (SYSTEMD / "retailprintguard-ingestion.service").read_text(encoding="utf-8")
     assert "ReadOnlyPaths=/var/lib/retailprintguard/spool" in ingestion
     assert "ReadWritePaths=/var/lib/retailprintguard/spool" not in ingestion
@@ -81,6 +88,7 @@ def test_expected_services_are_separate_and_hardened() -> None:
     for control in SERVICE_NAMES - {
         "retailprintguard-pos-proxy.service",
         "retailprintguard-rch-proxy.service",
+        "retailprintguard-epson-proxy.service",
         "retailprintguard-api.service",
     }:
         content = (SYSTEMD / control).read_text(encoding="utf-8")
@@ -266,12 +274,17 @@ def test_control_plane_update_never_restarts_or_changes_proxy_code() -> None:
     assert proxy_restart in install
     assert 'if [[ "${control_plane_only}" != yes ]]' in install
     assert install.index('if [[ "${control_plane_only}" != yes ]]') < install.index(proxy_restart)
+    assert (
+        'if rpg_service_configured retailprintguard-epson-proxy.service; then\n'
+        '        systemctl restart retailprintguard-epson-proxy.service\n'
+        '    fi\nfi'
+    ) in install
     assert install.index("rpg_assert_data_plane_unchanged") < install.index(
         "Applying versioned database migrations"
     )
     assert "Preserved installed proxy unit without rewriting it" in install
     assert "installed proxy unit differs during control-plane update" in install
-    assert '"${unit_name}" =~ ^retailprintguard-(pos|rch)-proxy\\.service$' in install
+    assert '"${unit_name}" =~ ^retailprintguard-(pos|rch|epson)-proxy\\.service$' in install
 
 
 def test_git_control_plane_updater_is_tagged_locked_and_fail_closed() -> None:
@@ -327,6 +340,7 @@ def test_control_plane_gate_rejects_a_changed_proxy_entrypoint(tmp_path: Path) -
         "requirements/production.lock",
         "systemd/retailprintguard-pos-proxy.service",
         "systemd/retailprintguard-rch-proxy.service",
+        "systemd/retailprintguard-epson-proxy.service",
         "pyproject.toml",
     )
     for root in (current, candidate):
@@ -377,8 +391,11 @@ def test_backup_and_restore_fail_closed_for_evidence() -> None:
     restore = (SCRIPTS / "restore.sh").read_text(encoding="utf-8")
     assert 'find "${RPG_SPOOL_ROOT}" -type f -name .ready -print0 >"${marker_list}"' in backup
     assert "cannot enumerate ready evidence for backup" in backup
-    assert backup.count("--no-owner --no-group") == 2
+    assert backup.count("--no-owner --no-group") == 3
     assert backup.count("--chmod=D0750,F0640") == 2
+    assert backup.count("--chmod=D0750,F0440") == 1
+    assert '"${RPG_EXPORT_ROOT}/" "${stage}/derived/exports/"' in backup
+    assert "--exclude='*.partial' --exclude='.worker.lock'" in backup
     assert "empty capability bounding" in backup
     assert 'cmp -s -- "${candidate}" "${existing}"' in restore
     assert "restore collision differs from backup" in restore

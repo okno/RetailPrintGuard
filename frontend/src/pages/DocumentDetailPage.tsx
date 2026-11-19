@@ -19,14 +19,18 @@ import {
 import {
   confidencePercent,
   deviceLabel,
+  documentLinePrice,
+  documentPreviewTabLabel,
   documentTypeLabel,
+  isEpsonDailyReport,
 } from '../documentPresentation'
 import {
-  configuredReceiptHeaderText,
   RECEIPT_HEADER_NOT_AVAILABLE,
   receiptHeaderEvidenceLabel,
 } from '../receiptHeaderPresentation'
-import type { DocumentRecord } from '../types'
+import { pdfDownloadFilename, receiptPreviewText } from '../receiptPresentation'
+import { canDownloadDocumentPdf, documentReasonLabel } from '../documentEligibility'
+import type { Device, DocumentRecord } from '../types'
 
 const money = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
 
@@ -61,17 +65,17 @@ function ReceiptHeaderDetails({ document }: { document: DocumentRecord }) {
         {header.phone && <ProvenanceValue label="Telefono" value={header.phone} />}
         {header.tax_code && <ProvenanceValue label="Codice fiscale" value={header.tax_code} />}
         {header.vat_number && <ProvenanceValue label="Partita IVA" value={header.vat_number} />}
-        <ProvenanceValue label="Provenienza intestazione" value={receiptHeaderEvidenceLabel(header.evidence)} />
+        {receiptHeaderEvidenceLabel(header.evidence) && <ProvenanceValue label="Provenienza intestazione" value={receiptHeaderEvidenceLabel(header.evidence)} />}
       </>}
   </Box>
 }
 
 function LinePrice({ line }: { line: DocumentRecord['lines'][number] }) {
-  const value = line.unit_price ?? line.derived_unit_price
-  if (value === undefined && line.derived_price_source === 'CONFLICTING_SOURCES') {
+  const price = documentLinePrice(line)
+  if (!price && line.derived_price_source === 'CONFLICTING_SOURCES') {
     const candidates = [...new Set(
       (line.price_attributions ?? [])
-        .filter((item) => item.observed_unit_price !== undefined)
+        .filter((item) => item.observed_unit_price != null)
         .map((item) => `${item.source_kind}: ${money.format(Number(item.observed_unit_price))}`),
     )]
     return <Chip
@@ -82,16 +86,15 @@ function LinePrice({ line }: { line: DocumentRecord['lines'][number] }) {
       title={candidates.join(' · ') || 'Le fonti correlate riportano prezzi differenti.'}
     />
   }
-  if (value === undefined) return <>—</>
-  const derived = line.unit_price === undefined
+  if (!price) return <>—</>
   const confidences = (line.price_attributions ?? [])
     .filter((item) => item.source_kind === line.derived_price_source && item.observed_unit_price === line.derived_unit_price)
     .map((item) => Number(item.confidence))
     .filter(Number.isFinite)
   const confidence = confidencePercent(confidences.length ? Math.max(...confidences) : undefined)
   return <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: .5 }}>
-    <span>{money.format(Number(value))}</span>
-    {derived && <Chip
+    <span>{money.format(Number(price.value))}</span>
+    {price.derived && <Chip
       size="small"
       variant="outlined"
       color="info"
@@ -120,15 +123,15 @@ export function DocumentDetailPage() {
     queryFn: () => api<DocumentRecord>(`/documents/${encodeURIComponent(documentId ?? '')}`),
     enabled: Boolean(documentId),
   })
+  const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), staleTime: 30_000 })
   if (!documentId) {
     return <ErrorState error={new Error('Identificativo documento mancante o URL non valida.')} />
   }
   if (query.isLoading) return <LoadingState />
   if (query.error || !query.data) return <ErrorState error={query.error} />
   const doc = query.data
-  const documentBody = doc.receipt_text || doc.normalized_text || 'Nessun testo documento disponibile.'
-  const configuredHeader = configuredReceiptHeaderText(doc.receipt_header)
-  const receiptPreview = configuredHeader ? `${configuredHeader}\n\n${documentBody}` : documentBody
+  const pdfAvailable = canDownloadDocumentPdf(doc)
+  const receiptPreview = pdfAvailable ? receiptPreviewText(doc) : doc.receipt_text || doc.normalized_text || 'Nessun testo acquisito disponibile.'
   const roles = session().user?.roles ?? []
   const canDownloadEvidence = roles.includes('ADMIN') || roles.includes('AUDITOR')
   const isFiscalMemoryExport = doc.subtype.startsWith('RCH_DGFE_')
@@ -162,7 +165,7 @@ export function DocumentDetailPage() {
       <Button variant="outlined" startIcon={<CodeOutlined />} onClick={loadRaw}>{isFiscalMemoryExport ? 'Anteprima XML' : 'Anteprima RAW'}</Button>
       <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/txt`, `${doc.id}.txt`))}>TXT</Button>
       <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/json`, `${doc.id}.json`))}>JSON</Button>
-      <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/pdf`, `${doc.id}.pdf`))}>PDF</Button>
+      <Button disabled={!pdfAvailable} aria-describedby={!pdfAvailable ? 'document-pdf-reason' : undefined} startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/pdf`, pdfDownloadFilename(doc)))}>{doc.pdf_category === 'partial' ? 'PDF parziale' : 'PDF'}</Button>
       {isFiscalMemoryExport
         ? <Button startIcon={<DownloadOutlined />} onClick={() => runArtifact(() => downloadApi(`/documents/${doc.id}/raw?direction=source`, `${doc.id}-memoria-fiscale.xml`))}>XML memoria fiscale</Button>
         : <>
@@ -173,14 +176,17 @@ export function DocumentDetailPage() {
   </Box>
 
   return <>
-    <PageHeader title={documentTypeLabel(doc.type)} subtitle={`${doc.subtype.replaceAll('_', ' ')} · ${deviceLabel(doc.device_id)} (${doc.device_id}) · parser ${doc.parser_name} ${doc.parser_version}`} actions={actions} />
+    <PageHeader title={documentTypeLabel(doc.type)} subtitle={`${doc.subtype.replaceAll('_', ' ')} · ${deviceLabel(doc.device_id, devices.data)} (${doc.device_id}) · parser ${doc.parser_name} ${doc.parser_version}`} actions={actions} />
     {artifactError && <Box sx={{ mb: 2 }}><ErrorState error={artifactError} /></Box>}
+    {doc.pdf_category !== 'complete' && <Alert id="document-pdf-reason" severity={doc.pdf_category === 'partial' ? 'warning' : 'info'} sx={{ mb: 2 }}>
+      {documentReasonLabel(doc.pdf_category ? doc.pdf_reason_code : undefined)} {!pdfAvailable && 'Il download PDF è disabilitato. Testo, JSON e RAW restano accessibili secondo il ruolo.'}
+    </Alert>}
     {!canDownloadEvidence && <Alert severity="info" sx={{ mb: 2 }}>Il download delle evidenze RAW e derivate richiede il ruolo AUDITOR o ADMIN.</Alert>}
     <Grid container spacing={2.5}>
       <Grid size={{ xs: 12, lg: 8 }}>
         <Card>
           <Tabs value={tab} onChange={(_, value) => setTab(value)} aria-label="Viste documento">
-            <Tab label="Scontrino" />
+            <Tab label={pdfAvailable ? documentPreviewTabLabel(doc) : 'Testo acquisito'} />
             <Tab label="Righe strutturate" />
             <Tab label="Testo parser" />
             <Tab label={isFiscalMemoryExport ? 'XML tecnico' : 'RAW tecnico'} disabled={!canDownloadEvidence} />
@@ -225,7 +231,7 @@ export function DocumentDetailPage() {
             provenance={doc.rch_serial_number ? rchSerialEvidenceLabel(doc.rch_serial_number_evidence) : NOT_OBSERVED_IN_FLOW}
           />}
           {[
-            ['Progressivo documento', doc.external_document_code ?? doc.external_code ?? (doc.resolved_external_document_code ? `${doc.resolved_external_document_code} (da riferimento gestionale correlato)` : undefined) ?? (doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE' ? 'Non osservato nel flusso catturato' : undefined)],
+            [isEpsonDailyReport(doc) ? 'Progressivo Z' : 'Progressivo documento', doc.external_document_code ?? doc.external_code ?? (doc.resolved_external_document_code ? `${doc.resolved_external_document_code} (da riferimento gestionale correlato)` : undefined) ?? (doc.progressive_observation_status === 'NOT_OBSERVED_IN_CAPTURE' ? 'Non osservato nel flusso catturato' : undefined)],
             ['Suffisso progressivo RCH', doc.external_document_code_suffix],
             ['Osservabilità progressivo', progressiveObservationLabel(doc.progressive_observation_status)],
             ['Provenienza risoluzione', doc.resolved_external_document_code_provenance === 'CORRELATED_MANAGEMENT_REFERENCE' ? 'Riferimento commerciale in documento gestionale correlato' : undefined],

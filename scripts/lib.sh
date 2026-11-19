@@ -17,6 +17,7 @@ readonly RPG_CURRENT_LINK="${RPG_APP_ROOT}/current"
 readonly RPG_DATA_ROOT="/var/lib/retailprintguard"
 readonly RPG_SPOOL_ROOT="${RPG_DATA_ROOT}/spool"
 readonly RPG_ARCHIVE_ROOT="${RPG_DATA_ROOT}/archive"
+readonly RPG_EXPORT_ROOT="${RPG_DATA_ROOT}/exports"
 readonly RPG_STATE_ROOT="${RPG_DATA_ROOT}/state"
 readonly RPG_BACKUP_ROOT="/var/backups/retailprintguard"
 readonly RPG_LOG_ROOT="/var/log/retailprintguard"
@@ -29,12 +30,22 @@ readonly RPG_DATABASE_USER="retailprintguard_app"
 readonly RPG_SERVICES=(
     retailprintguard-pos-proxy.service
     retailprintguard-rch-proxy.service
+    retailprintguard-epson-proxy.service
     retailprintguard-ingestion.service
     retailprintguard-parser.service
     retailprintguard-correlation.service
     retailprintguard-fraud.service
     retailprintguard-api.service
+    retailprintguard-export.service
+    retailprintguard-analysis.service
 )
+
+rpg_service_configured() {
+    [[ "$1" == retailprintguard-epson-proxy.service ]] || return 0
+    "${RPG_CURRENT_LINK}/.venv/bin/python" \
+        "${RPG_CURRENT_LINK}/scripts/validate_site_config.py" \
+        --config "${RPG_CONFIG_PATH}" --has-enabled-type epson
+}
 
 rpg_note() {
     printf '[RetailPrintGuard] %s\n' "$*"
@@ -103,7 +114,8 @@ rpg_assert_data_plane_unchanged() {
         src/retailprintguard/common/logging.py \
         requirements/production.lock \
         systemd/retailprintguard-pos-proxy.service \
-        systemd/retailprintguard-rch-proxy.service; do
+        systemd/retailprintguard-rch-proxy.service \
+        systemd/retailprintguard-epson-proxy.service; do
         [[ -e "${current_release}/${relative}" && -e "${candidate_release}/${relative}" ]] || \
             rpg_die "missing data-plane artifact required for comparison: ${relative}"
         diff -qr -- "${current_release}/${relative}" "${candidate_release}/${relative}" \
@@ -162,7 +174,7 @@ PY
 
 rpg_stop_control_plane() {
     local service
-    for service in retailprintguard-api.service retailprintguard-fraud.service \
+    for service in retailprintguard-analysis.service retailprintguard-export.service retailprintguard-api.service retailprintguard-fraud.service \
         retailprintguard-correlation.service retailprintguard-parser.service \
         retailprintguard-ingestion.service; do
         systemctl stop "${service}" 2>/dev/null || true

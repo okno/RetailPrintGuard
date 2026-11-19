@@ -6,6 +6,7 @@ from retailprintguard.render.text import (
     document_text_export,
     rch_identity_text_lines,
     receipt_header_text_lines,
+    receipt_preview_text,
     receipt_text,
 )
 
@@ -35,6 +36,39 @@ def test_receipt_text_preserves_receipt_columns_and_bounds_input() -> None:
 
     assert receipt_text(normalized) == normalized
     assert receipt_text(normalized, maximum_characters=4) == "EURO"
+
+
+def test_web_preview_keeps_whitespace_and_uses_exact_truthy_fallback_order() -> None:
+    preview = "  Caffè          4,00 €  \n\n\n"
+    document = SimpleNamespace(receipt_text=preview, normalized_text="not used")
+    assert receipt_preview_text(document) == preview
+    document.receipt_text = " \n "
+    assert receipt_preview_text(document) == " \n "
+    document.receipt_text = ""
+    assert receipt_preview_text(document) == "not used"
+    document.normalized_text = ""
+    assert receipt_preview_text(document) == "Nessun testo documento disponibile."
+
+
+def test_web_preview_does_not_duplicate_header_already_observed_in_body() -> None:
+    source = " LAB OSSERVATO \n\nArticolo   1,00"
+    for evidence in ("RCH_PRINTED_HEADER", "UNKNOWN", None):
+        document = SimpleNamespace(receipt_text=source, receipt_header={
+            "evidence": evidence, "merchant_name": "LAB OSSERVATO", "address_lines": []
+        })
+        assert receipt_preview_text(document) == source
+
+
+def test_web_preview_configured_header_does_not_trim_or_drop_blank_addresses() -> None:
+    document = SimpleNamespace(receipt_text=" body \n", receipt_header={
+        "evidence": "DEVICE_METADATA_CONFIGURED", "merchant_name": "  Merchant  ",
+        "legal_name": " ", "address_lines": [" First ", "", " Third  "],
+        "phone": " 123 ", "tax_code": "", "vat_number": " 456 ",
+    })
+    assert receipt_preview_text(document) == (
+        "  Merchant  \n \n First \n\n Third  \n"
+        "Telefono  123 \nP.IVA  456 \n\n body \n"
+    )
 
 
 def test_rch_identity_text_keeps_printed_clocks_capture_and_serial_separate() -> None:
@@ -123,7 +157,8 @@ def test_receipt_header_text_distinguishes_configured_and_missing_headers() -> N
         receipt_header_text_lines(SimpleNamespace(receipt_header=None))
     )
 
-    assert "Configurata sul dispositivo (non osservata nel flusso)" in configured_text
+    assert "Configurata sul dispositivo (non osservata nel flusso)" not in configured_text
+    assert "LAB CONFIGURATO" in configured_text
     assert "stampato dalla RCH" not in configured_text
     assert RECEIPT_HEADER_NOT_AVAILABLE in missing_text
 
@@ -177,7 +212,7 @@ def test_document_text_export_prepends_only_configured_header() -> None:
     text = document_text_export(document)
 
     assert text.index("Insegna: LAB CONFIGURATO") < text.index("TESTO DOCUMENTO")
-    assert "Configurata sul dispositivo (non osservata nel flusso)" in text
+    assert "Configurata sul dispositivo (non osservata nel flusso)" not in text
     assert "PROVENIENZA INTESTAZIONE" not in text
 
 
@@ -203,3 +238,73 @@ def test_document_text_export_projects_dgfe_header_with_distinct_provenance() ->
     assert text.index("Insegna: LAB MEMORIA") < text.index("TESTO DOCUMENTO")
     assert "Estratta dall'export della memoria fiscale DGFE" in text
     assert "osservata nel flusso" not in text.lower()
+
+
+def test_ocr_projection_matches_legacy_regex_for_bounded_adversarial_inputs() -> None:
+    """Compatibility oracle includes malformed nesting and mismatched labels."""
+    import itertools
+    import random
+    import re
+
+    from retailprintguard.render.text import _unwrap_ocr_blocks
+
+    legacy = re.compile(r"<OCR:[^>]+>(.*?)</OCR:[^>]+>", re.DOTALL)
+    tokens = (
+        "a", "\n", "€", "<OCR:x>", "<OCR:y>", "</OCR:x>", "</OCR:y>",
+        "<OCR:>", "</OCR:>", "<OCR:", "</OCR:", ">",
+    )
+    cases = ["".join(parts) for parts in itertools.product(tokens, repeat=3)]
+    generator = random.Random(2042)  # noqa: S311 - reproducible compatibility corpus
+    cases.extend(
+        "".join(generator.choices(tokens, k=generator.randrange(1, 30)))
+        for _ in range(2000)
+    )
+    for source in cases:
+        expected = legacy.sub(lambda match: match.group(1), source)
+        assert _unwrap_ocr_blocks(source) == expected, repr(source)
+
+
+def test_ocr_projection_preserves_unmatched_tags_without_dropping_later_text() -> None:
+    # This malformed body previously caused quadratic retries of every opener.
+    source = "<OCR:x>" * 30_000 + "\n2x Articolo sintetico €"
+    assert receipt_text(source) == source
+    # An unmatched closing tag and an empty label have never been stripped.
+    assert receipt_text("<OCR:>test</OCR:x>") == "<OCR:>test</OCR:x>"
+    assert receipt_text("<OCR:x>test</OCR:>") == "<OCR:x>test</OCR:>"
+
+
+def test_ocr_projection_keeps_legacy_nonrecursive_and_mismatched_label_semantics() -> None:
+    source = "before<OCR:outer>A<OCR:inner>B</OCR:other>C</OCR:outer>after"
+    assert receipt_text(source) == "beforeA<OCR:inner>BC</OCR:outer>after"
+    assert receipt_text("<OCR:a>one\n\ntwo</OCR:b>\nthree") == "one\n\ntwo\nthree"
+
+
+def test_technical_projection_matches_legacy_regex_for_bounded_adversarial_inputs() -> None:
+    import itertools
+    import random
+    import re
+
+    from retailprintguard.render.text import _strip_technical_tokens
+
+    legacy = re.compile(r"<(?:ESC/POS|BYTE):[^>]*>")
+    tokens = (
+        "x", "€", "\n", "<BYTE:", "<ESC/POS:", "<BYTE:>", "<ESC/POS:>",
+        "<BYTE:x>", "<ESC/POS:x>", "<byte:x>", "<OCR:x>", "</OCR:x>", ">", "<",
+    )
+    cases = ["".join(parts) for parts in itertools.product(tokens, repeat=3)]
+    generator = random.Random(2042)  # noqa: S311 - reproducible compatibility corpus
+    cases.extend(
+        "".join(generator.choices(tokens, k=generator.randrange(1, 30)))
+        for _ in range(2000)
+    )
+    for source in cases:
+        assert _strip_technical_tokens(source) == legacy.sub("", source), repr(source)
+
+
+def test_unclosed_technical_tokens_keep_later_text_without_quadratic_retries() -> None:
+    for token in ("<BYTE:", "<ESC/POS:"):
+        source = token * 25_000 + "\nArticolo sintetico €"
+        assert receipt_text(source) == source
+    assert receipt_text("before<BYTE:>after") == "beforeafter"
+    assert receipt_text("before<ESC/POS:<BYTE:nested>>after") == "before>after"
+    assert receipt_text("<byte:literal>\n<ESC/POS:complete>text") == "<byte:literal>\ntext"

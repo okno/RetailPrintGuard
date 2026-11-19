@@ -13,7 +13,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from retailprintguard import __version__
+from retailprintguard.api.analyses import AnalysisService
 from retailprintguard.api.auth import LoginThrottle, TokenService
+from retailprintguard.api.exports import ExportService
 from retailprintguard.api.middleware import CorrelationAndSecurityMiddleware
 from retailprintguard.api.reachability import DeviceProbeTarget, DeviceReachabilityMonitor
 from retailprintguard.api.repository import ApiRepository, EmptyRepository
@@ -30,6 +32,8 @@ def create_app(
     settings: Settings | None = None,
     review_password_hash: str | None = None,
     reachability_monitor: DeviceReachabilityMonitor | None = None,
+    export_service: ExportService | None = None,
+    analysis_service: AnalysisService | None = None,
 ) -> FastAPI:
     if jwt_secret is None:
         jwt_secret = b"test-only-secret-not-for-production-00000000000000000000"
@@ -46,6 +50,19 @@ def create_app(
         )
         if targets:
             reachability_monitor = DeviceReachabilityMonitor(targets)
+    if export_service is None and settings is not None:
+        from retailprintguard.db.session import create_db_engine, session_factory
+
+        export_service = ExportService(
+            session_factory(create_db_engine(settings.database_url().get_secret_value())),
+            settings.archive_root,
+        )
+    if analysis_service is None and settings is not None:
+        from retailprintguard.db.session import create_db_engine, session_factory
+
+        analysis_service = AnalysisService(
+            session_factory(create_db_engine(settings.database_url().get_secret_value())), settings
+        )
     context = ApiContext(
         repository or EmptyRepository(),
         TokenService(jwt_secret, lifetime_minutes=token_minutes),
@@ -53,6 +70,12 @@ def create_app(
         ReviewSecretVerifier(review_password_hash),
         LoginThrottle(limit=failed_limit, delay_seconds=failed_delay),
         reachability_monitor,
+        export_service,
+        analysis_service=analysis_service,
+        device_additional_ports=(
+            {device.id: device.additional_ports for device in settings.devices}
+            if settings is not None else None
+        ),
     )
 
     @asynccontextmanager

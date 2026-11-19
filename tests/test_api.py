@@ -521,6 +521,8 @@ def test_document_derivatives_and_bidirectional_evidence_downloads() -> None:
     )
     assert json_response.status_code == 200
     assert json_response.json()["id"] == str(repository.document_id)
+    assert "receipt_preview" not in json_response.json()
+    assert "pdf_filename" not in json_response.json()
     assert json_response.json()["receipt_header"] == {
         "schema_version": 1,
         "merchant_name": "LAB HOTEL",
@@ -559,6 +561,64 @@ def test_document_derivatives_and_bidirectional_evidence_downloads() -> None:
     assert source.status_code == 200
     assert source.headers["content-type"] == "application/xml"
     assert source.content.startswith(b"<MemoriaDettaglio")
+
+
+def test_document_pdf_name_and_web_preview_are_server_projections(monkeypatch) -> None:
+    client, repository = _client()
+    document = repository.get_document(repository.document_id).model_copy(
+        update={
+            "external_document_code": '0001/0023\r\n";filename=../caffè',
+            "document_timestamp": datetime(2042, 7, 8, 23, 30, tzinfo=UTC),
+            "receipt_text": "  RIGA ESATTA    0,00\n\n",
+        }
+    )
+    monkeypatch.setattr(repository, "get_document", lambda _: document)
+    headers = _login(client)
+    response = client.get(f"/api/v1/documents/{document.id}", headers=headers)
+    assert response.status_code == 200
+    projected = response.json()
+    assert projected["receipt_preview"] == "  RIGA ESATTA    0,00\n\n"
+    assert projected["pdf_category"] == "complete"
+    assert projected["pdf_reason_code"] == "COMPLETE_PRINTABLE_DOCUMENT"
+    assert projected["pdf_policy_version"]
+    assert projected["pdf_filename"] == (
+        "2042-07-09_preconto_numero-0001-0023-filename-caffe_pos_1.pdf"
+    )
+    pdf = client.get(f"/api/v1/documents/{document.id}/pdf", headers=headers)
+    assert pdf.status_code == 200
+    assert pdf.headers["content-disposition"] == (
+        f'attachment; filename="{projected["pdf_filename"]}"'
+    )
+    exported_json = client.get(f"/api/v1/documents/{document.id}/json", headers=headers)
+    assert exported_json.status_code == 200
+    assert "receipt_preview" not in exported_json.json()
+    assert "pdf_filename" not in exported_json.json()
+    expected = document.model_dump_json(
+        indent=2, exclude={
+            "receipt_preview", "pdf_filename", "pdf_category", "pdf_reason_code",
+            "pdf_policy_version",
+        }
+    ) + "\n"
+    assert exported_json.content == expected.encode("utf-8")
+
+
+def test_pdf_download_rejects_protocol_evidence_but_keeps_raw_and_partial_access(monkeypatch):
+    client, repository = _client()
+    base = repository.get_document(repository.document_id)
+    document = base.model_copy(update={
+        "type": "DEVICE_RESPONSE", "normalized_text": "ON00000000", "receipt_header": None,
+    })
+    monkeypatch.setattr(repository, "get_document", lambda _: document)
+    headers = _login(client)
+    endpoint = f"/api/v1/documents/{document.id}"
+    assert client.get(endpoint, headers=headers).json()["pdf_category"] == "excluded"
+    assert client.get(endpoint + "/pdf", headers=headers).status_code == 409
+    assert client.get(endpoint + "/raw", headers=headers).status_code == 200
+    document = base.model_copy(update={"complete": False})
+    partial = client.get(endpoint + "/pdf", headers=headers)
+    assert partial.status_code == 200
+    assert partial.headers["X-RetailPrintGuard-Document-Scope"] == "partial"
+    assert partial.headers["content-disposition"].endswith('_parziale.pdf"')
 
 
 def test_alert_workflow_and_csv_export() -> None:
@@ -673,3 +733,70 @@ def test_login_throttle_is_bounded_and_rotating_usernames_cannot_bypass_ip_limit
     for index in range(50):
         throttle.failure(f"192.0.2.{index + 60}", f"user-{index}")
     assert len(throttle._events) <= 6  # noqa: SLF001 - security-bound regression
+
+
+def test_device_additional_ports_merge_settings_without_changing_primary_or_repository(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from test_config import _base
+
+    from retailprintguard.common.config import Settings
+
+    data = _base(tmp_path)
+    data["devices"].append(
+        {
+            "id": "epson_test",
+            "name": "Fiscale sintetica",
+            "type": "epson",
+            "listen_ip": "192.0.2.12",
+            "listen_port": 9100,
+            "target_ip": "192.0.2.22",
+            "target_port": 9100,
+            "additional_ports": [80, 443],
+            "parser": "opaque_raw",
+            "bidirectional": True,
+            "enabled": True,
+            "allowed_networks": ["192.0.2.0/24"],
+        }
+    )
+    settings = Settings.model_validate(data)
+    monkeypatch.setenv("RPG_DATABASE_URL", "sqlite://")
+    repository = FakeRepository()
+    original = repository.list_devices() + [
+        DeviceView(
+            id="epson_test",
+            name="Fiscale sintetica",
+            type="epson",
+            enabled=True,
+            online=False,
+            listen_endpoint="192.0.2.12:9100",
+            target_endpoint="192.0.2.22:9100",
+        )
+    ]
+    monkeypatch.setattr(repository, "list_devices", lambda: original)
+    monitor = DeviceReachabilityMonitor(
+        (DeviceProbeTarget("epson_test", "192.0.2.22"),),
+        probe=lambda _host, _timeout: True,
+    )
+    monitor.poll_once()
+    client = TestClient(
+        create_app(
+            repository=repository,
+            jwt_secret=b"x" * 64,
+            settings=settings,
+            reachability_monitor=monitor,
+        )
+    )
+    response = client.get("/api/v1/devices", headers=_login(client))
+    assert response.status_code == 200
+    devices = {device["id"]: device for device in response.json()}
+    assert devices["pos_1"]["additional_ports"] == []
+    epson = devices["epson_test"]
+    assert epson["additional_ports"] == [80, 443]
+    assert epson["listen_endpoint"] == "192.0.2.12:9100"
+    assert epson["target_endpoint"] == "192.0.2.22:9100"
+    assert epson["online"] is True
+    assert epson["reachability_checked_at"] is not None
+    assert original[1].additional_ports == []
+    assert original[1].online is False

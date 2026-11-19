@@ -8,6 +8,7 @@ import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 from uuid import UUID
 
 import jwt
@@ -16,7 +17,22 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from retailprintguard import __version__
+from retailprintguard.api.analyses import (
+    AnalysisCreate,
+    AnalysisError,
+    AnalysisResultView,
+    AnalysisService,
+    AnalysisView,
+)
 from retailprintguard.api.auth import LoginThrottle, TokenService, constant_time_dummy_verify
+from retailprintguard.api.discounts import DiscountPage
+from retailprintguard.api.exports import (
+    ExportCreate,
+    ExportDocumentPage,
+    ExportError,
+    ExportService,
+    ExportView,
+)
 from retailprintguard.api.reachability import DeviceReachabilityMonitor
 from retailprintguard.api.repository import ApiRepository, RawArtifact
 from retailprintguard.api.review_secret import ReviewSecretVerifier
@@ -112,6 +128,9 @@ class ApiContext:
         review_secret: ReviewSecretVerifier | None = None,
         review_throttle: LoginThrottle | None = None,
         reachability_monitor: DeviceReachabilityMonitor | None = None,
+        export_service: ExportService | None = None,
+        device_additional_ports: dict[str, tuple[int, ...]] | None = None,
+        analysis_service: AnalysisService | None = None,
     ) -> None:
         self.repository = repository
         self.tokens = tokens
@@ -119,6 +138,9 @@ class ApiContext:
         self.review_secret = review_secret or ReviewSecretVerifier(None)
         self.review_throttle = review_throttle or LoginThrottle(limit=5, delay_seconds=2)
         self.reachability_monitor = reachability_monitor
+        self.export_service = export_service
+        self.analysis_service = analysis_service
+        self.device_additional_ports = dict(device_additional_ports or {})
 
 
 def create_router(context: ApiContext) -> APIRouter:
@@ -225,6 +247,215 @@ def create_router(context: ApiContext) -> APIRouter:
             },
         )
 
+    def analyses() -> AnalysisService:
+        if context.analysis_service is None:
+            raise HTTPException(status_code=503, detail="Rianalisi non configurata")
+        return context.analysis_service
+
+    @router.post("/analyses", response_model=AnalysisView, status_code=202, tags=["analyses"])
+    def create_analysis(request: Request, body: AnalysisCreate, user: Auditor) -> AnalysisView:
+        try:
+            result = analyses().create(body, user)
+        except AnalysisError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        audit(request, context.repository, user, "ANALYSIS_REQUESTED", "analysis", str(result.id),
+              scope="all_history", total_jobs=result.total_jobs,
+              input_sha256=result.input_metadata["input_sha256"])
+        return result
+
+    @router.get("/analyses", response_model=Page[AnalysisView], tags=["analyses"])
+    def list_analyses(
+        _: Auditor,
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+        offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    ) -> Page[AnalysisView]:
+        items, total = analyses().history(limit=limit, offset=offset)
+        return Page(items=items, total=total, limit=limit, offset=offset)
+
+    @router.get("/analyses/{analysis_id}", response_model=AnalysisView, tags=["analyses"])
+    def get_analysis(analysis_id: UUID, _: Auditor) -> AnalysisView:
+        result = analyses().get(analysis_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Rianalisi non trovata")
+        return result
+
+    @router.post(
+        "/analyses/{analysis_id}/retry", response_model=AnalysisView,
+        status_code=202, tags=["analyses"],
+    )
+    def retry_analysis(request: Request, analysis_id: UUID, user: Auditor) -> AnalysisView:
+        try:
+            result = analyses().retry(analysis_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Rianalisi non trovata") from exc
+        except AnalysisError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        audit(request, context.repository, user, "ANALYSIS_RETRIED", "analysis", str(analysis_id))
+        return result
+
+    @router.get(
+        "/analyses/{analysis_id}/results",
+        response_model=Page[AnalysisResultView], tags=["analyses"],
+    )
+    def analysis_results(
+        analysis_id: UUID, _: Auditor,
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+        offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
+        device_id: Annotated[str | None, Query(max_length=64)] = None,
+        kind: Literal["employee_30", "generic_30", "other"] | None = None,
+        reconciliation: Literal["verified", "unverified"] | None = None,
+        with_discounts: bool = False,
+    ) -> Page[AnalysisResultView]:
+        period_from, period_to = _utc_period(period_from, period_to)
+        try:
+            items, total = analyses().results(
+                analysis_id, limit=limit, offset=offset, period_from=period_from,
+                period_to=period_to, device_id=device_id, kind=kind, reconciliation=reconciliation,
+                with_discounts=with_discounts,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Rianalisi non trovata") from exc
+        except AnalysisError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Page(items=items, total=total, limit=limit, offset=offset)
+
+    @router.get("/analyses/{analysis_id}/download", tags=["analyses"])
+    def download_analysis(
+        request: Request, analysis_id: UUID, user: Auditor,
+        format: Literal["json", "csv"] = "json",
+    ) -> StreamingResponse:
+        try:
+            payload = analyses().download(analysis_id, format=format)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Rianalisi non trovata") from exc
+        except AnalysisError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        checksum = hashlib.sha256(payload).hexdigest()
+        audit(
+            request, context.repository, user, "ANALYSIS_DOWNLOADED", "analysis", str(analysis_id),
+              format=format, sha256=checksum, bytes=len(payload))
+        return StreamingResponse(_stream_bytes(payload),
+            media_type="application/json" if format == "json" else "text/csv; charset=utf-8",
+            headers={"Content-Disposition": (
+                f'attachment; filename="RetailPrintGuard_rianalisi_{analysis_id}.{format}"'),
+                     "Content-Length": str(len(payload)), "X-Checksum-SHA256": checksum,
+                     "Cache-Control": "no-store"})
+
+    def exports() -> ExportService:
+        if context.export_service is None:
+            raise HTTPException(status_code=503, detail="Esportazioni non configurate")
+        return context.export_service
+
+    @router.post("/exports", response_model=ExportView, status_code=202, tags=["exports"])
+    def create_export(request: Request, body: ExportCreate, user: Auditor) -> ExportView:
+        try:
+            result = exports().create(body, user)
+        except ExportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        audit(
+            request, context.repository, user, "EXPORT_REQUESTED", "export", str(result.id),
+            date_from=body.date_from.isoformat() if body.date_from else None,
+            date_to=body.date_to.isoformat() if body.date_to else None,
+            scope=body.scope, document_scope=body.document_scope,
+            device_ids=body.device_ids, total_documents=result.total_documents,
+        )
+        return result
+
+    @router.get("/exports", response_model=Page[ExportView], tags=["exports"])
+    def list_exports(
+        _: Auditor,
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+        offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    ) -> Page[ExportView]:
+        items, total = exports().history(limit=limit, offset=offset)
+        return Page(items=items, total=total, limit=limit, offset=offset)
+
+    @router.get("/exports/{export_id}", response_model=ExportView, tags=["exports"])
+    def get_export(export_id: UUID, _: Auditor) -> ExportView:
+        result = exports().get(export_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Richiesta non trovata")
+        return result
+
+    @router.get(
+        "/exports/{export_id}/documents", response_model=ExportDocumentPage, tags=["exports"]
+    )
+    def export_documents(
+        request: Request, export_id: UUID, user: Auditor,
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+        offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    ) -> ExportDocumentPage:
+        try:
+            result = exports().archive_documents(export_id, limit=limit, offset=offset)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Richiesta non trovata") from exc
+        except ExportError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        audit(
+            request, context.repository, user, "EXPORT_CONTENTS_VIEWED", "export", str(export_id),
+            limit=limit, offset=offset, total=result.total, legacy=result.legacy,
+        )
+        return result
+
+    @router.get("/exports/{export_id}/documents/{sequence}/pdf", tags=["exports"])
+    def preview_export_pdf(
+        request: Request, export_id: UUID, sequence: int, user: Auditor,
+    ) -> StreamingResponse:
+        try:
+            document, payload = exports().archive_pdf(export_id, sequence)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="PDF non trovato nell'archivio") from exc
+        except ExportError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        audit(
+            request, context.repository, user, "EXPORT_PDF_PREVIEWED", "export", str(export_id),
+            archive_sequence=sequence, document_id=str(document.document_id),
+            sha256=document.pdf_sha256, bytes=len(payload),
+        )
+        return StreamingResponse(_stream_bytes(payload), media_type="application/pdf", headers={
+            "Content-Disposition": (
+                f'inline; filename="documento_{sequence}.pdf"; '
+                f"filename*=UTF-8''{quote(document.filename, safe='')}"
+            ),
+            "Content-Length": str(len(payload)),
+            "X-Checksum-SHA256": document.pdf_sha256,
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        })
+
+    @router.get("/exports/{export_id}/download", tags=["exports"])
+    def download_export(request: Request, export_id: UUID, user: Auditor) -> StreamingResponse:
+        try:
+            result, stream = exports().open_archive(export_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Richiesta non trovata") from exc
+        except ExportError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            audit(
+                request, context.repository, user, "EXPORT_DOWNLOADED", "export", str(export_id),
+                sha256=result.archive_sha256, bytes=result.archive_bytes,
+            )
+        except Exception:
+            stream.close()
+            raise
+
+        def chunks() -> Any:
+            try:
+                while block := stream.read(64 * 1024):
+                    yield block
+            finally:
+                stream.close()
+
+        return StreamingResponse(chunks(), media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="{result.archive_filename}"',
+            "Content-Length": str(result.archive_bytes),
+            "X-Checksum-SHA256": str(result.archive_sha256),
+            "Cache-Control": "no-store",
+        })
+
     @router.post("/auth/login", response_model=TokenResponse, tags=["auth"])
     def login(
         request: Request, body: LoginRequest, repo: Annotated[ApiRepository, Depends(repository)]
@@ -270,11 +501,35 @@ def create_router(context: ApiContext) -> APIRouter:
             return result
         return result.model_copy(update={"devices_online": counts[0], "devices_offline": counts[1]})
 
+    @router.get("/discounts", response_model=DiscountPage, tags=["documents"])
+    def discounts(
+        _: AnyUser,
+        repo: Annotated[ApiRepository, Depends(repository)],
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
+        device_id: str | None = None,
+        kind: Literal["all", "employee_30", "generic_30", "other"] = "all",
+        reconciliation: Literal["all", "verified", "review"] = "all",
+        limit: Annotated[int, Query(ge=1, le=200)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> DiscountPage:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
+        return repo.list_discounts(limit=limit, offset=offset, filters={
+            "from": normalized_from, "to": normalized_to, "device_id": device_id,
+            "kind": kind, "reconciliation": reconciliation,
+        })
+
     @router.get("/devices", response_model=list[DeviceView], tags=["devices"])
     def devices(
         _: AnyUser, repo: Annotated[ApiRepository, Depends(repository)]
     ) -> list[DeviceView]:
-        result = list(repo.list_devices())
+        result = [
+            item.model_copy(update={
+                "additional_ports": list(context.device_additional_ports[item.id]),
+            })
+            if item.id in context.device_additional_ports else item
+            for item in repo.list_devices()
+        ]
         if context.reachability_monitor is None:
             return result
         snapshots = context.reachability_monitor.snapshots()
@@ -441,6 +696,7 @@ def create_router(context: ApiContext) -> APIRouter:
         document_type: str | None = Query(default=None, alias="type"),
         exclude_type: str | None = None,
         include_technical: bool = False,
+        document_scope: Literal["complete", "partial", "all"] = "all",
         device_id: str | None = None,
         order_code: str | None = None,
         external_document_code: str | None = None,
@@ -457,6 +713,7 @@ def create_router(context: ApiContext) -> APIRouter:
                 "type": document_type,
                 "exclude_type": exclude_type,
                 "include_technical": include_technical,
+                "document_scope": document_scope,
                 "device_id": device_id,
                 "order_code": order_code,
                 "external_document_code": external_document_code,
@@ -542,7 +799,12 @@ def create_router(context: ApiContext) -> APIRouter:
         result = repo.get_document(document_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Documento non trovato")
-        payload = (result.model_dump_json(indent=2) + "\n").encode("utf-8")
+        payload = (
+            result.model_dump_json(indent=2, exclude={
+                "receipt_preview", "pdf_filename", "pdf_category", "pdf_reason_code",
+                "pdf_policy_version",
+            }) + "\n"
+        ).encode("utf-8")
         artifact = RawArtifact(
             payload,
             f"{document_id}.json",
@@ -569,13 +831,19 @@ def create_router(context: ApiContext) -> APIRouter:
         result = repo.get_document(document_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Documento non trovato")
+        if result.pdf_category == "excluded":
+            raise HTTPException(
+                status_code=409,
+                detail="Questa evidenza non contiene un documento stampabile; "
+                "i dati originali restano consultabili.",
+            )
         try:
             payload = render_document_pdf(result)
         except DocumentRenderError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         artifact = RawArtifact(
             payload,
-            f"{document_id}.pdf",
+            result.pdf_filename,
             hashlib.sha256(payload).hexdigest(),
             media_type="application/pdf",
         )
@@ -589,6 +857,7 @@ def create_router(context: ApiContext) -> APIRouter:
             entity_id=document_id,
         )
         response.headers["X-RetailPrintGuard-Renderer"] = PDF_RENDERER_VERSION
+        response.headers["X-RetailPrintGuard-Document-Scope"] = result.pdf_category
         return response
 
     @router.get("/orders", response_model=Page[OrderView], tags=["orders"])

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retailprintguard"
-version = "0.4.9"
+version = "0.5.5"
 description = "Resilient print evidence ingestion, correlation and fraud analysis platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,12 +27,15 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "httpx>=0.28,<1",
+  "pypdf>=6,<7",
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.25,<1",
   "ruff>=0.11,<1",
 ]
 
 [project.scripts]
+retailprintguard-analysis = "retailprintguard.api.analysis_worker:cli"
+retailprintguard-export = "retailprintguard.api.export_worker:cli"
 retailprintguard-api = "retailprintguard.api.main:cli"
 retailprintguard-configure-review = "retailprintguard.api.review_secret:cli"
 retailprintguard-admin = "retailprintguard.admin.main:cli"
@@ -46,6 +49,9 @@ retailprintguard-compile-legacy = "retailprintguard.proxy.legacy_config:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"retailprintguard.render" = ["fonts/*.ttf", "fonts/LICENSE*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

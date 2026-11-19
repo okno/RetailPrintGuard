@@ -18,6 +18,7 @@ fi
 failures=0
 services_json=()
 for service in "${RPG_SERVICES[@]}"; do
+    rpg_service_configured "${service}" || continue
     state="$(systemctl is-active "${service}" 2>/dev/null || true)"
     [[ "${state}" == active ]] || failures=$((failures + 1))
     services_json+=("$(printf '{\"name\":\"%s\",\"state\":\"%s\"}' "${service}" "${state}")")

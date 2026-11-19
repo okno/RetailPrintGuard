@@ -139,3 +139,22 @@ export async function downloadApi(path: string, filename: string): Promise<void>
     URL.revokeObjectURL(blobUrl)
   }
 }
+
+/** Fetch one immutable archive PDF; credentials stay in the header, never the frame URL. */
+export async function archivePdf(path: string, signal?: AbortSignal): Promise<Blob> {
+  const headers = new Headers({ Accept: 'application/pdf' })
+  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`)
+  const response = await request(`${API_ROOT}${path}`, { headers, signal, cache: 'no-store' })
+  if (response.status === 401) clearSession()
+  if (!response.ok) throw await apiError(response, 'PDF dell’archivio non disponibile')
+  const maximum = 16 * 1024 * 1024
+  if (!response.headers.get('Content-Type')?.toLowerCase().startsWith('application/pdf')) throw new ApiError('Il file ricevuto non è un PDF.', response.status)
+  if (Number(response.headers.get('Content-Length')) > maximum) {
+    await response.body?.cancel()
+    throw new ApiError('Il PDF supera il limite di 16 MiB per l’anteprima.', response.status)
+  }
+  const blob = await response.blob()
+  if (blob.size > maximum) throw new ApiError('Il PDF supera il limite di 16 MiB per l’anteprima.', response.status)
+  if (await blob.slice(0, 5).text() !== '%PDF-') throw new ApiError('Il file ricevuto non è un PDF valido.', response.status)
+  return blob
+}

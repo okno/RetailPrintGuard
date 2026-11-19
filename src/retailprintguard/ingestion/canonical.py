@@ -476,9 +476,11 @@ class CanonicalCaptureV1Adapter:
         if not relative_parts or relative_parts[0] != device_id:
             raise SourceValidationError("canonical job path is outside its device namespace")
         device_type = require_string(session.get("device_type"), "session.device_type", maximum=16)
-        if device_type not in {"pos", "rch"}:
+        if device_type not in {"pos", "rch", "epson"}:
             raise SourceValidationError(f"unsupported canonical device type: {device_type!r}")
         parser = require_string(session.get("parser"), "session.parser", maximum=64)
+        if device_type == "epson" and parser != "opaque_raw":
+            raise SourceValidationError("Epson fiscal captures require parser=opaque_raw")
         source_endpoint = endpoint(
             _mapping(session.get("client_endpoint"), "session.client_endpoint").get("host"),
             _mapping(session.get("client_endpoint"), "session.client_endpoint").get("port"),

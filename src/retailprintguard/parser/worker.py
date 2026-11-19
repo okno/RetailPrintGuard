@@ -12,6 +12,7 @@ from threading import Event
 from typing import Protocol
 
 from retailprintguard.parser.beeper import is_complete_pos_command
+from retailprintguard.parser.epson import parse_epson
 from retailprintguard.parser.escpos import parse_escpos
 from retailprintguard.parser.rch import parse_rch
 from retailprintguard.parser.repository import ParserRepositoryError, SqlAlchemyParserRepository
@@ -45,8 +46,15 @@ class ParserWorker:
         self.timezone_name = timezone_name
         self.beeper = beeper
 
-    def run_once(self, *, limit: int = 100, reparse: bool = False) -> ParserRunReport:
-        job_ids = self.repository.pending_jobs(limit=limit, reparse=reparse)
+    def run_once(
+        self, *, limit: int = 100, reparse: bool = False, device_id: str | None = None
+    ) -> ParserRunReport:
+        if device_id is not None and not reparse:
+            raise ValueError("device filter is available only for explicit historical reparse")
+        options: dict[str, object] = {"limit": limit, "reparse": reparse}
+        if device_id is not None:
+            options["device_id"] = device_id
+        job_ids = self.repository.pending_jobs(**options)
         parsed_jobs = 0
         parsed_documents = 0
         failed = 0
@@ -127,6 +135,13 @@ class ParserWorker:
                         source["response"],
                         response_source_path=source["response_path"],
                         timezone_name=self.timezone_name,
+                        **common,
+                    )
+                elif parser_kind == "opaque_raw":
+                    documents = parse_epson(
+                        source["request"],
+                        source["response"],
+                        response_source_path=source["response_path"],
                         **common,
                     )
                 else:

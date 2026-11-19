@@ -45,7 +45,7 @@ stage="$(mktemp -d "${RPG_BACKUP_ROOT}/.backup.XXXXXXXX")"
 cleanup() { rm -rf -- "${stage}"; }
 trap cleanup EXIT
 install -d -m 0700 -- "${stage}/database" "${stage}/configuration" \
-    "${stage}/evidence/spool" "${stage}/evidence/archive" "${stage}/deployment"
+    "${stage}/evidence/spool" "${stage}/evidence/archive" "${stage}/derived/exports" "${stage}/deployment"
 
 rpg_note "Dumping MariaDB with a single transaction"
 mariadb-dump --protocol=socket --single-transaction --quick --routines --events --triggers \
@@ -82,6 +82,13 @@ if [[ -d "${RPG_ARCHIVE_ROOT}" ]]; then
         --exclude='*.partial' -- \
         "${RPG_ARCHIVE_ROOT}/" \
         "${stage}/evidence/archive/"
+fi
+
+# Only immutable completed ZIPs are backed up; pending requests resume from DB snapshots.
+if [[ -d "${RPG_EXPORT_ROOT}" ]]; then
+    rsync -a --no-owner --no-group --chmod=D0750,F0440 \
+        --exclude='*.partial' --exclude='.worker.lock' -- \
+        "${RPG_EXPORT_ROOT}/" "${stage}/derived/exports/"
 fi
 
 if [[ -L "${RPG_CURRENT_LINK}" ]]; then

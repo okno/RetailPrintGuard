@@ -84,7 +84,9 @@ def _database(*, parser_kind: str, request: bytes, response: bytes = b""):
                 id=device_id,
                 external_id="device_synthetic",
                 name="Dispositivo sintetico",
-                device_type="rch" if parser_kind == "rch_observed" else "pos",
+                device_type={
+                    "rch_observed": "rch", "opaque_raw": "epson", "escpos": "pos"
+                    }.get(parser_kind, "pos"),
                 parser_kind=parser_kind,
                 listen_ip="192.0.2.10",
                 listen_port=9100,
@@ -218,6 +220,46 @@ def test_parser_worker_is_idempotent_and_links_response_to_response_raw() -> Non
         assert by_document[response_document.id].raw_payload_id == response_id
         assert by_document[response_document.id].source_path.endswith("device.raw")
         assert by_document[commercial_document.id].raw_payload_id == request_id
+    engine.dispose()
+
+
+def test_opaque_worker_keeps_identical_directions_distinct_and_reparse_idempotent(
+    monkeypatch,
+) -> None:
+    def forbidden_parser(*args, **kwargs):
+        raise AssertionError("Epson streams must not reach POS/RCH semantic parsers")
+
+    monkeypatch.setattr(parser_worker, "parse_escpos", forbidden_parser)
+    monkeypatch.setattr(parser_worker, "parse_rch", forbidden_parser)
+    payload = b"\x06\x00SYNTHETIC FISCAL RESPONSE\xff"
+    engine, factory, _job_id, request_id, response_id = _database(
+        parser_kind="opaque_raw", request=payload, response=payload
+    )
+    repository = SqlAlchemyParserRepository(factory)
+    report = ParserWorker(repository).run_once()
+    assert (report.parsed_jobs, report.parsed_documents, report.failed) == (1, 2, 0)
+    assert repository.pending_jobs(limit=10, reparse=True) == ()
+    assert ParserWorker(repository).run_once().discovered == 0
+    with factory() as session:
+        documents = session.scalars(select(Document)).all()
+        assert {document.document_type for document in documents} == {"UNKNOWN"}
+        versions = session.scalars(select(DocumentVersion)).all()
+        by_direction = {version.raw_metadata["direction"]: version for version in versions}
+        assert by_direction["CLIENT_TO_DEVICE"].raw_payload_id == request_id
+        assert by_direction["DEVICE_TO_CLIENT"].raw_payload_id == response_id
+        assert all(version.gross_total is None for version in versions)
+        assert session.scalar(select(func.count(DocumentLine.id))) == 0
+    engine.dispose()
+
+
+def test_empty_opaque_worker_does_not_retry_as_rch() -> None:
+    engine, factory, _job_id, _request_id, _response_id = _database(
+        parser_kind="opaque_raw", request=b""
+    )
+    repository = SqlAlchemyParserRepository(factory)
+    report = ParserWorker(repository).run_once()
+    assert (report.parsed_jobs, report.parsed_documents, report.failed) == (1, 0, 0)
+    assert repository.pending_jobs(limit=10, reparse=True) == ()
     engine.dispose()
 
 

@@ -1,8 +1,12 @@
 export const DOCUMENT_DETAIL_PARAM = 'documentId' as const
 export const TRANSACTION_DETAIL_PARAM = 'transactionId' as const
+export const ANALYSIS_DETAIL_PARAM = 'analysisId' as const
+export const EXPORT_DETAIL_PARAM = 'exportId' as const
 
 export const DOCUMENT_DETAIL_ROUTE = `/documenti/:${DOCUMENT_DETAIL_PARAM}`
 export const TRANSACTION_DETAIL_ROUTE = `/transazioni/:${TRANSACTION_DETAIL_PARAM}`
+export const ANALYSIS_DETAIL_ROUTE = `/rianalisi/:${ANALYSIS_DETAIL_PARAM}`
+export const EXPORT_DETAIL_ROUTE = `/esportazioni/:${EXPORT_DETAIL_PARAM}`
 
 export function documentDetailPath(documentId: string) {
   return `/documenti/${encodeURIComponent(documentId)}`
@@ -10,4 +14,12 @@ export function documentDetailPath(documentId: string) {
 
 export function transactionDetailPath(transactionId: string) {
   return `/transazioni/${encodeURIComponent(transactionId)}`
+}
+
+export function analysisDetailPath(analysisId: string) {
+  return `/rianalisi/${encodeURIComponent(analysisId)}`
+}
+
+export function exportDetailPath(exportId: string) {
+  return `/esportazioni/${encodeURIComponent(exportId)}`
 }

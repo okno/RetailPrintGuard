@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 from uuid import UUID
 
+from retailprintguard.api.discounts import DiscountPage
 from retailprintguard.api.schemas import (
     AlertUpdate,
     AlertView,
@@ -45,6 +46,10 @@ class ApiRepository(Protocol):
     def authenticate(self, username: str, password: str) -> UserPrincipal | None: ...
 
     def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView: ...
+
+    def list_discounts(
+        self, *, limit: int, offset: int, filters: dict[str, Any]
+    ) -> DiscountPage: ...
 
     def diagnostics(self) -> DiagnosticsView: ...
 
@@ -139,6 +144,12 @@ class EmptyRepository:
     def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView:
         del filters
         return DashboardView()
+
+    def list_discounts(
+        self, *, limit: int, offset: int, filters: dict[str, Any]
+    ) -> DiscountPage:
+        del filters
+        return DiscountPage(limit=limit, offset=offset)
 
     def diagnostics(self) -> DiagnosticsView:
         from datetime import UTC, datetime

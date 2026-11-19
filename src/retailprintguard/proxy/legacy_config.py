@@ -26,6 +26,8 @@ class CompiledLegacyConfigs:
 
 
 def compile_legacy_configs(settings: Settings) -> CompiledLegacyConfigs:
+    if any(device.enabled and device.type is DeviceType.EPSON for device in settings.devices):
+        raise LegacyConfigError("Epson fiscal routes require the native RetailPrintGuard proxy")
     files: dict[str, str] = {}
     pos_devices = [
         device
