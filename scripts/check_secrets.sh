@@ -67,7 +67,7 @@ placeholder_passwords = {
 findings: list[str] = []
 reviewed_font_path = "src/retailprintguard/render/fonts/DejaVuSansMono.ttf"
 reviewed_font_sha256 = "54bf827eb99404e8f430c330ad30f063334f637eba0109b6a18d4f566a8e9dd8"
-reviewed_font_license_sha256 = "e180b3d65bf650dffffd71dd21b6180767b469a18dd87e1d8552be69bb9ecdf0"
+reviewed_font_license_sha256 = "562c8f5e92af7a06339292a1bb0b9a3e9c8d5142af5d7167f2866fc50261b993"
 for relative in paths:
     if relative.suffix.lower() in forbidden_suffixes:
         findings.append(f"private artifact extension: {relative.as_posix()}")
@@ -88,7 +88,9 @@ for relative in paths:
     if relative.as_posix() == reviewed_font_path:
         license_path = path.with_name("LICENSE-DejaVu.txt")
         try:
-            license_sha256 = hashlib.sha256(license_path.read_bytes()).hexdigest()
+            # Git may check out this text license with CRLF on Windows.
+            license_bytes = license_path.read_bytes().replace(b"\r\n", b"\n")
+            license_sha256 = hashlib.sha256(license_bytes).hexdigest()
         except OSError:
             license_sha256 = None
         if (

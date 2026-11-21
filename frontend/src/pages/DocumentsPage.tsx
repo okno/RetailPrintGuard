@@ -11,6 +11,7 @@ import {
   Card,
   Chip,
   FormControl,
+  FormHelperText,
   IconButton,
   InputLabel,
   MenuItem,
@@ -44,6 +45,8 @@ import {
   ALL_EVIDENCE_FILTER,
   deviceLabel,
   documentApiSearchParams,
+  documentDeviceOptions,
+  documentFilterParams,
   documentTypeLabel,
   isEpsonDailyReport,
   selectedDocumentScope,
@@ -108,6 +111,7 @@ export function DocumentsPage() {
   const limit = Number(params.get('limit') ?? 25)
   const offset = Number(params.get('offset') ?? 0)
   const selectedType = params.get('type') === ALL_EVIDENCE_FILTER ? '' : params.get('type') ?? ''
+  const selectedDeviceId = params.get('device_id') ?? ''
   const documentScope = selectedDocumentScope(params)
   const apiParams = documentApiSearchParams(params)
   if (!apiParams.has('limit')) apiParams.set('limit', String(limit))
@@ -117,6 +121,7 @@ export function DocumentsPage() {
     queryFn: () => api<Page<DocumentRecord>>(`/documents?${apiParams.toString()}`),
   })
   const devices = useQuery({ queryKey: scopedQueryKey('devices'), queryFn: () => api<Device[]>('/devices'), staleTime: 30_000 })
+  const availableDevices = documentDeviceOptions(devices.data, selectedDeviceId)
   const visibleDocuments = query.data?.items ?? []
   const scopeMatches = documentsMatchScope(visibleDocuments, documentScope)
   const [columnOrder, setColumnOrder] = useState<DocumentColumnId[]>(initialColumnOrder)
@@ -214,11 +219,7 @@ export function DocumentsPage() {
   }
 
   function filter(key: string, value: string) {
-    const next = new URLSearchParams(params)
-    value ? next.set(key, value) : next.delete(key)
-    next.set('offset', '0')
-    next.set('limit', String(limit))
-    setParams(next)
+    setParams(documentFilterParams(params, key, value, limit))
   }
 
   function setDocumentScope(value: DocumentScope) {
@@ -252,12 +253,14 @@ export function DocumentsPage() {
             </MenuItem>)}
           </Select>
         </FormControl>
-        <TextField
-          size="small"
-          label="Dispositivo"
-          value={params.get('device_id') ?? ''}
-          onChange={(event) => filter('device_id', event.target.value)}
-        />
+        <FormControl size="small" disabled={devices.isLoading && !devices.data} error={Boolean(devices.error)}>
+          <InputLabel id="document-device-label">Dispositivo</InputLabel>
+          <Select labelId="document-device-label" label="Dispositivo" value={selectedDeviceId} onChange={(event) => filter('device_id', String(event.target.value))}>
+            <MenuItem value="">Tutti i dispositivi</MenuItem>
+            {availableDevices.map((device) => <MenuItem key={device.id} value={device.id}>{device.label}{device.label !== device.id ? ` · ${device.id}` : ''}</MenuItem>)}
+          </Select>
+          {devices.error && <FormHelperText>Elenco dispositivi non disponibile</FormHelperText>}
+        </FormControl>
         <TextField
           size="small"
           label="Codice ordine"

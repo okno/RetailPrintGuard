@@ -5,6 +5,13 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.5.6] — 2026-11-21
+
+### Fixed
+
+- La ricerca nella pagina Documenti permette di scegliere il dispositivo per nome,
+  conserva il filtro nei link e azzera la paginazione al cambio di selezione.
+
 ## [0.5.5] — 2026-11-19
 
 ### Added

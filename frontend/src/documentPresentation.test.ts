@@ -4,6 +4,8 @@ import {
   confidencePercent,
   deviceLabel,
   documentApiSearchParams,
+  documentDeviceOptions,
+  documentFilterParams,
   documentLinePrice,
   documentPreviewTabLabel,
   documentTypeLabel,
@@ -88,5 +90,37 @@ describe('primary document presentation', () => {
     expect(params.get('document_scope')).toBe('complete')
     expect(params.get('type')).toBe('SHIFT_END_REPORT')
     expect(params.get('device_id')).toBe('epson_reception')
+  })
+
+  it('offers real devices by display name and retains a saved ID until devices load', () => {
+    const devices = [
+      { id: 'epson_reception', name: 'Epson', display_name: 'Fiscale reception' },
+      { id: 'rch_bar', name: 'Cassa bar' },
+    ]
+    expect(documentDeviceOptions(devices, 'epson_reception')).toEqual([
+      { id: 'epson_reception', label: 'Fiscale reception' },
+      { id: 'rch_bar', label: 'Cassa bar' },
+    ])
+    expect(documentDeviceOptions(undefined, 'legacy_device')).toEqual([
+      { id: 'legacy_device', label: 'legacy_device' },
+    ])
+    expect(documentDeviceOptions(devices, 'legacy_device')[0]).toEqual({
+      id: 'legacy_device', label: 'legacy_device',
+    })
+  })
+
+  it('selects and clears a device without losing the other document filters', () => {
+    const original = new URLSearchParams('type=SHIFT_END_REPORT&document_scope=complete&order_code=A-1&offset=50&limit=25')
+    const selected = documentFilterParams(original, 'device_id', 'epson_reception', 25)
+    expect(selected.get('device_id')).toBe('epson_reception')
+    expect(selected.get('type')).toBe('SHIFT_END_REPORT')
+    expect(selected.get('order_code')).toBe('A-1')
+    expect(selected.get('offset')).toBe('0')
+    expect(documentApiSearchParams(selected).get('device_id')).toBe('epson_reception')
+    expect(original.has('device_id')).toBe(false)
+    const cleared = documentFilterParams(selected, 'device_id', '', 25)
+    expect(cleared.has('device_id')).toBe(false)
+    expect(cleared.get('type')).toBe('SHIFT_END_REPORT')
+    expect(cleared.get('order_code')).toBe('A-1')
   })
 })

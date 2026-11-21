@@ -42,6 +42,26 @@ export function deviceLabel(value: string, devices?: readonly Pick<Device, 'id' 
   return device?.display_name?.trim() || device?.name?.trim() || value
 }
 
+export function documentDeviceOptions(
+  devices: readonly Pick<Device, 'id' | 'name' | 'display_name'>[] | undefined,
+  selectedId: string,
+) {
+  const options = (devices ?? []).map((device) => ({ id: device.id, label: deviceLabel(device.id, devices) }))
+  // Keep a saved filter selectable while the device list loads or if the device was removed.
+  if (selectedId && !options.some((option) => option.id === selectedId)) {
+    options.unshift({ id: selectedId, label: selectedId })
+  }
+  return options
+}
+
+export function documentFilterParams(params: URLSearchParams, key: string, value: string, limit: number) {
+  const next = new URLSearchParams(params)
+  value ? next.set(key, value) : next.delete(key)
+  next.set('offset', '0')
+  next.set('limit', String(limit))
+  return next
+}
+
 export function documentTimestampEvidenceLabel(value?: string) {
   if (value === 'RCH_PRINTED_TEXT') return 'Stampata dalla cassa RCH'
   if (value === 'ESC_POS_PRINTED_OPERATOR_LINE') return 'Stampata sulla comanda POS'
