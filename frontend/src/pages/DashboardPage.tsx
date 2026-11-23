@@ -1,5 +1,6 @@
 import {
   AssignmentLateOutlined,
+  AccessTimeOutlined,
   ArrowForwardOutlined,
   DescriptionOutlined,
   DevicesOutlined,
@@ -12,6 +13,7 @@ import {
   RestaurantOutlined,
   ShieldOutlined,
   WarningAmberOutlined,
+  UpdateOutlined,
 } from '@mui/icons-material'
 import { Alert, Box, Button, Card, CardContent, Chip, Grid, LinearProgress, List, ListItem, ListItemText, Paper, Stack, Typography } from '@mui/material'
 import { alpha, useTheme } from '@mui/material/styles'
@@ -104,6 +106,8 @@ export function DashboardPage() {
       </Box>
       <Grid container spacing={2.2}>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Documenti completi" value={documentCount} helper={`${preBills} preconti completi nel periodo`} icon={<DescriptionOutlined />} to={routeWithPeriod('/documenti', period, { document_scope: 'complete' })} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Primo documento acquisito" value={data.first_document_captured_at ? shortDateTime.format(new Date(data.first_document_captured_at)) : 'Nessun documento'} helper="Data e ora di acquisizione · ora italiana" icon={<AccessTimeOutlined />} to={routeWithPeriod('/documenti', period, { document_scope: 'all' })} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ultimo documento acquisito" value={data.last_document_captured_at ? shortDateTime.format(new Date(data.last_document_captured_at)) : 'Nessun documento'} helper="Data e ora di acquisizione · ora italiana" icon={<UpdateOutlined />} to={routeWithPeriod('/documenti', period, { document_scope: 'all' })} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Segnalazioni operative" value={operationalAlerts} helper={`${data.critical_alerts} critiche; consultazione di supporto`} icon={<ShieldOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con possibile ammanco" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ammanco potenziale totale" value={euros.format(Number(economicDifference))} helper="somma unica degli episodi del periodo" icon={<EuroOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>

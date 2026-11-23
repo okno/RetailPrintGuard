@@ -26,4 +26,10 @@ describe('period filters in Europe/Rome', () => {
     expect(result.get('from')).toMatch(/Z$/)
     expect(result.get('to')).toMatch(/Z$/)
   })
+
+  it('sends no date bounds for an explicit all-history dashboard selection', () => {
+    const result = apiPeriodParams(new URLSearchParams('period=all'), 'week')
+    expect(result.has('from')).toBe(false)
+    expect(result.has('to')).toBe(false)
+  })
 })

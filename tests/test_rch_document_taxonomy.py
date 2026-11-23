@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -62,7 +63,92 @@ def test_shift_end_report_signature_wins_over_aggregate_invoice_row() -> None:
     assert document.type is DocumentType.SHIFT_END_REPORT
     assert document.subtype == "RCH_REPORT_FINE_TURNO_LITERAL"
     assert document.parse_confidence == 98
-    assert document.parser_version == PARSER_VERSION == "1.7.1"
+    assert document.parser_version == PARSER_VERSION == "1.7.2"
+
+
+def test_shift_end_report_sums_all_observed_payment_methods() -> None:
+    document = _management_document(
+        "Report di fine turno",
+        "Pagamenti",
+        "                         EURO",
+        "Contanti               320,00",
+        "Bancomat               288,50",
+        "Carta di credito       150,00",
+        "Addebito in camera      50,00",
+        "----------------------------",
+        "Libro cassa",
+        "                         EURO",
+        "Contanti               999,00",
+    )
+
+    assert document.type is DocumentType.SHIFT_END_REPORT
+    assert document.gross_total == document.net_total == Decimal("808.50")
+    assert [(payment.method, payment.amount) for payment in document.payments] == [
+        ("CONTANTI", Decimal("320.00")),
+        ("BANCOMAT", Decimal("288.50")),
+        ("CARTA DI CREDITO", Decimal("150.00")),
+        ("ADDEBITO IN CAMERA", Decimal("50.00")),
+    ]
+    assert (
+        document.raw_metadata["shift_end_payment_total_evidence"]
+        == "RCH_PRINTED_PAYMENT_SECTION_SUM"
+    )
+
+
+def test_shift_end_report_sums_repeated_methods_without_counting_summary() -> None:
+    document = _management_document(
+        "Report di fine turno",
+        "Pagamenti",
+        "EURO",
+        "Contanti 40,00",
+        "Contanti 30,00",
+        "Bancomat 51,80",
+        "TOTALE PAGAMENTI 121,80",
+        "----------------------------",
+        "Libro cassa",
+        "Contanti 500,00",
+    )
+
+    assert document.gross_total == Decimal("121.80")
+    assert [payment.amount for payment in document.payments] == [
+        Decimal("40.00"),
+        Decimal("30.00"),
+        Decimal("51.80"),
+    ]
+
+
+def test_shift_end_report_without_bounded_payments_keeps_existing_total() -> None:
+    without_payments = _management_document(
+        "Report di fine turno",
+        "Scontrini 10,00",
+        "Fatture 5,00",
+    )
+    without_end = _management_document(
+        "Report di fine turno",
+        "Pagamenti",
+        "Contanti 70,00",
+        "Bancomat 51,80",
+    )
+
+    assert without_payments.gross_total == Decimal("5.00")
+    assert without_end.gross_total == Decimal("51.80")
+    assert without_payments.raw_metadata["shift_end_payment_total_evidence"] is None
+    assert without_end.raw_metadata["shift_end_payment_total_evidence"] is None
+
+
+def test_management_document_does_not_sum_shift_end_payment_rows() -> None:
+    document = _management_document(
+        "Riepilogo gestionale",
+        "Pagamenti",
+        "Contanti 70,00",
+        "Bancomat 51,80",
+        "Libro cassa",
+        "Contanti 500,00",
+    )
+
+    assert document.type is DocumentType.MANAGEMENT_DOCUMENT
+    assert document.gross_total == Decimal("500.00")
+    assert document.raw_metadata["shift_end_payment_total_evidence"] is None
 
 
 def test_invoice_requires_a_strong_singular_document_signature() -> None:

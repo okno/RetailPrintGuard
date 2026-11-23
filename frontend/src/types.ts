@@ -93,6 +93,8 @@ export interface Dashboard {
   excluded_evidence?: number
   total_evidence?: number
   complete_document_type_counts?: Record<string, number>
+  first_document_captured_at?: string | null
+  last_document_captured_at?: string | null
   orders: number
   pre_bills: number
   management_documents: number

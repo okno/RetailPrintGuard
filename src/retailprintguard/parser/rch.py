@@ -23,7 +23,7 @@ from retailprintguard.common.domain import (
 )
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.7.1"
+PARSER_VERSION = "1.7.2"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -90,6 +90,11 @@ _BARE_RCH_SERIAL_RE = re.compile(r"^\s*(?P<value>[A-Z0-9]{8,32})\s*$", re.IGNORE
 _SHIFT_END_REPORT_HEADER_RE = re.compile(
     r"^\s*REPORT\s+DI\s+FINE\s+TURNO\b",
     re.IGNORECASE,
+)
+_SHIFT_END_PAYMENTS_HEADER_RE = re.compile(r"^\s*PAGAMENTI\s*:?\s*$", re.IGNORECASE)
+_SHIFT_END_PAYMENTS_END_RE = re.compile(r"^\s*LIBRO\s+CASSA\b", re.IGNORECASE)
+_SHIFT_END_PAYMENT_SUMMARY_RE = re.compile(
+    r"^\s*(?:TOT(?:ALE)?|SUBTOTALE|RESTO)\b", re.IGNORECASE
 )
 _INVOICE_HEADER_RE = re.compile(
     r"^\s*FATTURA(?:\s+ELETTRONICA)?\s*$",
@@ -359,6 +364,43 @@ def _management_document_classification(
         for line in lines
     ):
         return DocumentType.INVOICE, "RCH_FATTURA_LITERAL", 96
+    return None
+
+
+def _shift_end_report_payments(texts: list[str]) -> tuple[PaymentRecord, ...] | None:
+    """Read the observed payment section without including the cashbook below it.
+
+    A shift report is an aggregate document. Its last printed amount is often
+    the last payment method, not the total. Only a bounded ``PAGAMENTI`` to
+    ``LIBRO CASSA`` section supports summing its individual methods.
+    """
+
+    in_payments = False
+    payments: list[PaymentRecord] = []
+    for text in texts:
+        if not in_payments:
+            if _SHIFT_END_PAYMENTS_HEADER_RE.fullmatch(text):
+                in_payments = True
+            continue
+        if _SHIFT_END_PAYMENTS_END_RE.match(text):
+            return tuple(payments) if payments else None
+        amount_matches = list(_PRINTED_MONEY_RE.finditer(text))
+        if not amount_matches:
+            # Currency headings and separator rules carry no amount.
+            continue
+        amount_match = amount_matches[-1]
+        method = " ".join(text[: amount_match.start()].strip(" -:;").split())
+        if not method or _SHIFT_END_PAYMENT_SUMMARY_RE.match(method):
+            continue
+        amount = _printed_money(amount_match.group("value"))
+        if amount is not None:
+            payments.append(
+                PaymentRecord(
+                    method=method.upper(),
+                    amount=amount,
+                    evidence=EvidenceLevel.INFERRED,
+                )
+            )
     return None
 
 
@@ -904,6 +946,7 @@ def _draft_document(
         printed_identity.application_timestamp_precision
         or printed_identity.footer_timestamp_precision
     )
+    shift_end_payment_total_evidence: str | None = None
     if draft.kind == "commercial":
         document_type = DocumentType.COMMERCIAL_DOCUMENT
         subtype = "RCH_COMMERCIALE_INFERRED"
@@ -944,13 +987,26 @@ def _draft_document(
             document_type = DocumentType.MANAGEMENT_DOCUMENT
             subtype = "RCH_GESTIONALE_INFERRED"
             confidence = 70
-        if draft.total is None:
-            values = [
-                _printed_money(match.group("value"))
-                for match in _PRINTED_MONEY_RE.finditer(text)
-            ]
-            draft.total = next((value for value in reversed(values) if value is not None), None)
-        payments = tuple(draft.payments)
+        shift_end_payments = (
+            _shift_end_report_payments(draft.texts)
+            if document_type is DocumentType.SHIFT_END_REPORT
+            else None
+        )
+        if shift_end_payments is not None:
+            draft.total = sum(
+                (payment.amount for payment in shift_end_payments),
+                Decimal("0.00"),
+            )
+            payments = shift_end_payments
+            shift_end_payment_total_evidence = "RCH_PRINTED_PAYMENT_SECTION_SUM"
+        else:
+            if draft.total is None:
+                values = [
+                    _printed_money(match.group("value"))
+                    for match in _PRINTED_MONEY_RE.finditer(text)
+                ]
+                draft.total = next((value for value in reversed(values) if value is not None), None)
+            payments = tuple(draft.payments)
     identifier = uuid5(
         NAMESPACE_URL,
         f"retailprintguard:rch:{job_id}:{draft.kind}:{draft.start_offset}:{source_hash}",
@@ -1063,6 +1119,7 @@ def _draft_document(
                 else "NOT_OBSERVED_IN_CAPTURE"
             ),
             "semantic_evidence": "INFERRED_FROM_CAPTURE",
+            "shift_end_payment_total_evidence": shift_end_payment_total_evidence,
             "quantity_context_observations": quantity_observations,
             "economic_close": (
                 draft.kind == "management"

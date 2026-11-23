@@ -116,6 +116,31 @@ def test_dashboard_classification_matches_documents_and_keeps_global_coverage(di
     assert empty.available_data_from == NOW and empty.available_data_to == NOW
 
 
+def test_dashboard_capture_bounds_follow_selected_period_and_all_history(discount_repo):
+    repo, factory, ids = discount_repo
+    technical = _add_document(factory, ids, "DEVICE_RESPONSE", "ON00000000")
+    first = _add_document(factory, ids, "COMMERCIAL_DOCUMENT", "Articolo 1,00")
+    last_partial = _discount(factory, ids, complete=False)
+    with factory.begin() as session:
+        session.get(Document, technical).captured_at = NOW - timedelta(days=4)
+        session.get(Document, first).captured_at = NOW - timedelta(days=3)
+        session.get(Document, last_partial).captured_at = NOW + timedelta(days=2)
+
+    all_history = repo.dashboard()
+    assert all_history.first_document_captured_at == NOW - timedelta(days=3)
+    assert all_history.last_document_captured_at == NOW + timedelta(days=2)
+    assert all_history.available_data_from == NOW - timedelta(days=4)
+
+    selected = repo.dashboard(filters={"from": NOW, "to": NOW + timedelta(days=2)})
+    assert selected.first_document_captured_at == NOW
+    assert selected.last_document_captured_at == NOW
+
+    empty = repo.dashboard(filters={"from": NOW + timedelta(days=3)})
+    assert empty.first_document_captured_at is None
+    assert empty.last_document_captured_at is None
+    assert empty.available_data_to == NOW + timedelta(days=2)
+
+
 def test_discount_route_validates_period_roles_and_pagination(discount_repo):
     repo, factory, ids = discount_repo
     _discount(factory, ids)

@@ -5,6 +5,18 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.5.7] — 2026-11-23
+
+### Added
+
+- La dashboard mostra data e ora del primo e dell'ultimo documento acquisito
+  nel periodo selezionato, compreso l'intero storico.
+
+### Fixed
+
+- Il totale dei report RCH di fine turno somma le voci monetarie osservate
+  pertinenti, senza usare soltanto l'ultimo importo stampato.
+
 ## [0.5.6] — 2026-11-21
 
 ### Fixed

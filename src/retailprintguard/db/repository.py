@@ -1455,7 +1455,7 @@ class SqlAlchemyApiRepository:
                 Document.document_type,
             ).label("document_type")
             selected_documents = (
-                select(semantic_type)
+                select(semantic_type, Document.captured_at.label("captured_at"))
                 .select_from(DocumentVersion)
                 .join(Document, Document.id == DocumentVersion.document_id)
                 .where(
@@ -1465,6 +1465,12 @@ class SqlAlchemyApiRepository:
                 )
                 .subquery()
             )
+            first_document_at, last_document_at = session.execute(
+                select(
+                    func.min(selected_documents.c.captured_at),
+                    func.max(selected_documents.c.captured_at),
+                )
+            ).one()
             type_counts = dict(
                 session.execute(
                     select(selected_documents.c.document_type, func.count()).group_by(
@@ -1715,6 +1721,8 @@ class SqlAlchemyApiRepository:
                 excluded_evidence=category_counts["excluded"],
                 total_evidence=sum(category_counts.values()),
                 complete_document_type_counts=complete_type_counts,
+                first_document_captured_at=first_document_at,
+                last_document_captured_at=last_document_at,
                 available_data_from=available_from,
                 available_data_to=available_to,
                 documents=documents,

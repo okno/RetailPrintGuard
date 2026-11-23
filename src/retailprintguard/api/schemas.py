@@ -116,6 +116,8 @@ class DashboardView(BaseModel):
     excluded_evidence: int = 0
     total_evidence: int = 0
     complete_document_type_counts: dict[str, int] = Field(default_factory=dict)
+    first_document_captured_at: datetime | None = None
+    last_document_captured_at: datetime | None = None
     available_data_from: datetime | None = None
     available_data_to: datetime | None = None
 
