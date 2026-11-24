@@ -1834,6 +1834,17 @@ class FraudEngine:
             for line in document.lines:
                 if (document.id, line.sequence) in authorized_lines:
                     continue
+                if (
+                    line.state == "SUBTOTAL_DISCOUNT"
+                    and line.discount is not None
+                    and line.discount > ZERO
+                    and line.line_total == -line.discount
+                    and line.quantity is None
+                    and line.unit_price is None
+                    and line.modified_unit_price is None
+                ):
+                    # A reconciled, typed fiscal subtotal adjustment is not an item.
+                    continue
                 effective_unit_price = (
                     line.modified_unit_price
                     if line.modified_unit_price is not None

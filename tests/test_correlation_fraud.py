@@ -135,6 +135,43 @@ def test_zero_value_line_without_description_does_not_abort_fraud_run() -> None:
     assert "NEGATIVE_OR_ZERO_VALUE_ITEM" in {finding.rule_code for finding in findings}
 
 
+def test_reconciled_epson_subtotal_discount_is_not_a_negative_item() -> None:
+    document = _document(
+        "synthetic-epson-subtotal-adjustment",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "3.50",
+        (
+            DocumentLine(
+                sequence=1,
+                description="Bevanda sintetica",
+                quantity=Decimal("1"),
+                unit_price=Decimal("5.00"),
+                line_total=Decimal("5.00"),
+                state="SALE_ITEM",
+            ),
+            DocumentLine(
+                sequence=2,
+                description="Sconto dipendenti 30%",
+                discount=Decimal("1.50"),
+                line_total=Decimal("-1.50"),
+                state="SUBTOTAL_DISCOUNT",
+            ),
+        ),
+        minute=0,
+        device="epson_synthetic",
+        external_code=None,
+    )
+    transaction = CorrelationEngine().correlate((document,))[0]
+    codes = {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+        )
+    }
+    assert "NEGATIVE_OR_ZERO_VALUE_ITEM" not in codes
+    assert "EXTREME_PRINTED_DISCOUNT" not in codes
+
+
 def test_printed_management_subtotal_discount_above_90_percent_is_alerted() -> None:
     def receipt(name: str, products: tuple[str, ...], discount: str, total: str):
         basis = sum((Decimal(item) for item in products), Decimal("0.00"))

@@ -5,6 +5,14 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.5.10] — 2026-11-24
+
+### Fixed
+
+- La regola sugli articoli a valore nullo o negativo esclude gli sconti di
+  subtotale Epson strutturati e riconciliati, senza nascondere gli articoli
+  effettivamente anomali o gli sconti superiori al 90%.
+
 ## [0.5.9] — 2026-11-24
 
 ### Fixed
