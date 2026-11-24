@@ -21,8 +21,11 @@ import {
   deviceLabel,
   documentLinePrice,
   documentPreviewTabLabel,
+  documentServiceMode,
+  documentServiceModeLabel,
   documentTypeLabel,
   isEpsonDailyReport,
+  serviceModeEvidenceLabel,
 } from '../documentPresentation'
 import {
   RECEIPT_HEADER_NOT_AVAILABLE,
@@ -204,6 +207,18 @@ export function DocumentDetailPage() {
           <ReceiptHeaderDetails document={doc} />
           <Typography variant="h2" sx={{ mb: 2 }}>Provenienza</Typography>
           <StatusChip value={doc.complete ? 'COMPLETE' : 'INCOMPLETE'} />
+          {documentServiceModeLabel(doc) && <Chip
+            size="small"
+            variant="outlined"
+            sx={{ ml: 1 }}
+            label={documentServiceModeLabel(doc)}
+            color={documentServiceMode(doc) === 'DINE_IN' ? 'success' : documentServiceMode(doc) === 'TAKEAWAY' ? 'info' : 'default'}
+          />}
+          {documentServiceModeLabel(doc) && <ProvenanceValue
+            label="Modalità di servizio"
+            value={documentServiceModeLabel(doc)}
+            provenance={serviceModeEvidenceLabel(doc)}
+          />}
           <ProvenanceValue
             label="Ora documento"
             value={doc.document_timestamp ? formatDocumentDateTime(doc.document_timestamp, doc.document_timestamp_precision) : NOT_OBSERVED_IN_FLOW}

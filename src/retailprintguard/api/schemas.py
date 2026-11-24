@@ -102,8 +102,17 @@ class DashboardView(BaseModel):
     false_positive_alerts: int = 0
     justified_alerts: int = 0
     sold_product_quantity_bar: Decimal = Decimal("0")
+    sold_product_quantity_bar_dine_in: Decimal = Decimal("0")
+    sold_product_quantity_bar_takeaway: Decimal = Decimal("0")
+    sold_product_quantity_bar_undetermined: Decimal = Decimal("0")
     sold_product_quantity_kitchen: Decimal = Decimal("0")
+    sold_product_quantity_kitchen_dine_in: Decimal = Decimal("0")
+    sold_product_quantity_kitchen_takeaway: Decimal = Decimal("0")
+    sold_product_quantity_kitchen_undetermined: Decimal = Decimal("0")
     sold_product_quantity_pizzeria: Decimal = Decimal("0")
+    sold_product_quantity_pizzeria_dine_in: Decimal = Decimal("0")
+    sold_product_quantity_pizzeria_takeaway: Decimal = Decimal("0")
+    sold_product_quantity_pizzeria_undetermined: Decimal = Decimal("0")
     employee_discount_total: Decimal = Decimal("0")
     observed_employee_discount_total: Decimal = Decimal("0")
     observed_employee_discount_count: int = 0
@@ -274,6 +283,8 @@ class DocumentView(BaseModel):
     external_code: str | None = None
     order_code: str | None = None
     table_code: str | None = None
+    service_mode: Literal["DINE_IN", "TAKEAWAY", "UNDETERMINED"] | None = None
+    service_mode_evidence: str | None = None
     operator_code: str | None = None
     terminal_code: str | None = None
     receipt_header: ReceiptHeaderView | None = None

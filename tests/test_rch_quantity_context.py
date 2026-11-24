@@ -47,7 +47,7 @@ def test_quantity_explanation_preserves_both_raw_spans_without_double_counting()
     document, raw, frames = _parse(text)
     detail, product = document.lines[1:3]
 
-    assert document.parser_version == PARSER_VERSION == "1.7.2"
+    assert document.parser_version == PARSER_VERSION == "1.7.3"
     assert document.normalized_text == "\n".join(text)
     assert detail.raw_text == text[1] and detail.state == "QUANTITY_CONTEXT"
     assert detail.quantity is detail.unit_price is detail.line_total is None

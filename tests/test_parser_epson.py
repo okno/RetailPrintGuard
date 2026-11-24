@@ -46,6 +46,34 @@ REPORT_FIELDS = (
     "<zRepNumber>42</zRepNumber><dailyAmount>123,45</dailyAmount>"
 )
 
+RECEIPT_FIELDS = (
+    "<elementList>lastCommand,printerStatus,fiscalReceiptNumber,"
+    "fiscalReceiptAmount,fiscalReceiptDate,fiscalReceiptTime,zRepNumber</elementList>"
+    "<lastCommand>74</lastCommand><printerStatus>20010</printerStatus>"
+    "<fiscalReceiptNumber>1</fiscalReceiptNumber>"
+    "<fiscalReceiptAmount>3,50</fiscalReceiptAmount>"
+    "<fiscalReceiptDate>02/01/2042</fiscalReceiptDate>"
+    "<fiscalReceiptTime>14:37</fiscalReceiptTime>"
+    "<zRepNumber>42</zRepNumber><serialNumber>SYNTHETIC123</serialNumber>"
+)
+
+
+def _receipt_request(
+    *,
+    item: str = '<printRecItem operator="1" description="Articolo sintetico" quantity="1" '
+    'unitPrice="5,00" department="1"/>',
+    adjustment: str = '<printRecSubtotalAdjustment operator="1" '
+    'description="Sconto dipendenti 30% (-30%)" adjustmentType="1" amount="1,50"/>',
+    payment: str = '<printRecTotal operator="1" description="Contanti" '
+    'payment="3,50" paymentType="0"/>',
+    marker: str = '<printRecMessage operator="1" message="Tavolo: A-01"/>',
+) -> bytes:
+    return _http(_soap(
+        '<printerFiscalReceipt><beginFiscalReceipt operator="1"/>'
+        f'{item}{adjustment}{payment}{marker}'
+        '<endFiscalReceipt operator="1"/></printerFiscalReceipt>'
+    ))
+
 
 def _parse(request: bytes, response: bytes = b""):
     return epson.parse_epson(
@@ -53,6 +81,199 @@ def _parse(request: bytes, response: bytes = b""):
         job_id="job-synthetic", captured_at=NOW, manifest_sha256="a" * 64,
         source_path="/synthetic/client.raw", response_source_path="/synthetic/device.raw",
     )
+
+
+def test_confirmed_commercial_receipt_exposes_item_discount_payment_and_table():
+    request = _receipt_request()
+    response = _response(RECEIPT_FIELDS)
+    receipt, reverse = _parse(request, response)
+    assert receipt.type is DocumentType.COMMERCIAL_DOCUMENT
+    assert receipt.subtype == "EPSON_COMMERCIAL_SALE_SOAP_OBSERVED"
+    assert receipt.complete and receipt.status == "ACKNOWLEDGED"
+    assert receipt.gross_total == receipt.net_total == Decimal("3.50")
+    assert receipt.discount_total == Decimal("1.50")
+    assert receipt.external_document_code is None
+    assert receipt.external_document_code_suffix == "1"
+    assert receipt.document_timestamp is not None
+    assert receipt.document_timestamp.hour == 14
+    assert receipt.document_timestamp.minute == 37
+    assert receipt.document_timestamp != receipt.captured_at
+    assert receipt.receipt_header is None
+    assert receipt.table_code == "A-01" and receipt.order_code is None
+    assert receipt.raw_metadata["service_mode"] == "DINE_IN"
+    assert receipt.raw_metadata["service_mode_evidence"] == "EPSON_SOAP_PRINT_REC_MESSAGE_TABLE"
+    assert receipt.raw_metadata["text_projection"] == "RECONSTRUCTED_FROM_SOAP_NOT_PRINTED_TEXT"
+    assert receipt.raw_metadata["physical_delivery"] == "UNKNOWN"
+    assert receipt.raw_metadata["arithmetic_reconciled"] is True
+    assert receipt.raw_metadata["payment_reconciled"] is True
+    assert receipt.raw_metadata["subtotal_modifiers"] == [{
+        "sign": "-", "description": "Sconto dipendenti 30% (-30%)", "amount": "1.50",
+    }]
+    assert [(line.description, line.line_total) for line in receipt.lines] == [
+        ("Articolo sintetico", Decimal("5.00")),
+        ("Sconto dipendenti 30% (-30%)", Decimal("-1.50")),
+    ]
+    assert receipt.lines[1].discount == Decimal("1.50")
+    for line in receipt.lines:
+        assert line.source is not None and line.source.direction == "CLIENT_TO_DEVICE"
+        assert request[line.source.offset:line.source.offset + line.source.length].startswith(
+            b"<printRec"
+        )
+    assert receipt.payments[0].method == "CONTANTI"
+    assert receipt.payments[0].amount == Decimal("3.50")
+    assert "Sconto dipendenti 30% (-30%)" in receipt.normalized_text
+    assert "Tavolo: A-01" in receipt.normalized_text
+    assert "DATI SOAP" in receipt.normalized_text
+    assert reverse.type is DocumentType.DEVICE_RESPONSE
+    assert classify_pdf_document(receipt).category == "complete"
+    assert _parse(request, response) == (receipt, reverse)
+
+
+def test_two_fiscal_receipts_in_one_capture_remain_distinct_and_takeaway_is_structured():
+    request = _receipt_request(
+        item=(
+            '<printRecItem description="Prodotto sintetico A" quantity="1" unitPrice="2,00"/>'
+            '<printRecItem description="Prodotto sintetico B" quantity="1" unitPrice="2,00"/>'
+        ),
+        adjustment="",
+        payment='<printRecTotal description="Contanti" payment="4,00" paymentType="0"/>',
+        marker='<printRecMessage message="Ordine: ORD-TEST-7"/>',
+    )
+    response = _response(RECEIPT_FIELDS.replace("3,50", "4,00"))
+    first, second, reverse = _parse(request * 2, response * 2)
+    assert first.type is second.type is DocumentType.COMMERCIAL_DOCUMENT
+    assert first.id != second.id
+    assert first.gross_total == second.gross_total == Decimal("4.00")
+    assert first.discount_total == second.discount_total == 0
+    assert first.order_code == second.order_code == "ORD-TEST-7"
+    assert first.table_code is second.table_code is None
+    assert first.raw_metadata["service_mode"] == second.raw_metadata["service_mode"] == "TAKEAWAY"
+    assert second.raw_metadata["raw_offset"] == len(request)
+    assert second.lines[0].source.offset > len(request)
+    assert reverse.type is DocumentType.DEVICE_RESPONSE
+
+
+@pytest.mark.parametrize("response", [
+    b"", _response(RECEIPT_FIELDS, success="false"),
+    _response(RECEIPT_FIELDS, status=500),
+    _response(RECEIPT_FIELDS.replace("3,50", "NaN")),
+    _response(RECEIPT_FIELDS.replace("<fiscalReceiptNumber>1</fiscalReceiptNumber>",
+                                     "<fiscalReceiptNumber></fiscalReceiptNumber>")),
+])
+def test_unconfirmed_or_invalid_fiscal_response_does_not_create_sale(response):
+    record = _parse(_receipt_request(), response)[0]
+    assert record.type is DocumentType.UNKNOWN
+    assert record.gross_total is None
+    assert record.lines == record.payments == ()
+    assert not record.complete
+
+
+def test_inconsistent_fiscal_arithmetic_is_visible_as_partial_not_confirmed_sale():
+    receipt = _parse(_receipt_request(), _response(RECEIPT_FIELDS.replace(
+        "<fiscalReceiptAmount>3,50</fiscalReceiptAmount>",
+        "<fiscalReceiptAmount>3,51</fiscalReceiptAmount>",
+    )))[0]
+    assert receipt.type is DocumentType.COMMERCIAL_DOCUMENT
+    assert not receipt.complete
+    assert receipt.gross_total == Decimal("3.51")
+    assert "receipt_item_adjustment_total_mismatch" in receipt.warnings
+    assert "receipt_payment_total_mismatch_or_change" in receipt.warnings
+    assert classify_pdf_document(receipt).category == "partial"
+
+
+def test_documented_zero_payment_uses_confirmed_fiscal_total_only_for_one_payment():
+    receipt = _parse(_receipt_request(
+        payment='<printRecTotal description="Contanti" payment="0" paymentType="0"/>',
+    ), _response(RECEIPT_FIELDS))[0]
+    assert receipt.type is DocumentType.COMMERCIAL_DOCUMENT
+    assert receipt.complete
+    assert receipt.payments[0].amount == Decimal("3.50")
+    assert receipt.raw_metadata["zero_payment_interpreted_from_response"] is True
+
+
+def test_unsupported_void_command_does_not_invent_sale_or_discount():
+    request = _receipt_request(
+        item=(
+            '<printRecItem description="Prodotto sintetico" quantity="1" unitPrice="5,00"/>'
+            '<printRecItemVoid operator="1"/>'
+        ),
+    )
+    record = _parse(request, _response(RECEIPT_FIELDS))[0]
+    assert record.type is DocumentType.UNKNOWN
+    assert record.gross_total is None
+    assert record.lines == record.payments == ()
+    assert not record.complete
+
+
+@pytest.mark.parametrize("command", [
+    '<printRecItemAdjustment adjustmentType="1" amount="0,50"/>',
+    '<printRecSubtotalAdjustment description="Rettifica sintetica" '
+    'adjustmentType="99" amount="0,50"/>',
+])
+def test_unknown_economic_command_or_adjustment_type_fails_closed(command):
+    request = _receipt_request(item=(
+        '<printRecItem description="Articolo sintetico" quantity="1" unitPrice="5,00"/>'
+        + command
+    ))
+    record = _parse(request, _response(RECEIPT_FIELDS))[0]
+    assert record.type is DocumentType.UNKNOWN
+    assert record.gross_total is None and not record.lines and not record.payments
+    assert not record.complete
+    assert any("receipt_" in warning for warning in record.warnings)
+
+
+@pytest.mark.parametrize("item,adjustment,payment,expected_warning", [
+    (
+        '<printRecItem description="Sintetico" quantity="oops" unitPrice="5,00"/>',
+        "", '<printRecTotal description="Contanti" payment="3,50" paymentType="0"/>',
+        "receipt_invalid_decimal",
+    ),
+    (
+        '<printRecItem description="Sintetico" quantity="999999999" '
+        'unitPrice="999999999999"/>',
+        "", '<printRecTotal description="Contanti" payment="3,50" paymentType="0"/>',
+        "receipt_amount_model_limit",
+    ),
+    (
+        '<printRecItem description="Sintetico" quantity="1" unitPrice="5,00"/>',
+        '<printRecSubtotalAdjustment description="Sconto sintetico" '
+        'adjustmentType="1" amount="NaN"/>',
+        '<printRecTotal description="Contanti" payment="3,50" paymentType="0"/>',
+        "receipt_invalid_decimal",
+    ),
+])
+def test_malformed_or_overflowing_economics_are_opaque_without_worker_error(
+    item, adjustment, payment, expected_warning,
+):
+    record = _parse(_receipt_request(
+        item=item, adjustment=adjustment, payment=payment,
+    ), _response(RECEIPT_FIELDS))[0]
+    assert record.type is DocumentType.UNKNOWN
+    assert record.gross_total is None and not record.lines and not record.payments
+    assert not record.complete
+    assert expected_warning in record.warnings
+
+
+def test_ambiguous_fiscal_clock_does_not_silently_pick_a_dst_fold():
+    fields = RECEIPT_FIELDS.replace("02/01/2042", "26/10/2042").replace(
+        "14:37", "02:30",
+    )
+    record = _parse(_receipt_request(), _response(fields))[0]
+    assert record.type is DocumentType.COMMERCIAL_DOCUMENT and record.complete
+    assert record.document_timestamp is None
+    assert "receipt_fiscal_datetime_ambiguous_dst" in record.warnings
+    assert record.raw_metadata["document_timestamp_evidence"] == (
+        "EPSON_SOAP_LOCAL_CLOCK_DST_UNRESOLVED"
+    )
+
+
+def test_receipt_command_count_limit_keeps_capture_opaque():
+    marker = '<printRecMessage message="Nota sintetica"/>'
+    request = _receipt_request(marker=marker * (epson.MAX_RECEIPT_COMMANDS + 1))
+    record = _parse(request, _response(RECEIPT_FIELDS))[0]
+    assert record.type is DocumentType.UNKNOWN
+    assert record.gross_total is None
+    assert "receipt_command_semantics_unsupported" in record.warnings
 
 
 def test_report_uses_canonical_model_and_both_raw_directions_without_network(monkeypatch):

@@ -111,6 +111,149 @@ def _document(
     )
 
 
+def test_printed_management_subtotal_discount_above_90_percent_is_alerted() -> None:
+    def receipt(name: str, products: tuple[str, ...], discount: str, total: str):
+        basis = sum((Decimal(item) for item in products), Decimal("0.00"))
+        entries = [
+            DocumentLine(
+                sequence=index,
+                description=f"Articolo sintetico {index}",
+                raw_text=f"Articolo sintetico {index}",
+                quantity=Decimal("1"),
+                unit_price=Decimal(amount),
+                line_total=Decimal(amount),
+            )
+            for index, amount in enumerate(products, 1)
+        ]
+        for label, amount in (
+            ("SUBTOT", basis),
+            ("Sconto 99%", Decimal(discount)),
+            ("TOT", Decimal(total)),
+        ):
+            entries.append(
+                DocumentLine(
+                    sequence=len(entries) + 1,
+                    description=label,
+                    raw_text=label,
+                    quantity=Decimal("1"),
+                    unit_price=amount,
+                    line_total=amount,
+                )
+            )
+        return _document(
+            name,
+            DocumentType.MANAGEMENT_DOCUMENT,
+            total,
+            tuple(entries),
+            minute=0,
+            device="rch_synthetic",
+            external_code=None,
+        )
+
+    for document, expected_basis, expected_discount in (
+        (
+            receipt("large-subtotal", ("10.00", "12.00", "18.00"), "-39.60", "0.40"),
+            "40.00",
+            "39.60",
+        ),
+        (
+            receipt("small-subtotal", ("20.00", "40.00"), "-59.40", "0.60"),
+            "60.00",
+            "59.40",
+        ),
+    ):
+        assert document.discount_total is None
+        transaction = CorrelationEngine().correlate((document,))[0]
+        alerts = [
+            item
+            for item in FraudEngine().evaluate(
+                FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+            )
+            if item.rule_code == "EXTREME_PRINTED_DISCOUNT"
+        ]
+        assert len(alerts) == 1
+        assert alerts[0].severity.value == "CRITICAL"
+        assert alerts[0].document_ids == (document.id,)
+        assert alerts[0].evidence[0]["discount_basis"] == expected_basis
+        assert alerts[0].evidence[0]["discount_amount"] == expected_discount
+        assert alerts[0].evidence[0]["printed_rate_percent"] == "99"
+
+
+def test_printed_discount_threshold_is_strict_and_unreconciled_rows_do_not_alert() -> None:
+    def codes(
+        rate: str,
+        discount: str,
+        subtotal: str,
+        total: str,
+        document_type: DocumentType = DocumentType.MANAGEMENT_DOCUMENT,
+        subtotal_label: str = "SUBTOT",
+    ) -> set[str]:
+        document = _document(
+            f"discount-boundary-{rate}-{subtotal}",
+            document_type,
+            total,
+            (
+                DocumentLine(
+                    sequence=1,
+                    description="Articolo sintetico",
+                    line_total=Decimal("100.00"),
+                ),
+                DocumentLine(sequence=2, description=subtotal_label, line_total=Decimal(subtotal)),
+                DocumentLine(
+                    sequence=3,
+                    description=f"Sconto {rate}%",
+                    line_total=Decimal(discount),
+                ),
+                DocumentLine(sequence=4, description="TOT", line_total=Decimal(total)),
+            ),
+            minute=0,
+            device="rch_synthetic",
+            external_code=None,
+        )
+        transaction = CorrelationEngine().correlate((document,))[0]
+        return {
+            finding.rule_code
+            for finding in FraudEngine().evaluate(
+                FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+            )
+        }
+
+    assert "EXTREME_PRINTED_DISCOUNT" not in codes("90", "-90.00", "100.00", "10.00")
+    assert "EXTREME_PRINTED_DISCOUNT" in codes("99", "-99.00", "100.00", "1.00")
+    assert "EXTREME_PRINTED_DISCOUNT" in codes(
+        "99", "-99.00", "100.00", "1.00", DocumentType.COMMERCIAL_DOCUMENT
+    )
+    assert "EXTREME_PRINTED_DISCOUNT" in codes(
+        "99", "-99.00", "100.00", "1.00", DocumentType.PRE_BILL, "SUB-TOTALE"
+    )
+    assert "EXTREME_PRINTED_DISCOUNT" not in codes("99", "-99.00", "101.00", "1.00")
+
+
+def test_fiscal_employee_30_percent_parenthesized_label_is_not_extreme() -> None:
+    fiscal = _document(
+        "synthetic-epson-employee-discount",
+        DocumentType.COMMERCIAL_DOCUMENT,
+        "7.00",
+        (
+            DocumentLine(sequence=1, description="Prodotto sintetico", line_total=Decimal("10.00")),
+            DocumentLine(
+                sequence=2,
+                description="Sconto dipendenti 30% (-30%)",
+                line_total=Decimal("-3.00"),
+            ),
+            DocumentLine(sequence=3, description="TOTALE", line_total=Decimal("7.00")),
+        ),
+        minute=0,
+        device="epson_synthetic",
+        external_code=None,
+    ).model_copy(update={"parser_name": "retailprintguard-epson-observed"})
+    transaction = CorrelationEngine().correlate((fiscal,))[0]
+    findings = FraudEngine().evaluate(
+        FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+    )
+    assert "EXTREME_PRINTED_DISCOUNT" not in {item.rule_code for item in findings}
+
+
 def test_scenario_a_100_to_50_creates_diff_and_explainable_high_alerts() -> None:
     prebill = _document(
         "a-prebill",
@@ -680,6 +823,7 @@ def _partial_employee_discount_documents(
     copy_total: str = "153.10",
     first_discount: str = "-30.00",
     table_code: str | None = "T-7",
+    discount_label: str = "SCONTO DIPENDENTI 30% [-30%]",
 ) -> tuple[NormalizedDocument, NormalizedDocument, NormalizedDocument]:
     base_lines = (
         DocumentLine(
@@ -749,13 +893,13 @@ def _partial_employee_discount_documents(
         _management_discount_line(1, "Articolo A", "100.00"),
         _management_discount_line(
             2,
-            "SCONTO DIPENDENTI 30% [-30%]",
+            discount_label,
             first_discount,
         ),
         _management_discount_line(3, "Articolo B", "93.00"),
         _management_discount_line(
             4,
-            "SCONTO DIPENDENTI 30% [-30%]",
+            discount_label,
             "-27.90",
         ),
         _management_discount_line(5, "Articolo C", "18.00"),
@@ -805,6 +949,22 @@ def test_partial_item_employee_discount_is_proven_by_strong_management_copy() ->
     assert {item["paired_item_sequence"] for item in authorization.observations} == {
         1,
         3,
+    }
+
+
+def test_parenthesized_employee_30_literal_keeps_existing_authorization_checks() -> None:
+    prebill, fiscal, management = _partial_employee_discount_documents(
+        discount_label="SCONTO DIPENDENTI 30% (-30%)"
+    )
+    transaction = CorrelationEngine().correlate((management, fiscal, prebill))[0]
+    authorization = authorized_employee_discount(transaction)
+    assert authorization is not None
+    assert authorization.discount_amount == Decimal("57.90")
+    assert "EXTREME_PRINTED_DISCOUNT" not in {
+        finding.rule_code
+        for finding in FraudEngine().evaluate(
+            FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+        )
     }
 
 
@@ -996,13 +1156,14 @@ def test_synthetic_post_prebill_change_35_to_non_fiscal_close_5_is_quantified() 
     assert "ORDER_WITHOUT_FISCAL_CLOSE" not in codes
 
 
-def test_all_sixteen_required_rules_are_versioned_and_registered() -> None:
+def test_all_required_rules_are_versioned_and_registered() -> None:
     expected = {
         "PREBILL_FISCAL_AMOUNT_DROP",
         "MODIFICA_POST_PRECONTO",
         "ITEM_REMOVED_AFTER_PREBILL",
         "PRICE_REDUCED_AFTER_PREBILL",
         "EXTREME_PRICE_CHANGE",
+        "EXTREME_PRINTED_DISCOUNT",
         "SAME_REFERENCE_DIFFERENT_AMOUNT",
         "ORDER_WITHOUT_FISCAL_CLOSE",
         "FISCAL_WITHOUT_SOURCE_ORDER",

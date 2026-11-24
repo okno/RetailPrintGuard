@@ -47,9 +47,12 @@ import {
   documentApiSearchParams,
   documentDeviceOptions,
   documentFilterParams,
+  documentServiceMode,
+  documentServiceModeLabel,
   documentTypeLabel,
   isEpsonDailyReport,
   selectedDocumentScope,
+  serviceModeEvidenceLabel,
 } from '../documentPresentation'
 import { DOCUMENT_SCOPE_LABELS, documentPdfLabel, documentReasonLabel, documentsMatchScope } from '../documentEligibility'
 import { formatDocumentDateTime, mediumDateTime as date } from '../format'
@@ -177,6 +180,14 @@ export function DocumentsPage() {
     if (column === 'type') return <>
       <strong>{documentTypeLabel(doc.type)}</strong>
       <br /><small>{doc.subtype.replaceAll('_', ' ')}</small>
+      {documentServiceModeLabel(doc) && <><br /><Chip
+        size="small"
+        variant="outlined"
+        sx={{ mt: 0.5 }}
+        label={documentServiceModeLabel(doc)}
+        color={documentServiceMode(doc) === 'DINE_IN' ? 'success' : documentServiceMode(doc) === 'TAKEAWAY' ? 'info' : 'default'}
+        title={serviceModeEvidenceLabel(doc)}
+      /></>}
     </>
     if (column === 'references') return <>
       {(doc.external_document_code ?? doc.external_code)

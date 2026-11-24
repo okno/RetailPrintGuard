@@ -64,6 +64,12 @@ def test_escpos_multiple_documents_and_controls_are_bounded_and_visible() -> Non
     assert documents[0].gross_total is not None
     assert documents[0].gross_total == 100
     assert documents[0].table_code == "T-9"
+    assert documents[0].raw_metadata["service_mode"] == "UNDETERMINED"
+    assert documents[0].raw_metadata["service_mode_evidence"] == (
+        "CONFLICTING_ORDER_AND_TABLE_MARKERS"
+    )
+    assert documents[1].raw_metadata["service_mode"] == "DINE_IN"
+    assert documents[1].order_code is None  # COMANDA document number is not an Ordine marker.
     assert "<ESC/POS:INIT>" in documents[0].normalized_text
     assert "<ESC/POS:CUT>" in documents[0].normalized_text
     assert documents[0].lines[0].source is not None
@@ -101,6 +107,7 @@ def test_rch_reconstructs_commercial_and_device_response_from_coalesced_stream()
 
     commercial = documents[0]
     assert commercial.type is DocumentType.COMMERCIAL_DOCUMENT
+    assert commercial.raw_metadata["service_mode"] == "UNDETERMINED"
     assert commercial.complete is True
     assert commercial.gross_total == 50
     assert commercial.table_code == "T-7"
@@ -594,6 +601,8 @@ def test_escpos_pos_ticket_recovers_table_quantity_course_and_wrapped_item() -> 
     assert document.gross_total is None
     assert document.raw_metadata["covers"] == 1
     assert document.raw_metadata["table_code_evidence"] == "ESC_POS_RASTER_OCR_INFERRED"
+    assert document.raw_metadata["service_mode"] == "DINE_IN"
+    assert document.raw_metadata["service_mode_evidence"] == "ESC_POS_RASTER_OCR_INFERRED"
     assert "<OCR:ESC_STAR:96.50>Tavolo: LAB-22</OCR:ESC_STAR>" in document.normalized_text
     assert len(document.lines) == 1
     assert document.lines[0].description == "Pietanza mista"

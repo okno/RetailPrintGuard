@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from retailprintguard.analysis.discounts import analyze_document_discounts
 from retailprintguard.common.domain import (
     NON_SALE_DOCUMENT_TYPES,
     AlertSeverity,
@@ -60,13 +61,15 @@ _MONEY_QUANTUM = Decimal("0.01")
 _RCH_CAPTURE_PARSER = "retailprintguard-rch-observed"
 _EMPLOYEE_DISCOUNT_LABEL_RE = re.compile(
     r"^SCONTO(?:\s+DIPENDENT(?:E|I))?\s+30(?:[,.]0+)?\s*%"
-    r"(?:\s*\[-30(?:[,.]0+)?%\])?$",
+    r"(?:\s*(?:\[\s*-30(?:[,.]0+)?\s*%\s*\]"
+    r"|\(\s*-30(?:[,.]0+)?\s*%\s*\)))?$",
     re.IGNORECASE,
 )
 _GENERIC_STRUCTURED_DISCOUNT_RE = re.compile(r"^SCONTO$", re.IGNORECASE)
 _EMPLOYEE_DISCOUNT_LITERAL_RE = re.compile(
     r"^\s*(?P<label>SCONTO(?:\s+DIPENDENT(?:E|I))?\s+30(?:[,.]0+)?\s*%)"
-    r"(?P<structured_suffix>\s*\[-30(?:[,.]0+)?%\])?"
+    r"(?P<structured_suffix>\s*(?:\[\s*-30(?:[,.]0+)?\s*%\s*\]"
+    r"|\(\s*-30(?:[,.]0+)?\s*%\s*\)))?"
     r"\s+(?P<amount>-\s*(?:\d{1,3}(?:[. ]\d{3})+|\d+)[,.]\d{2})\s*$",
     re.IGNORECASE,
 )
@@ -218,6 +221,11 @@ DEFAULT_RULES: tuple[RuleDefinition, ...] = (
         "EXTREME_PRICE_CHANGE",
         AlertSeverity.CRITICAL,
         minimum_percent=Decimal("70"),
+    ),
+    _rule(
+        "EXTREME_PRINTED_DISCOUNT",
+        AlertSeverity.CRITICAL,
+        minimum_percent=Decimal("90"),
     ),
     _rule(
         "SAME_REFERENCE_DIFFERENT_AMOUNT",
@@ -1030,6 +1038,7 @@ class FraudEngine:
             "ITEM_REMOVED_AFTER_PREBILL": self._item_removed,
             "PRICE_REDUCED_AFTER_PREBILL": self._price_reduced,
             "EXTREME_PRICE_CHANGE": self._extreme_price_change,
+            "EXTREME_PRINTED_DISCOUNT": self._extreme_printed_discount,
             "SAME_REFERENCE_DIFFERENT_AMOUNT": self._same_reference_different_amount,
             "ORDER_WITHOUT_FISCAL_CLOSE": self._order_without_fiscal_close,
             "FISCAL_WITHOUT_SOURCE_ORDER": self._fiscal_without_source_order,
@@ -1355,6 +1364,64 @@ class FraudEngine:
             evidence=tuple(extreme),
             score=min(100, 75 + int(highest / Decimal("5"))),
             confidence=92,
+        )
+
+    def _extreme_printed_discount(
+        self, context: FraudContext, rule: RuleDefinition
+    ) -> _FindingData | None:
+        """Flag a printed sale discount above the threshold without a prebill.
+
+        A management receipt can be the only captured sale document. Require
+        the printed percentage, negative discount amount, product basis and
+        final total to reconcile before issuing an operational alert.
+        """
+
+        threshold = _decimal(rule.parameters.get("minimum_percent"), "90")
+        evidence: list[dict[str, Any]] = []
+        involved: set[UUID] = set()
+        for document in context.transaction.documents:
+            if document.type not in {
+                DocumentType.PRE_BILL,
+                DocumentType.MANAGEMENT_DOCUMENT,
+                DocumentType.COMMERCIAL_DOCUMENT,
+            }:
+                continue
+            analysis = analyze_document_discounts(document)
+            if not analysis.arithmetic_reconciled:
+                continue
+            for observation in analysis.observations:
+                if (
+                    observation.rate_percent is None
+                    or observation.rate_percent <= threshold
+                    or not observation.arithmetic_verified
+                ):
+                    continue
+                involved.add(document.id)
+                evidence.append(
+                    {
+                        "kind": "extreme_printed_discount",
+                        "document_id": str(document.id),
+                        "document_type": document.type.value,
+                        "line_sequence": observation.sequence,
+                        "printed_rate_percent": str(observation.rate_percent),
+                        "discount_basis": str(observation.basis),
+                        "discount_amount": str(observation.amount),
+                        "document_total": str(_document_total(document)),
+                        "arithmetic_reconciled": True,
+                    }
+                )
+        if not evidence:
+            return None
+        return _FindingData(
+            description=f"Sconto stampato superiore al {threshold}%",
+            explanation=(
+                f"Rilevati {len(evidence)} sconti stampati oltre il {threshold}% "
+                "con base e totale riconciliati; richiedono revisione contabile."
+            ),
+            evidence=tuple(evidence),
+            score=min(100, 90 + 5 * len(evidence)),
+            confidence=95,
+            document_ids=tuple(sorted(involved, key=str)),
         )
 
     def _same_reference_different_amount(

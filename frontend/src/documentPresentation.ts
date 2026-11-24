@@ -1,4 +1,4 @@
-import type { Device, DocumentLine, DocumentScope } from './types'
+import type { Device, DocumentLine, DocumentRecord, DocumentScope } from './types'
 
 export const TECHNICAL_DOCUMENT_TYPE = 'DEVICE_RESPONSE'
 export const ALL_EVIDENCE_FILTER = '__ALL__'
@@ -23,6 +23,37 @@ const DOCUMENT_TYPE_LABELS: Record<string, string> = {
 
 export function documentTypeLabel(value: string) {
   return DOCUMENT_TYPE_LABELS[value] ?? value.replaceAll('_', ' ')
+}
+
+const SERVICE_MODE_DOCUMENT_TYPES = new Set([
+  'ORDER', 'ORDER_CHANGE', 'KITCHEN_ORDER', 'PRE_BILL',
+  'MANAGEMENT_DOCUMENT', 'COMMERCIAL_DOCUMENT',
+])
+
+export function documentServiceMode(document: Pick<DocumentRecord, 'type' | 'service_mode' | 'table_code' | 'order_code'>) {
+  if (!SERVICE_MODE_DOCUMENT_TYPES.has(document.type)) return undefined
+  if (document.service_mode) return document.service_mode
+  const table = Boolean(document.table_code?.trim())
+  const order = Boolean(document.order_code?.trim())
+  if (table && !order) return 'DINE_IN'
+  if (order && !table) return 'TAKEAWAY'
+  return 'UNDETERMINED'
+}
+
+export function documentServiceModeLabel(document: Pick<DocumentRecord, 'type' | 'service_mode' | 'table_code' | 'order_code'>) {
+  const mode = documentServiceMode(document)
+  return mode === 'DINE_IN' ? 'In sede (Tavolo)' : mode === 'TAKEAWAY' ? 'Asporto (Ordine)' : mode === 'UNDETERMINED' ? 'Non determinato' : undefined
+}
+
+export function serviceModeEvidenceLabel(document: Pick<DocumentRecord, 'service_mode_evidence'>) {
+  const evidence = document.service_mode_evidence
+  if (evidence?.startsWith('ESC_POS_RASTER_OCR')) return 'Tavolo letto tramite OCR della comanda'
+  if (evidence === 'EPSON_SOAP_PRINT_REC_MESSAGE_TABLE') return 'Tavolo osservato nel comando SOAP Epson'
+  if (evidence === 'CONFLICTING_ORDER_AND_TABLE_MARKERS') return 'Entrambi i riferimenti stampati: attribuzione non determinata'
+  if (evidence === 'NO_ORDER_OR_TABLE_MARKER') return 'Nessun riferimento Tavolo o Ordine osservato'
+  if (evidence === 'OBSERVED_TABLE_MARKER' || evidence === 'PLAIN_TEXT') return 'Riferimento Tavolo osservato nella stampa'
+  if (evidence === 'OBSERVED_ORDER_MARKER') return 'Riferimento Ordine osservato nella stampa'
+  return undefined
 }
 
 export function isEpsonDailyReport(document: Pick<{

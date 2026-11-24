@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
 
-DISCOUNT_ANALYSIS_VERSION = "rpg-observed-discounts-1.0.0"
+DISCOUNT_ANALYSIS_VERSION = "rpg-observed-discounts-1.1.0"
 _ZERO = Decimal("0")
 _CENT = Decimal("0.01")
 _MAX_LINES = 32_768
@@ -23,21 +23,24 @@ _QUANTITY = re.compile(
     r"(?P<unit>(?:\d{1,9}|\d{1,3}(?:\.\d{3}){1,3}),\d{2})\s*$"
 )
 _TOTAL = re.compile(r"^(?:TOT|TOTALE(?:\s+COMPLESSIVO)?)\s*[:.]?$", re.I)
+_SUBTOTAL = re.compile(r"^SUB(?:-?\s*)?TOT(?:AL[EI]?)?\s*[:.]?$", re.I)
 _DISCOUNT_WORD = re.compile(r"\bSCONT[OI]\b", re.I)
 _RATE = re.compile(r"(?<!\d)(\d{1,3}(?:[.,]\d{1,4})?)\s*%")
 _EMPLOYEE_LABEL = re.compile(
     r"SCONT[OI]\s+DIPENDENT[EI]\s+(?P<rate>\d{1,3}(?:[.,]\d{1,4})?)\s*%"
-    r"(?:\s*\[\s*-(?P<repeat>\d{1,3}(?:[.,]\d{1,4})?)\s*%\s*\])?",
+    r"(?:\s*(?:\[\s*-(?P<repeat_square>\d{1,3}(?:[.,]\d{1,4})?)\s*%\s*\]"
+    r"|\(\s*-(?P<repeat_round>\d{1,3}(?:[.,]\d{1,4})?)\s*%\s*\)))?",
     re.I,
 )
 _GENERIC_LABEL = re.compile(
     r"SCONT[OI]\s+(?P<rate>\d{1,3}(?:[.,]\d{1,4})?)\s*%"
-    r"(?:\s*\[\s*-(?P<repeat>\d{1,3}(?:[.,]\d{1,4})?)\s*%\s*\])?",
+    r"(?:\s*(?:\[\s*-(?P<repeat_square>\d{1,3}(?:[.,]\d{1,4})?)\s*%\s*\]"
+    r"|\(\s*-(?P<repeat_round>\d{1,3}(?:[.,]\d{1,4})?)\s*%\s*\)))?",
     re.I,
 )
 _MONEY_SUFFIX = re.compile(r"\s+(-\s*\d{1,9}(?:\.\d{3})*,\d{2})\s*$")
 _TECHNICAL = re.compile(
-    r"^(?:TOT(?:ALE)?\b|IVA\b|DI\s+CUI\s+IVA\b|RESTO\b|CONTANTI\b|"
+    r"^(?:TOT(?:ALE)?\b|SUB(?:-?\s*)?TOT(?:AL[EI]?)?\b|IVA\b|DI\s+CUI\s+IVA\b|RESTO\b|CONTANTI\b|"
     r"CONTANTE\b|CARTA\b|BANCOMAT\b|ASSEGNO\b|PAGAMENTO\b|IMPORTO\s+PAGATO\b|"
     r"IMPONIBILE\b|ALIQUOTA\b|EURO\b|DOCUMENTO\b|ORDINE\s*:|TAVOLO\s*:|"
     r"SCONT[OI]\b|[A-Z]\s+\d+(?:[.,]\d+)?\s*%)",
@@ -221,7 +224,7 @@ def _discount_label(line: Any) -> tuple[str, Decimal | None, str]:
     match = employee or _GENERIC_LABEL.fullmatch(label)
     if match is not None:
         rate = Decimal(match.group("rate").replace(",", "."))
-        repeat = match.group("repeat")
+        repeat = match.group("repeat_square") or match.group("repeat_round")
         if repeat is not None and Decimal(repeat.replace(",", ".")) != rate:
             return label, None, "other"
         kind = "employee_30" if employee else "generic_30"
@@ -302,6 +305,15 @@ def analyze_document_discounts(document: Any) -> DiscountAnalysis:
             if not verified:
                 reasons.append("discount_basis_unverified")
             previous_basis = None
+        elif _SUBTOTAL.fullmatch(label):
+            # A printed subtotal is a control total, not an additional sale.
+            # It can serve as the basis of a following document-wide discount
+            # only when it equals the observed positive product rows.
+            if amount is not None and amount > _ZERO and amount == positive_total:
+                previous_basis = amount
+            else:
+                reasons.append("subtotal_not_reconciled")
+                previous_basis = None
         elif amount is not None and amount > _ZERO and not _technical(label):
             positive_total += amount
             previous_basis = amount

@@ -64,6 +64,7 @@ from retailprintguard.api.schemas import (
 from retailprintguard.common.config import Settings
 from retailprintguard.common.domain import AlertStatus, DocumentType, ReceiptHeader
 from retailprintguard.common.hashchain import ZERO_HASH, chained_hash
+from retailprintguard.common.service_mode import classify_service_mode
 from retailprintguard.db.models import (
     ActiveParserVersion,
     AnalysisWatermark,
@@ -139,6 +140,17 @@ SOURCE_TYPES = {
 }
 
 DASHBOARD_SALES_DEPARTMENTS = ("BAR", "CUCINA", "PIZZERIA")
+DASHBOARD_SERVICE_MODES = ("DINE_IN", "TAKEAWAY", "UNDETERMINED")
+SERVICE_MODE_DOCUMENT_TYPES = frozenset(
+    {
+        DocumentType.ORDER.value,
+        DocumentType.ORDER_CHANGE.value,
+        DocumentType.KITCHEN_ORDER.value,
+        DocumentType.PRE_BILL.value,
+        DocumentType.MANAGEMENT_DOCUMENT.value,
+        DocumentType.COMMERCIAL_DOCUMENT.value,
+    }
+)
 DASHBOARD_POS_SALE_TYPES = (
     DocumentType.KITCHEN_ORDER.value,
     DocumentType.ORDER.value,
@@ -146,7 +158,7 @@ DASHBOARD_POS_SALE_TYPES = (
 )
 _EMPLOYEE_DISCOUNT_30_PATTERN = (
     r"(?:SCONTO|SCONTI)(?:\s+(?:DIPENDENTE|DIPENDENTI))?\s+30\s*%"
-    r"(?:\s*\[\s*-30\s*%\s*\])?"
+    r"(?:\s*(?:\[\s*-30\s*%\s*\]|\(\s*-30\s*%\s*\)))?"
 )
 _EMPLOYEE_DISCOUNT_30_RE = re.compile(
     rf"{_EMPLOYEE_DISCOUNT_30_PATTERN}",
@@ -685,16 +697,17 @@ def _dashboard_sales_department_quantities(
     session: Session,
     *,
     document_period: Sequence[Any],
-) -> dict[str, Decimal]:
-    """Return net product quantities printed by each configured POS department.
+) -> dict[str, dict[str, Decimal]]:
+    """Return signed net quantities by department and observed service mode.
 
     One selected parser version contributes for each logical ``Document``.  A
     positive order line adds its quantity and a signed ``ORDER_CHANGE`` line
     subtracts it; identical product rows are deliberately *not* collapsed
     because two equal rows can be two real sales.  Cancelled/removed projections
-    and incomplete documents are not economic sale evidence.  A final clamp at
-    zero prevents a partial historical range containing only a negative delta
-    from presenting a negative number of sold articles.
+    and incomplete documents are not economic sale evidence.  Signed amounts
+    preserve adjustments even when a selected period contains only removals.
+    Both printed references, or neither, remain undetermined; every line thus
+    contributes to exactly one mode and the parts reconcile to the total.
     """
 
     department = func.upper(func.trim(Device.department)).label("department")
@@ -702,9 +715,19 @@ def _dashboard_sales_department_quantities(
         DocumentVersion.document_type,
         Document.document_type,
     )
+    table_code = _version_column(DocumentVersion.table_code, Document.table_code)
+    order_code = _version_column(DocumentVersion.order_code, Document.order_code)
+    has_table = func.nullif(func.trim(func.coalesce(table_code, "")), "").is_not(None)
+    has_order = func.nullif(func.trim(func.coalesce(order_code, "")), "").is_not(None)
+    service_mode = case(
+        (and_(has_table, ~has_order), "DINE_IN"),
+        (and_(has_order, ~has_table), "TAKEAWAY"),
+        else_="UNDETERMINED",
+    ).label("service_mode")
     rows = session.execute(
         select(
             department,
+            service_mode,
             func.coalesce(func.sum(DocumentLine.quantity), MONEY_ZERO).label("quantity"),
         )
         .select_from(DocumentLine)
@@ -724,12 +747,15 @@ def _dashboard_sales_department_quantities(
             DocumentLine.removed.is_(False),
             *document_period,
         )
-        .group_by(department)
+        .group_by(department, service_mode)
     ).all()
-    result = {name: MONEY_ZERO for name in DASHBOARD_SALES_DEPARTMENTS}
-    for name, quantity in rows:
+    result = {
+        name: {mode: MONEY_ZERO for mode in DASHBOARD_SERVICE_MODES}
+        for name in DASHBOARD_SALES_DEPARTMENTS
+    }
+    for name, mode, quantity in rows:
         normalized = quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
-        result[str(name)] = max(MONEY_ZERO, normalized)
+        result[str(name)][str(mode)] = normalized
     return result
 
 
@@ -1746,9 +1772,18 @@ class SqlAlchemyApiRepository:
                 incomplete_jobs=incomplete_jobs,
                 false_positive_alerts=false_positives,
                 justified_alerts=justified,
-                sold_product_quantity_bar=department_quantities["BAR"],
-                sold_product_quantity_kitchen=department_quantities["CUCINA"],
-                sold_product_quantity_pizzeria=department_quantities["PIZZERIA"],
+                sold_product_quantity_bar=sum(department_quantities["BAR"].values()),
+                sold_product_quantity_bar_dine_in=department_quantities["BAR"]["DINE_IN"],
+                sold_product_quantity_bar_takeaway=department_quantities["BAR"]["TAKEAWAY"],
+                sold_product_quantity_bar_undetermined=department_quantities["BAR"]["UNDETERMINED"],
+                sold_product_quantity_kitchen=sum(department_quantities["CUCINA"].values()),
+                sold_product_quantity_kitchen_dine_in=department_quantities["CUCINA"]["DINE_IN"],
+                sold_product_quantity_kitchen_takeaway=department_quantities["CUCINA"]["TAKEAWAY"],
+                sold_product_quantity_kitchen_undetermined=department_quantities["CUCINA"]["UNDETERMINED"],
+                sold_product_quantity_pizzeria=sum(department_quantities["PIZZERIA"].values()),
+                sold_product_quantity_pizzeria_dine_in=department_quantities["PIZZERIA"]["DINE_IN"],
+                sold_product_quantity_pizzeria_takeaway=department_quantities["PIZZERIA"]["TAKEAWAY"],
+                sold_product_quantity_pizzeria_undetermined=department_quantities["PIZZERIA"]["UNDETERMINED"],
                 employee_discount_total=employee_discount_total,
             )
 
@@ -2475,6 +2510,24 @@ class SqlAlchemyApiRepository:
             selected_document_type = _version_value(
                 version, document, "document_type"
             )
+            service_mode = None
+            service_mode_evidence = None
+            if selected_document_type in SERVICE_MODE_DOCUMENT_TYPES:
+                metadata = version.raw_metadata if isinstance(version.raw_metadata, dict) else {}
+                table_evidence = metadata.get("table_code_evidence")
+                decision = classify_service_mode(
+                    order_code=_version_value(version, document, "order_code"),
+                    table_code=_version_value(version, document, "table_code"),
+                    table_evidence=table_evidence if isinstance(table_evidence, str) else None,
+                )
+                service_mode = decision.mode
+                saved_evidence = metadata.get("service_mode_evidence")
+                service_mode_evidence = (
+                    saved_evidence
+                    if metadata.get("service_mode") == decision.mode
+                    and isinstance(saved_evidence, str)
+                    else decision.evidence
+                )
             observed_rch_serial_number = _version_value(
                 version, document, "rch_serial_number"
             )
@@ -2552,6 +2605,8 @@ class SqlAlchemyApiRepository:
                     ),
                     order_code=_version_value(version, document, "order_code"),
                     table_code=_version_value(version, document, "table_code"),
+                    service_mode=service_mode,
+                    service_mode_evidence=service_mode_evidence,
                     operator_code=_version_value(version, document, "operator_code"),
                     terminal_code=_version_value(version, document, "terminal_code"),
                     receipt_header=receipt_header,

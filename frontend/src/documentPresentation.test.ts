@@ -8,9 +8,12 @@ import {
   documentFilterParams,
   documentLinePrice,
   documentPreviewTabLabel,
+  documentServiceMode,
+  documentServiceModeLabel,
   documentTypeLabel,
   isEpsonDailyReport,
   selectedDocumentScope,
+  serviceModeEvidenceLabel,
 } from './documentPresentation'
 
 describe('primary document presentation', () => {
@@ -75,6 +78,16 @@ describe('primary document presentation', () => {
     expect(deviceLabel('fiscal_test', devices)).toBe('Fiscale RECEPTION')
     expect(deviceLabel('pos_1')).toBe('pos_1')
     expect(deviceLabel('rch_1')).toBe('rch_1')
+  })
+
+  it('shows service mode only for sales and orders, keeping conflicts undetermined', () => {
+    expect(documentServiceModeLabel({ type: 'COMMERCIAL_DOCUMENT', table_code: 'TABLE-TEST-1' })).toBe('In sede (Tavolo)')
+    expect(documentServiceModeLabel({ type: 'KITCHEN_ORDER', order_code: 'ORDER-TEST-1' })).toBe('Asporto (Ordine)')
+    expect(documentServiceMode({ type: 'MANAGEMENT_DOCUMENT', order_code: 'ORDER-TEST-1', table_code: 'TABLE-TEST-1' })).toBe('UNDETERMINED')
+    expect(documentServiceModeLabel({ type: 'SHIFT_END_REPORT' })).toBeUndefined()
+    expect(documentServiceModeLabel({ type: 'DEVICE_RESPONSE' })).toBeUndefined()
+    expect(serviceModeEvidenceLabel({ service_mode_evidence: 'CONFLICTING_ORDER_AND_TABLE_MARKERS' })).toContain('Entrambi')
+    expect(serviceModeEvidenceLabel({ service_mode_evidence: 'EPSON_SOAP_PRINT_REC_MESSAGE_TABLE' })).toBe('Tavolo osservato nel comando SOAP Epson')
   })
 
   it('presents the Epson daily closure as a report with its own Z progressive', () => {

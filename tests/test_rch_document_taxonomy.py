@@ -63,7 +63,7 @@ def test_shift_end_report_signature_wins_over_aggregate_invoice_row() -> None:
     assert document.type is DocumentType.SHIFT_END_REPORT
     assert document.subtype == "RCH_REPORT_FINE_TURNO_LITERAL"
     assert document.parse_confidence == 98
-    assert document.parser_version == PARSER_VERSION == "1.7.2"
+    assert document.parser_version == PARSER_VERSION == "1.7.3"
 
 
 def test_shift_end_report_sums_all_observed_payment_methods() -> None:
@@ -149,6 +149,25 @@ def test_management_document_does_not_sum_shift_end_payment_rows() -> None:
     assert document.type is DocumentType.MANAGEMENT_DOCUMENT
     assert document.gross_total == Decimal("500.00")
     assert document.raw_metadata["shift_end_payment_total_evidence"] is None
+
+
+def test_management_receipt_service_mode_follows_printed_order_or_table() -> None:
+    dine_in = _management_document("Documento gestionale", "Tavolo: Z-99")
+    takeaway = _management_document("Documento gestionale", "Ordine: 9001")
+    conflicting = _management_document(
+        "Documento gestionale", "Tavolo: Z-99", "Ordine: 9001"
+    )
+    unknown = _management_document("Documento gestionale", "Voce sintetica")
+
+    assert dine_in.table_code == "Z-99"
+    assert dine_in.raw_metadata["service_mode"] == "DINE_IN"
+    assert takeaway.order_code == "9001"
+    assert takeaway.raw_metadata["service_mode"] == "TAKEAWAY"
+    assert conflicting.raw_metadata["service_mode"] == "UNDETERMINED"
+    assert conflicting.raw_metadata["service_mode_evidence"] == (
+        "CONFLICTING_ORDER_AND_TABLE_MARKERS"
+    )
+    assert unknown.raw_metadata["service_mode"] == "UNDETERMINED"
 
 
 def test_invoice_requires_a_strong_singular_document_signature() -> None:

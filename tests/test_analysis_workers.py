@@ -455,6 +455,68 @@ def test_database_workers_persist_scenario_a_idempotently() -> None:
     engine.dispose()
 
 
+def test_printed_subtotal_discount_alert_is_persisted_for_management_receipt() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        device_id = _device(session, "rch_discount_lab", "rch", 23)
+        parser = ParserVersion(
+            name="test",
+            version="1.0.0",
+            build_sha256=_sha("synthetic-discount-parser"),
+            protocol="test",
+        )
+        session.add(parser)
+        session.flush()
+        document_id = _document(
+            session,
+            device_id=device_id,
+            parser_id=parser.id,
+            source="synthetic-discount-management",
+            document_type="MANAGEMENT_DOCUMENT",
+            total="0.40",
+            when=NOW,
+            lines=(
+                ("Synthetic item one", "10.00"),
+                ("Synthetic item two", "30.00"),
+                ("SUBTOT", "40.00"),
+                ("Sconto 99%", "-39.60"),
+                ("TOT", "0.40"),
+            ),
+            external_document_code=None,
+            auto_external_document_code=False,
+        )
+
+    assert CorrelationWorker(factory).run_once().correlations_inserted == 1
+    fraud = FraudWorker(factory)
+    first = fraud.run_once()
+    second = fraud.run_once()
+    assert first.alerts_inserted >= 1
+    assert second.alerts_inserted == 0
+    with factory() as session:
+        row = session.execute(
+            select(FraudAlert, FraudRule.code)
+            .join(FraudRuleVersion, FraudRuleVersion.id == FraudAlert.fraud_rule_version_id)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "EXTREME_PRINTED_DISCOUNT")
+        ).one()
+        alert, rule_code = row
+        assert rule_code == "EXTREME_PRINTED_DISCOUNT"
+        assert alert.status == "OPEN"
+        assert alert.severity == "CRITICAL"
+        assert alert.is_canonical
+        evidence = session.scalars(
+            select(FraudAlertEvidence).where(FraudAlertEvidence.fraud_alert_id == alert.id)
+        ).all()
+        assert any(
+            item.document_id == document_id
+            and item.evidence_type == "extreme_printed_discount"
+            and Decimal(str(item.evidence.get("discount_basis"))) == Decimal("40.00")
+            and Decimal(str(item.evidence.get("discount_amount"))) == Decimal("39.60")
+            for item in evidence
+        )
+    engine.dispose()
+
+
 def test_worker_justifies_legacy_loss_alert_for_proven_employee_discount() -> None:
     engine, factory = _database()
     with factory.begin() as session:

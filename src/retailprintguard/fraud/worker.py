@@ -60,7 +60,7 @@ from retailprintguard.fraud.engine import (
 )
 from retailprintguard.fraud.versioning import rule_configuration_fingerprint
 
-FRAUD_ENGINE_VERSION = "rpg-fraud-1.4.0"
+FRAUD_ENGINE_VERSION = "rpg-fraud-1.5.0"
 _AUXILIARY_ECONOMIC_RULE_CODES = (
     "PREBILL_FISCAL_AMOUNT_DROP",
     "ITEM_REMOVED_AFTER_PREBILL",

@@ -112,8 +112,17 @@ export interface Dashboard {
   false_positive_alerts?: number
   justified_alerts?: number
   sold_product_quantity_bar?: string
+  sold_product_quantity_bar_dine_in?: string
+  sold_product_quantity_bar_takeaway?: string
+  sold_product_quantity_bar_undetermined?: string
   sold_product_quantity_kitchen?: string
+  sold_product_quantity_kitchen_dine_in?: string
+  sold_product_quantity_kitchen_takeaway?: string
+  sold_product_quantity_kitchen_undetermined?: string
   sold_product_quantity_pizzeria?: string
+  sold_product_quantity_pizzeria_dine_in?: string
+  sold_product_quantity_pizzeria_takeaway?: string
+  sold_product_quantity_pizzeria_undetermined?: string
   employee_discount_total?: string
   observed_employee_discount_total?: string
   observed_employee_discount_count?: number
@@ -252,6 +261,8 @@ export interface DocumentRecord {
   external_code?: string
   order_code?: string
   table_code?: string
+  service_mode?: 'DINE_IN' | 'TAKEAWAY' | 'UNDETERMINED' | null
+  service_mode_evidence?: string | null
   covers?: number
   operator_code?: string
   terminal_code?: string

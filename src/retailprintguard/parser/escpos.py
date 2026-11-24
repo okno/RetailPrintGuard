@@ -29,9 +29,10 @@ from retailprintguard.common.domain import (
     NormalizedDocument,
     SourceSpan,
 )
+from retailprintguard.common.service_mode import classify_service_mode
 
 PARSER_NAME = "retailprintguard-escpos"
-PARSER_VERSION = "1.3.0"
+PARSER_VERSION = "1.3.1"
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_OUTPUT_CHARS = 4_000_000
 _MAX_DOCUMENTS = 1_024
@@ -50,7 +51,7 @@ _NUMERIC_OCR_TABLE_RE = re.compile(
     r"(?P<numeric>[O0-9]{1,8})(?P<suffix>(?:[-/][A-Z0-9]{1,16})?)",
     re.IGNORECASE,
 )
-_ORDER_RE = re.compile(r"\b(?:ORDINE|COMANDA)\s*[:#-]?\s*(?P<value>[A-Z0-9._/-]+)", re.IGNORECASE)
+_ORDER_RE = re.compile(r"\bORDINE\s*:\s*(?P<value>[A-Z0-9._/-]+)", re.IGNORECASE)
 _OPERATOR_LINE_RE = re.compile(
     r"\bOPERATORE\s*[:#-]?\s*(?P<value>[^\r\n]*)",
     re.IGNORECASE,
@@ -1114,6 +1115,26 @@ def parse_escpos(
         table_code = plain_table or raster_table
         if raster_text:
             text = f"{text}\n" + "\n".join(raster_text)
+        order_code = _field(_ORDER_RE, text)
+        table_evidence = (
+            "ESC_POS_RASTER_OCR_NUMERIC_NORMALIZED"
+            if raster_table is not None
+            and plain_table is None
+            and any(
+                observation.get("table_code_normalization")
+                for observation in raster_observations
+            )
+            else "ESC_POS_RASTER_OCR_INFERRED"
+            if raster_table is not None and plain_table is None
+            else "PLAIN_TEXT"
+            if table_code is not None
+            else "UNKNOWN"
+        )
+        service_mode = classify_service_mode(
+            order_code=order_code,
+            table_code=table_code,
+            table_evidence=table_evidence if table_code is not None else None,
+        )
         # The source identity deliberately excludes the parser version.  A new
         # parser release must append a DocumentVersion to the same document,
         # never manufacture a second business document from unchanged bytes.
@@ -1130,7 +1151,7 @@ def parse_escpos(
                 type=doc_type,
                 subtype=subtype,
                 external_document_code=_field(_DOCUMENT_RE, text),
-                order_code=_field(_ORDER_RE, text),
+                order_code=order_code,
                 table_code=table_code,
                 operator_code=operator_code,
                 document_timestamp=document_timestamp,
@@ -1170,20 +1191,9 @@ def parse_escpos(
                     "classification_evidence": subtype
                     if doc_type is not DocumentType.UNKNOWN
                     else "UNKNOWN",
-                    "table_code_evidence": (
-                        "ESC_POS_RASTER_OCR_NUMERIC_NORMALIZED"
-                        if raster_table is not None
-                        and plain_table is None
-                        and any(
-                            observation.get("table_code_normalization")
-                            for observation in raster_observations
-                        )
-                        else "ESC_POS_RASTER_OCR_INFERRED"
-                        if raster_table is not None and plain_table is None
-                        else "PLAIN_TEXT"
-                        if table_code is not None
-                        else "UNKNOWN"
-                    ),
+                    "table_code_evidence": table_evidence,
+                    "service_mode": service_mode.mode,
+                    "service_mode_evidence": service_mode.evidence,
                     "raster_ocr": {
                         "runtime": (
                             "injected" if ocr_engine is not None else runtime_build_fingerprint()

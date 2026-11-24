@@ -5,6 +5,24 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.5.8] — 2026-11-24
+
+### Added
+
+- Gli scontrini fiscali Epson riconosciuti dal flusso SOAP entrano nei Documenti
+  con articoli, sconti, pagamenti e identificativo fiscale, se la risposta del
+  dispositivo conferma la stampa e gli importi sono riconciliati.
+- Scontrini con `Tavolo:` e `Ordine:` sono classificati rispettivamente come
+  consumazione in sede e asporto; la dashboard divide le quantità nette di BAR,
+  CUCINA e PIZZERIA e conserva una voce per i casi indeterminati.
+- Gli sconti stampati superiori al 90% generano una segnalazione critica solo
+  quando imponibile, sconto e totale sono aritmeticamente coerenti.
+
+### Changed
+
+- Parser RCH, ESC/POS ed Epson versionati per il ricalcolo append-only dei
+  documenti storici, senza alterare i flussi RAW acquisiti.
+
 ## [0.5.7] — 2026-11-23
 
 ### Added

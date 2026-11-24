@@ -21,9 +21,10 @@ from retailprintguard.common.domain import (
     ReceiptHeader,
     SourceSpan,
 )
+from retailprintguard.common.service_mode import classify_service_mode
 
 PARSER_NAME = "retailprintguard-rch-observed"
-PARSER_VERSION = "1.7.2"
+PARSER_VERSION = "1.7.3"
 _STX = 0x02
 _ETX = 0x03
 _ACK = 0x06
@@ -1007,6 +1008,10 @@ def _draft_document(
                 ]
                 draft.total = next((value for value in reversed(values) if value is not None), None)
             payments = tuple(draft.payments)
+    service_mode = classify_service_mode(
+        order_code=draft.order_code,
+        table_code=draft.table_code,
+    )
     identifier = uuid5(
         NAMESPACE_URL,
         f"retailprintguard:rch:{job_id}:{draft.kind}:{draft.start_offset}:{source_hash}",
@@ -1119,6 +1124,8 @@ def _draft_document(
                 else "NOT_OBSERVED_IN_CAPTURE"
             ),
             "semantic_evidence": "INFERRED_FROM_CAPTURE",
+            "service_mode": service_mode.mode,
+            "service_mode_evidence": service_mode.evidence,
             "shift_end_payment_total_evidence": shift_end_payment_total_evidence,
             "quantity_context_observations": quantity_observations,
             "economic_close": (

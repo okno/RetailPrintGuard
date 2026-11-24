@@ -53,6 +53,7 @@ def test_explicit_employee_evidence_is_separate_from_generic_and_authorization()
         "SCONTI DIPENDENTI 30,00% [-30.0%]",
         "Sconto dipendente 30.00%",
         " Sconto  dipendenti 30 % ",
+        "Sconto dipendenti 30% (-30%)",
     ],
 )
 def test_equivalent_exact_labels_keep_the_same_rate(label) -> None:
@@ -66,6 +67,7 @@ def test_equivalent_exact_labels_keep_the_same_rate(label) -> None:
         "SCONTO PROMO 30%",
         "SCONTO DIPENDENTI 20% nota 30%",
         "SCONTO DIPENDENTI 30% [-20%]",
+        "SCONTO DIPENDENTI 30% (-20%)",
     ],
 )
 def test_ambiguous_labels_are_not_employee_evidence(label) -> None:
@@ -89,6 +91,53 @@ def test_quantity_context_legacy_read_model_matches_reparsed_values_without_muta
     result = analyze_document_discounts(document)
     assert document == before
     assert result.employee_total == Decimal("3.60") and result.arithmetic_reconciled
+
+
+@pytest.mark.parametrize(
+    "products,subtotal,discount,total",
+    [
+        (("10.00", "12.00", "18.00"), "40.00", "-39.60", "0.40"),
+        (("20.00", "40.00"), "60.00", "-59.40", "0.60"),
+    ],
+)
+@pytest.mark.parametrize("subtotal_label", ("SUBTOT", "SUBTOTALE", "SUB-TOTALE", "SUBTOTAL"))
+def test_printed_subtotal_is_discount_basis_without_double_counting_sales(
+    products, subtotal, discount, total, subtotal_label
+) -> None:
+    rows = [
+        _row(index, f"Articolo sintetico {index}", amount)
+        for index, amount in enumerate(products, 1)
+    ]
+    rows.extend(
+        (
+            _row(len(rows) + 1, subtotal_label, subtotal),
+            _row(len(rows) + 2, "Sconto 99%", discount),
+            _row(len(rows) + 3, "TOT", total),
+        )
+    )
+    analysis = analyze_document_discounts(
+        {"complete": True, "gross_total": total, "lines": rows}
+    )
+    assert analysis.arithmetic_reconciled
+    assert analysis.other_discount_total == -Decimal(discount)
+    assert analysis.observations[0].basis == Decimal(subtotal)
+    assert analysis.observations[0].rate_percent == Decimal("99")
+    assert analysis.observations[0].arithmetic_verified
+
+
+def test_unmatched_printed_subtotal_does_not_authorize_discount_basis() -> None:
+    rows = [
+        _row(1, "Articolo sintetico", "60.00"),
+        _row(2, "SUBTOT", "61.00"),
+        _row(3, "Sconto 99%", "-60.39"),
+        _row(4, "TOT", "0.61"),
+    ]
+    analysis = analyze_document_discounts(
+        {"complete": True, "gross_total": "0.61", "lines": rows}
+    )
+    assert not analysis.arithmetic_reconciled
+    assert "subtotal_not_reconciled" in analysis.reasons
+    assert not analysis.observations[0].arithmetic_verified
 
 
 @pytest.mark.parametrize(

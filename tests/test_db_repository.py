@@ -51,6 +51,7 @@ from retailprintguard.db.models import StreamChunk as StoredChunk
 from retailprintguard.db.repository import (
     SqlAlchemyApiRepository,
     SqlAlchemyIngestionRepository,
+    _employee_discount_30_label,
     _validated_management_employee_discount_total,
 )
 from retailprintguard.ingestion.dto import (
@@ -66,6 +67,14 @@ from retailprintguard.ingestion.dto import (
 from retailprintguard.ingestion.repository import ImportDisposition
 
 NOW = datetime(2042, 5, 6, 18, 0, tzinfo=UTC)
+
+
+def test_employee_discount_recognizes_parenthesized_percent_on_epson_sale() -> None:
+    assert _employee_discount_30_label("Sconto dipendenti 30% (-30%)")
+    assert _employee_discount_30_label(
+        "Sconto dipendenti 30% (-30%)", "Sconto dipendenti 30% (-30%) -1,50"
+    )
+    assert not _employee_discount_30_label("Sconto dipendenti 99% (-99%)")
 
 
 def _sha(value: bytes) -> str:
@@ -1232,10 +1241,18 @@ def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> N
             quantity: str,
             *,
             minute: int,
+            table_code: str | None = None,
+            order_code: str | None = None,
             complete: bool = True,
             cancelled: bool = False,
         ) -> None:
             document_id = uuid4()
+            labels = "\n".join(
+                label for label in (
+                    f"Tavolo: {table_code}" if table_code else "",
+                    f"Ordine: {order_code}" if order_code else "",
+                ) if label
+            )
             session.add(
                 Document(
                     id=document_id,
@@ -1245,6 +1262,8 @@ def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> N
                     source_document_key=f"department-sale-{document_id}",
                     document_type=document_type,
                     subtype=document_type,
+                    table_code=table_code,
+                    order_code=order_code,
                     captured_at=NOW + timedelta(minutes=minute),
                 )
             )
@@ -1256,8 +1275,10 @@ def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> N
                 version_sequence=1,
                 document_type=document_type,
                 subtype=document_type,
+                table_code=table_code,
+                order_code=order_code,
                 status="COMPLETE" if complete else "PARTIAL",
-                normalized_text=f"1x Prodotto sintetico {document_id}",
+                normalized_text=f"1x Prodotto sintetico {document_id}\n{labels}",
                 parse_confidence=100,
                 evidence_level="CONFIRMED",
                 source_manifest_sha256="a" * 64,
@@ -1282,24 +1303,33 @@ def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> N
             )
 
         # Equal descriptions are separate observed rows and therefore both
-        # count.  The signed change reduces the BAR total: 2 + 2 - 1 = 3.
-        add_pos_line(ids["device"], "KITCHEN_ORDER", "2", minute=1)
-        add_pos_line(ids["device"], "KITCHEN_ORDER", "2", minute=2)
-        add_pos_line(ids["device"], "ORDER_CHANGE", "-1", minute=3)
+        # count.  The signed change reduces the BAR table total: 2 - 1 = 1.
+        add_pos_line(ids["device"], "KITCHEN_ORDER", "2", minute=1, table_code="TABLE-TEST-1")
+        add_pos_line(ids["device"], "KITCHEN_ORDER", "2", minute=2, order_code="ORDER-TEST-1")
+        add_pos_line(ids["device"], "ORDER_CHANGE", "-1", minute=3, table_code="TABLE-TEST-1")
         add_pos_line(ids["device"], "KITCHEN_ORDER", "100", minute=4, complete=False)
-        add_pos_line(kitchen_device_id, "ORDER", "3", minute=5)
+        add_pos_line(ids["device"], "ORDER", "0.5", minute=5)
+        add_pos_line(kitchen_device_id, "ORDER", "3", minute=5, table_code="TABLE-TEST-2")
         add_pos_line(
             kitchen_device_id,
             "KITCHEN_ORDER",
             "4",
             minute=6,
+            table_code="TABLE-TEST-2",
             cancelled=True,
         )
-        add_pos_line(pizzeria_device_id, "KITCHEN_ORDER", "1.5", minute=9)
+        add_pos_line(
+            pizzeria_device_id,
+            "KITCHEN_ORDER",
+            "1.5",
+            minute=9,
+            table_code="TABLE-TEST-2",
+            order_code="ORDER-TEST-1",
+        )
         # The half-open upper bound must exclude this exact timestamp.
-        add_pos_line(pizzeria_device_id, "KITCHEN_ORDER", "9", minute=10)
-        # A partial range containing only a removal is clamped to zero.
-        add_pos_line(kitchen_device_id, "ORDER_CHANGE", "-5", minute=10)
+        add_pos_line(pizzeria_device_id, "KITCHEN_ORDER", "9", minute=10, table_code="TABLE-TEST-2")
+        # A partial range containing only a removal keeps its negative net value.
+        add_pos_line(kitchen_device_id, "ORDER_CHANGE", "-5", minute=10, order_code="ORDER-TEST-1")
 
         stream_id, stream_version_id = _add_correlated_document(
             session,
@@ -1497,9 +1527,44 @@ def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> N
     dashboard = repository.dashboard(
         filters={"from": NOW, "to": NOW + timedelta(minutes=10)}
     )
-    assert dashboard.sold_product_quantity_bar == Decimal("3.0000")
+    assert dashboard.sold_product_quantity_bar == Decimal("3.5000")
     assert dashboard.sold_product_quantity_kitchen == Decimal("3.0000")
     assert dashboard.sold_product_quantity_pizzeria == Decimal("1.5000")
+    assert dashboard.sold_product_quantity_bar_dine_in == Decimal("1.0000")
+    assert dashboard.sold_product_quantity_bar_takeaway == Decimal("2.0000")
+    assert dashboard.sold_product_quantity_bar_undetermined == Decimal("0.5000")
+    assert dashboard.sold_product_quantity_kitchen_dine_in == Decimal("3.0000")
+    assert dashboard.sold_product_quantity_kitchen_takeaway == Decimal("0.0000")
+    assert dashboard.sold_product_quantity_pizzeria_undetermined == Decimal("1.5000")
+    for department in ("bar", "kitchen", "pizzeria"):
+        assert getattr(dashboard, f"sold_product_quantity_{department}") == sum(
+            getattr(dashboard, f"sold_product_quantity_{department}_{mode}")
+            for mode in ("dine_in", "takeaway", "undetermined")
+        )
+    bar_documents, _ = repository.list_documents(
+        limit=100,
+        offset=0,
+        filters={"device_id": "pos_1", "from": NOW, "to": NOW + timedelta(minutes=10)},
+    )
+    assert any(
+        doc.table_code == "TABLE-TEST-1" and doc.service_mode == "DINE_IN"
+        for doc in bar_documents
+    )
+    assert any(
+        doc.order_code == "ORDER-TEST-1" and doc.service_mode == "TAKEAWAY"
+        for doc in bar_documents
+    )
+    pizzeria_documents, _ = repository.list_documents(
+        limit=100,
+        offset=0,
+        filters={"device_id": "pos_3", "from": NOW, "to": NOW + timedelta(minutes=10)},
+    )
+    assert any(
+        doc.table_code == "TABLE-TEST-2"
+        and doc.order_code == "ORDER-TEST-1"
+        and doc.service_mode == "UNDETERMINED"
+        for doc in pizzeria_documents
+    )
     # The management/pre-fiscal evidence carries the exact production -30%
     # label and refers to the commercial document.  It counts once despite the
     # generic DGFE modifier; the otherwise identical -20% row and the larger
@@ -1513,8 +1578,10 @@ def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> N
         }
     )
     assert outside.sold_product_quantity_bar == Decimal("0.0000")
-    assert outside.sold_product_quantity_kitchen == Decimal("0.0000")
+    assert outside.sold_product_quantity_kitchen == Decimal("-5.0000")
     assert outside.sold_product_quantity_pizzeria == Decimal("9.0000")
+    assert outside.sold_product_quantity_kitchen_takeaway == Decimal("-5.0000")
+    assert outside.sold_product_quantity_pizzeria_dine_in == Decimal("9.0000")
     assert outside.employee_discount_total == Decimal("0")
     engine.dispose()
 

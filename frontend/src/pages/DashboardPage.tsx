@@ -19,6 +19,7 @@ import { Alert, Box, Button, Card, CardContent, Chip, Grid, LinearProgress, List
 import { alpha, useTheme } from '@mui/material/styles'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
+import type { ReactNode } from 'react'
 import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
 import { PeriodPicker } from '../components/PeriodPicker'
@@ -35,6 +36,48 @@ import type { Dashboard, Device, Diagnostics, Page, Transaction } from '../types
 
 const euros = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
 const quantities = new Intl.NumberFormat('it-IT', { maximumFractionDigits: 4 })
+
+export function DepartmentQuantityCard({
+  label,
+  total,
+  dineIn,
+  takeaway,
+  undetermined,
+  icon,
+}: {
+  label: string
+  total?: string
+  dineIn?: string
+  takeaway?: string
+  undetermined?: string
+  icon: ReactNode
+}) {
+  const formatted = (value?: string) => quantities.format(Number(value ?? 0))
+  return <Card sx={{ height: '100%' }}>
+    <CardContent>
+      <Stack direction="row" justifyContent="space-between" alignItems="flex-start">
+        <Box>
+          <Typography variant="body2" color="text.secondary" fontWeight={650}>{label} · totale netto</Typography>
+          <Typography variant="h4" sx={{ mt: 0.75, fontWeight: 760 }}>{formatted(total)}</Typography>
+        </Box>
+        <Box sx={{ color: 'primary.main' }}>{icon}</Box>
+      </Stack>
+      <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 1, mt: 2 }}>
+        <Box sx={{ bgcolor: 'action.hover', borderRadius: 2, p: 1.25 }}>
+          <Typography variant="caption" color="text.secondary">In sede (Tavolo)</Typography>
+          <Typography variant="h6">{formatted(dineIn)}</Typography>
+        </Box>
+        <Box sx={{ bgcolor: 'action.hover', borderRadius: 2, p: 1.25 }}>
+          <Typography variant="caption" color="text.secondary">Asporto (Ordine)</Typography>
+          <Typography variant="h6">{formatted(takeaway)}</Typography>
+        </Box>
+      </Box>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1.25 }}>
+        Non determinato: {formatted(undetermined)} · quantità nette con rettifiche
+      </Typography>
+    </CardContent>
+  </Card>
+}
 
 function routeWithPeriod(path: string, period: URLSearchParams, extras?: Record<string, string>) {
   const query = new URLSearchParams()
@@ -117,13 +160,13 @@ export function DashboardPage() {
           <Box>
             <Typography variant="h2">Quantità nelle comande per reparto</Typography>
             <Typography color="text.secondary" sx={{ mt: 0.5 }}>
-              Quantità nette delle righe prodotto osservate nelle comande; le variazioni negative riducono il totale. Non rappresentano una riconciliazione delle vendite fiscali.
+              Quantità nette delle righe prodotto osservate nelle comande, suddivise per il riferimento stampato Tavolo o Ordine. Le rettifiche possono rendere negativo un sotto-totale. Le comande senza riferimento univoco restano in “Non determinato”. Non rappresentano una riconciliazione delle vendite fiscali.
             </Typography>
           </Box>
         </Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Prodotti BAR" value={quantities.format(Number(data.sold_product_quantity_bar ?? 0))} helper="quantità netta nelle comande" icon={<LocalCafeOutlined />} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Prodotti CUCINA" value={quantities.format(Number(data.sold_product_quantity_kitchen ?? 0))} helper="quantità netta nelle comande" icon={<RestaurantOutlined />} /></Grid>
-        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Prodotti PIZZERIA" value={quantities.format(Number(data.sold_product_quantity_pizzeria ?? 0))} helper="quantità netta nelle comande" icon={<LocalPizzaOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><DepartmentQuantityCard label="Prodotti BAR" total={data.sold_product_quantity_bar} dineIn={data.sold_product_quantity_bar_dine_in} takeaway={data.sold_product_quantity_bar_takeaway} undetermined={data.sold_product_quantity_bar_undetermined} icon={<LocalCafeOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><DepartmentQuantityCard label="Prodotti CUCINA" total={data.sold_product_quantity_kitchen} dineIn={data.sold_product_quantity_kitchen_dine_in} takeaway={data.sold_product_quantity_kitchen_takeaway} undetermined={data.sold_product_quantity_kitchen_undetermined} icon={<RestaurantOutlined />} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><DepartmentQuantityCard label="Prodotti PIZZERIA" total={data.sold_product_quantity_pizzeria} dineIn={data.sold_product_quantity_pizzeria_dine_in} takeaway={data.sold_product_quantity_pizzeria_takeaway} undetermined={data.sold_product_quantity_pizzeria_undetermined} icon={<LocalPizzaOutlined />} /></Grid>
         <Grid size={{ xs: 12 }} sx={{ mt: 1 }}>
           <Typography variant="h2">Sconti osservati nei documenti</Typography>
           <Typography color="text.secondary" sx={{ mt: .5 }}>Importi presenti nelle stampe selezionate. La verifica aritmetica non prova l’autorizzazione dello sconto e non chiude gli alert antifrode. Copie diverse possono riferirsi alla stessa vendita.</Typography>
