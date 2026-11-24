@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
@@ -10,6 +12,10 @@ from retailprintguard.analysis.discounts import (
     analyze_document_discounts,
     confirmed_quantity_contexts,
 )
+from retailprintguard.api.schemas import DocumentLineView, DocumentView
+from retailprintguard.correlation.engine import CorrelationEngine
+from retailprintguard.fraud.engine import FraudContext, FraudEngine
+from retailprintguard.parser.epson import parse_epson
 
 
 def _row(sequence, description, amount, **extra):
@@ -32,6 +38,149 @@ def _document(label="SCONTO DIPENDENTI 30% [-30%]", discount="-3.60", total="8.4
             _row(3, "TOT", total),
         ],
     }
+
+
+def _epson_soap_sale(*, rate: int, multi_item: bool = False):
+    """Build the two-sided protocol evidence used by the production parser."""
+
+    def http(body: str, *, response: bool = False) -> bytes:
+        encoded = body.encode("utf-8")
+        first = "HTTP/1.1 200 OK" if response else "POST /cgi-bin/fpmate.cgi HTTP/1.1"
+        return (
+            f"{first}\r\nContent-Type: text/xml; charset=utf-8\r\n"
+            f"Content-Length: {len(encoded)}\r\n\r\n"
+        ).encode() + encoded
+
+    items = (
+        '<printRecItem description="Margherita sintetica A" quantity="1" unitPrice="8,00"/>'
+        '<printRecItem description="Margherita sintetica B" quantity="1" unitPrice="8,00"/>'
+        if multi_item else
+        '<printRecItem description="The freddo sintetico" quantity="1" unitPrice="4,00"/>'
+    )
+    gross = Decimal("16.00") if multi_item else Decimal("4.00")
+    discount = (gross * Decimal(rate) / 100).quantize(Decimal("0.01"))
+    total = gross - discount
+    amount = str(discount).replace(".", ",")
+    payment = str(total).replace(".", ",")
+    request = http(
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+        '<printerFiscalReceipt><beginFiscalReceipt/>'
+        f'{items}<printRecSubtotalAdjustment description="Sconto dipendenti {rate}% '
+        f'(-{rate}%)" adjustmentType="1" amount="{amount}"/>'
+        f'<printRecTotal description="Contanti" payment="{payment}" paymentType="0"/>'
+        '<printRecMessage message="Tavolo: TEST-01"/>'
+        '<endFiscalReceipt/></printerFiscalReceipt></s:Body></s:Envelope>'
+    )
+    response = http(
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+        '<response success="true" code="" status="2"><addInfo>'
+        '<elementList>lastCommand,printerStatus,fiscalReceiptNumber,'
+        'fiscalReceiptAmount,fiscalReceiptDate,fiscalReceiptTime,zRepNumber</elementList>'
+        '<lastCommand>74</lastCommand><printerStatus>20010</printerStatus>'
+        '<fiscalReceiptNumber>1</fiscalReceiptNumber>'
+        f'<fiscalReceiptAmount>{payment}</fiscalReceiptAmount>'
+        '<fiscalReceiptDate>24/11/2026</fiscalReceiptDate>'
+        '<fiscalReceiptTime>09:24</fiscalReceiptTime><zRepNumber>91</zRepNumber>'
+        '</addInfo></response></s:Body></s:Envelope>',
+        response=True,
+    )
+    receipt = parse_epson(
+        request, response, device_id="epson_synthetic", session_id="synthetic-session",
+        job_id=f"synthetic-{rate}-{multi_item}",
+        captured_at=datetime(2026, 11, 24, 8, 24, tzinfo=UTC),
+        manifest_sha256="a" * 64, source_path="/synthetic/client.raw",
+        response_source_path="/synthetic/device.raw",
+    )[0]
+    assert receipt.complete
+    return receipt
+
+
+def test_confirmed_epson_soap_employee_discount_reconciles_without_printed_total_row() -> None:
+    receipt = _epson_soap_sale(rate=30)
+    assert all(line.description != "TOTALE" for line in receipt.lines)
+    analysis = analyze_document_discounts(receipt)
+    assert analysis.employee_total == Decimal("1.20")
+    assert analysis.arithmetic_reconciled and analysis.reasons == ()
+    assert analysis.observations[0].basis == Decimal("4.00")
+
+
+def test_epson_api_projection_reconciles_without_exposing_raw_metadata() -> None:
+    receipt = _epson_soap_sale(rate=30)
+    view = DocumentView(
+        id=receipt.id, device_id=receipt.source_device_id, job_id=uuid4(),
+        type=receipt.type.value, subtype=receipt.subtype,
+        external_document_code_suffix=receipt.external_document_code_suffix,
+        captured_at=receipt.captured_at, document_timestamp=receipt.document_timestamp,
+        document_timestamp_evidence=receipt.raw_metadata["document_timestamp_evidence"],
+        gross_total=receipt.gross_total, net_total=receipt.net_total,
+        discount_total=receipt.discount_total, status=receipt.status,
+        normalized_text=receipt.normalized_text, parser_name=receipt.parser_name,
+        parser_version=receipt.parser_version, confidence=receipt.parse_confidence,
+        sha256=receipt.source_payload_sha256, complete=receipt.complete,
+        lines=[DocumentLineView(**line.model_dump(exclude={"source"})) for line in receipt.lines],
+        payments=[payment.model_dump(mode="json") for payment in receipt.payments],
+    )
+    assert not hasattr(view, "raw_metadata")
+    result = analyze_document_discounts(view)
+    assert result == analyze_document_discounts(receipt)
+    assert not analyze_document_discounts(
+        view.model_copy(update={"payments": []})
+    ).arithmetic_reconciled
+
+
+def test_confirmed_epson_multi_item_99_percent_discount_generates_critical_alert() -> None:
+    receipt = _epson_soap_sale(rate=99, multi_item=True)
+    analysis = analyze_document_discounts(receipt)
+    assert analysis.arithmetic_reconciled and analysis.observations[0].basis == Decimal("16.00")
+    transaction = CorrelationEngine().correlate((receipt,))[0]
+    findings = FraudEngine().evaluate(FraudContext(
+        transaction=transaction,
+        evaluated_at=receipt.captured_at + timedelta(hours=1),
+    ))
+    extreme = [item for item in findings if item.rule_code == "EXTREME_PRINTED_DISCOUNT"]
+    assert len(extreme) == 1 and extreme[0].severity.value == "CRITICAL"
+    assert extreme[0].evidence[0]["discount_basis"] == "16.00"
+    assert extreme[0].evidence[0]["discount_amount"] == "15.84"
+
+
+@pytest.mark.parametrize("tamper", [
+    "incomplete", "wrong_parser", "unacknowledged", "unpaired", "bad_fiscal_span",
+    "wrong_subtotal", "wrong_total", "wrong_payment", "missing_line_source",
+    "wrong_modifier", "wrong_line_total",
+])
+def test_epson_response_total_requires_provenance_and_independent_arithmetic(tamper) -> None:
+    receipt = _epson_soap_sale(rate=99, multi_item=True)
+    metadata = copy.deepcopy(receipt.raw_metadata)
+    if tamper == "incomplete":
+        receipt = receipt.model_copy(update={"complete": False})
+    elif tamper == "wrong_parser":
+        receipt = receipt.model_copy(update={"parser_name": "synthetic-other-parser"})
+    elif tamper == "unacknowledged":
+        metadata["command_acknowledged"] = False
+    elif tamper == "unpaired":
+        metadata["response_paired"] = False
+    elif tamper == "bad_fiscal_span":
+        metadata["fiscal_total_source_span"]["direction"] = "CLIENT_TO_DEVICE"
+    elif tamper == "wrong_subtotal":
+        metadata["observed_item_subtotal"] = "17.00"
+    elif tamper == "wrong_total":
+        receipt = receipt.model_copy(update={"gross_total": Decimal("0.17")})
+    elif tamper == "wrong_payment":
+        receipt = receipt.model_copy(update={"payments": ()})
+    elif tamper == "missing_line_source":
+        lines = list(receipt.lines)
+        lines[0] = lines[0].model_copy(update={"source": None})
+        receipt = receipt.model_copy(update={"lines": tuple(lines)})
+    elif tamper == "wrong_modifier":
+        metadata["subtotal_modifiers"] = []
+    elif tamper == "wrong_line_total":
+        lines = list(receipt.lines)
+        lines[0] = lines[0].model_copy(update={"line_total": Decimal("7.00")})
+        receipt = receipt.model_copy(update={"lines": tuple(lines)})
+    receipt = receipt.model_copy(update={"raw_metadata": metadata})
+    analysis = analyze_document_discounts(receipt)
+    assert not analysis.arithmetic_reconciled
+    assert "printed_total_missing" in analysis.reasons
 
 
 def test_explicit_employee_evidence_is_separate_from_generic_and_authorization() -> None:

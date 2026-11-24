@@ -13,11 +13,14 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
 
-DISCOUNT_ANALYSIS_VERSION = "rpg-observed-discounts-1.1.0"
+from retailprintguard.api.schemas import DocumentView
+
+DISCOUNT_ANALYSIS_VERSION = "rpg-observed-discounts-1.2.0"
 _ZERO = Decimal("0")
 _CENT = Decimal("0.01")
 _MAX_LINES = 32_768
 _MAX_TEXT = 2_048
+_MAX_SPAN = 1_000_000_000_000
 _QUANTITY = re.compile(
     r"^\s*(?P<quantity>\d{1,6}(?:[.,]\d{1,4})?)\s*[xX×]\s*"
     r"(?P<unit>(?:\d{1,9}|\d{1,3}(?:\.\d{3}){1,3}),\d{2})\s*$"
@@ -233,6 +236,203 @@ def _discount_label(line: Any) -> tuple[str, Decimal | None, str]:
     return label, next(iter(rates)) if len(rates) == 1 else None, "other"
 
 
+def _span_within(span: Any, direction: str, envelope: Any | None = None) -> bool:
+    offset, length = _get(span, "offset"), _get(span, "length")
+    if (
+        _get(span, "direction") != direction
+        or type(offset) is not int
+        or type(length) is not int
+        or offset < 0
+        or length <= 0
+        or offset > _MAX_SPAN
+        or length > _MAX_SPAN
+    ):
+        return False
+    if envelope is None:
+        return True
+    start, size = _get(envelope, "offset"), _get(envelope, "length")
+    return (
+        type(start) is int
+        and type(size) is int
+        and 0 <= start <= _MAX_SPAN
+        and 0 < size <= _MAX_SPAN
+        and start <= offset
+        and offset + length <= start + size
+    )
+
+
+def _epson_soap_receipt(document: Any) -> bool:
+    """Identify the parser's fiscal sale, not arbitrary Epson command output."""
+
+    metadata = _get(document, "raw_metadata")
+    document_type = _get(document, "type")
+    return (
+        _get(document, "parser_name") == "retailprintguard-epson-observed"
+        and _get(document, "subtype") == "EPSON_COMMERCIAL_SALE_SOAP_OBSERVED"
+        and getattr(document_type, "value", document_type) == "COMMERCIAL_DOCUMENT"
+        and (
+            (
+                isinstance(metadata, Mapping)
+                and metadata.get("protocol") == "EPSON_FPMATE_SOAP_HTTP"
+                and metadata.get("request_root") == "printerFiscalReceipt"
+            )
+            or isinstance(document, DocumentView)
+        )
+    )
+
+
+def _epson_response_total_reconciled(
+    document: Any,
+    rows: Sequence[Any],
+    positive_total: Decimal,
+    negative_total: Decimal,
+    observations: Sequence[DiscountObservation],
+) -> bool:
+    """Use Epson's fiscal response as total evidence only with full provenance.
+
+    Epson SOAP sends sale and adjustment commands, then reports the fiscal
+    total in the acknowledged device response. It has no printed total row in
+    the request. A stored boolean alone is insufficient: both the request
+    rows and the response amount must independently reconcile here.
+    """
+
+    if not _epson_soap_receipt(document):
+        return False
+    metadata = _get(document, "raw_metadata")
+    projection = isinstance(document, DocumentView)
+    receipt_number = str(
+        (_get(document, "external_document_code_suffix") if projection else
+         metadata.get("fiscal_receipt_number")) or ""
+    )
+    if (
+        _get(document, "complete") is not True
+        or _get(document, "status") != "ACKNOWLEDGED"
+        or _get(document, "parser_version") != "1.1.0"
+        or re.fullmatch(r"[0-9]{1,12}", receipt_number) is None
+        or int(receipt_number) <= 0
+    ):
+        return False
+    request_span = None
+    if projection:
+        sha = _get(document, "sha256")
+        if (
+            _get(document, "confidence") != 95
+            or not isinstance(sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha) is None
+            or _get(document, "document_timestamp_evidence")
+            not in {"EPSON_SOAP_RESPONSE_PRINTER_CLOCK", "EPSON_SOAP_LOCAL_CLOCK_DST_UNRESOLVED"}
+            or not str(_get(document, "normalized_text") or "").startswith(
+                "DOCUMENTO COMMERCIALE EPSON (DATI SOAP)\n"
+            )
+        ):
+            return False
+    else:
+        if (
+            metadata.get("response_paired") is not True
+            or metadata.get("command_acknowledged") is not True
+            or metadata.get("arithmetic_reconciled") is not True
+            or metadata.get("payment_reconciled") is not True
+            or metadata.get("fiscal_identity_evidence") != "EPSON_SOAP_RESPONSE_FIELDS"
+            or metadata.get("text_projection") != "RECONSTRUCTED_FROM_SOAP_NOT_PRINTED_TEXT"
+            or re.fullmatch(r"[0-9]{1,12}", str(metadata.get("z_report_number") or ""))
+            is None
+        ):
+            return False
+        request_span = {
+            "direction": metadata.get("direction"),
+            "offset": metadata.get("raw_offset"),
+            "length": metadata.get("raw_length"),
+        }
+        response_span = metadata.get("response_span")
+        if (
+            not _span_within(request_span, "CLIENT_TO_DEVICE")
+            or not _span_within(response_span, "DEVICE_TO_CLIENT")
+            or not _span_within(
+                metadata.get("fiscal_total_source_span"),
+                "DEVICE_TO_CLIENT", response_span,
+            )
+            or _get(metadata.get("fiscal_total_source_span"), "length") > 128
+        ):
+            return False
+    total = _decimal(_get(document, "gross_total"))
+    net = _decimal(_get(document, "net_total"))
+    discount = _decimal(_get(document, "discount_total"))
+    if total is None or total <= _ZERO or net != total or discount is None:
+        return False
+    sale_total = surcharge_total = discount_total = _ZERO
+    modifiers = None if projection else metadata.get("subtotal_modifiers")
+    if not projection and not isinstance(modifiers, list):
+        return False
+    observed_modifiers: list[tuple[str, str, Decimal]] = []
+    discount_rows = 0
+    for line in rows:
+        if not _active(line) or (
+            not projection and not _span_within(
+                _get(line, "source"), "CLIENT_TO_DEVICE", request_span
+            )
+        ):
+            return False
+        amount = _decimal(_get(line, "line_total"))
+        state = _get(line, "state")
+        if amount is None:
+            return False
+        if state == "SALE_ITEM":
+            quantity = _decimal(_get(line, "quantity"))
+            unit = _decimal(_get(line, "unit_price"))
+            if (
+                amount <= _ZERO or quantity is None or quantity <= _ZERO
+                or unit is None or unit < _ZERO
+                or (quantity * unit).quantize(_CENT) != amount
+            ):
+                return False
+            sale_total += amount
+        elif state == "SUBTOTAL_DISCOUNT":
+            row_discount = _decimal(_get(line, "discount"))
+            if amount >= _ZERO or row_discount is None or row_discount != -amount:
+                return False
+            discount_total += row_discount
+            discount_rows += 1
+            observed_modifiers.append(("-", _label(line), row_discount))
+        elif state == "SUBTOTAL_SURCHARGE":
+            row_surcharge = _decimal(_get(line, "surcharge"))
+            if amount <= _ZERO or row_surcharge is None or row_surcharge != amount:
+                return False
+            surcharge_total += row_surcharge
+            observed_modifiers.append(("+", _label(line), row_surcharge))
+        else:
+            return False
+    declared_modifiers: list[tuple[str, str, Decimal]] = []
+    for modifier in modifiers or ():
+        if not isinstance(modifier, Mapping):
+            return False
+        amount = _decimal(modifier.get("amount"))
+        sign, label = modifier.get("sign"), modifier.get("description")
+        if sign not in ("+", "-") or not isinstance(label, str) or amount is None:
+            return False
+        declared_modifiers.append((sign, " ".join(label.split()), amount))
+    payments = _get(document, "payments") or ()
+    payment_amounts = [_decimal(_get(payment, "amount")) for payment in payments]
+    return (
+        sale_total > _ZERO
+        and (
+            projection
+            or sale_total == _decimal(metadata.get("observed_item_subtotal"))
+        )
+        and discount_total == discount == negative_total
+        and discount_rows == 1
+        and surcharge_total == _ZERO
+        and (projection or declared_modifiers == observed_modifiers)
+        and discount_rows == len(observations)
+        and all(item.arithmetic_verified for item in observations)
+        and sale_total + surcharge_total - discount_total == total
+        and positive_total == sale_total
+        and positive_total - negative_total == total
+        and bool(payment_amounts)
+        and all(amount is not None and amount >= _ZERO for amount in payment_amounts)
+        and sum(payment_amounts, _ZERO) == total
+    )
+
+
 def analyze_document_discounts(document: Any) -> DiscountAnalysis:
     """Read explicit, negative sale rows; never infer an employee entitlement.
 
@@ -261,9 +461,11 @@ def analyze_document_discounts(document: Any) -> DiscountAnalysis:
         None,
     )
     section = rows if total_index is None else rows[:total_index]
+    epson_soap = total_index is None and _epson_soap_receipt(document)
     observations: list[DiscountObservation] = []
     positive_total = _ZERO
     negative_total = _ZERO
+    epson_sale_total = _ZERO
     previous_basis: Decimal | None = None
     for index, line in enumerate(section):
         if index in context_indexes:
@@ -282,11 +484,16 @@ def analyze_document_discounts(document: Any) -> DiscountAnalysis:
                 continue
             normalized, rate, kind = _discount_label(line)
             observed = -amount
+            basis = (
+                epson_sale_total
+                if epson_soap and _get(line, "state") == "SUBTOTAL_DISCOUNT"
+                else previous_basis
+            )
             verified = bool(
-                previous_basis is not None
+                basis is not None
                 and rate is not None
                 and _ZERO < rate <= 100
-                and (previous_basis * rate / 100).quantize(_CENT, rounding=ROUND_HALF_UP)
+                and (basis * rate / 100).quantize(_CENT, rounding=ROUND_HALF_UP)
                 == observed
             )
             observations.append(
@@ -296,7 +503,7 @@ def analyze_document_discounts(document: Any) -> DiscountAnalysis:
                     amount=observed,
                     rate_percent=rate,
                     kind=kind,
-                    basis=previous_basis,
+                    basis=basis,
                     arithmetic_verified=verified,
                     source_text=str(_get(line, "raw_text") or "")[:_MAX_TEXT],
                 )
@@ -316,13 +523,18 @@ def analyze_document_discounts(document: Any) -> DiscountAnalysis:
                 previous_basis = None
         elif amount is not None and amount > _ZERO and not _technical(label):
             positive_total += amount
+            if epson_soap and _get(line, "state") == "SALE_ITEM":
+                epson_sale_total += amount
             previous_basis = amount
         else:
             if amount is not None and amount < _ZERO:
                 reasons.append("unclassified_negative_sale_row")
             previous_basis = None
     if total_index is None:
-        reasons.append("printed_total_missing")
+        if not _epson_response_total_reconciled(
+            document, rows, positive_total, negative_total, observations
+        ):
+            reasons.append("printed_total_missing")
     else:
         if any(_DISCOUNT_WORD.search(_label(line)) for line in rows[total_index + 1 :]):
             reasons.append("discount_after_total")

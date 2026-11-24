@@ -12,6 +12,9 @@ la struttura di Keep a Changelog.
 - La regola sugli articoli a valore nullo o negativo esclude gli sconti di
   subtotale Epson strutturati e riconciliati, senza nascondere gli articoli
   effettivamente anomali o gli sconti superiori al 90%.
+- Gli sconti Epson SOAP sono riconciliati con il totale fiscale e i pagamenti
+  confermati nella risposta del dispositivo anche senza una riga `TOTALE` nel
+  comando; le segnalazioni oltre il 90% coprono anche questo formato.
 
 ## [0.5.9] — 2026-11-24
 
