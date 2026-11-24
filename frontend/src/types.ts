@@ -88,6 +88,12 @@ export interface ExportRequest {
 
 export interface Dashboard {
   documents: number
+  observed_covers?: number
+  covers_counted_episodes?: number
+  covers_ambiguous_episodes?: number
+  covers_source_disagreements?: number
+  covers_unlinked_documents?: number
+  covers_unlinked_observations?: number
   complete_documents?: number
   partial_documents?: number
   excluded_evidence?: number

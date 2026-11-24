@@ -693,6 +693,242 @@ def _historical_correlation_occurrences() -> Any:
     )
 
 
+_MAX_OBSERVED_COVERS = 1000
+
+
+def _bounded_observed_covers(value: Any) -> int | None:
+    """Accept only a positive parser integer or integral stored quantity."""
+
+    if type(value) is int:
+        count = value
+    elif (
+        isinstance(value, Decimal)
+        and value.is_finite()
+        and 0 < value <= _MAX_OBSERVED_COVERS
+        and value == value.to_integral_value()
+    ):
+        count = int(value)
+    else:
+        return None
+    return count if 0 < count <= _MAX_OBSERVED_COVERS else None
+
+
+def _dashboard_observed_covers(
+    session: Session,
+    *,
+    occurrence: Any,
+    filters: dict[str, Any],
+) -> tuple[int, int, int, int, int, int]:
+    """Count an explicit cover figure once per current correlated sale.
+
+    The POS ``Coperti:`` field is primary; an exact RCH ``Coperto`` quantity
+    from a complete closing document is a fallback. Pre-bills and reprints do
+    not add guests. Conflicts within the chosen source are excluded; a POS/RCH
+    discrepancy is reported while retaining the unambiguous primary POS value.
+    The first acquisition of cover evidence assigns the sale to one period.
+    """
+
+    semantic_type = _version_column(DocumentVersion.document_type, Document.document_type)
+    eligible_pos = and_(
+        ParserVersion.name == "retailprintguard-escpos",
+        semantic_type.in_((DocumentType.ORDER.value, DocumentType.ORDER_CHANGE.value,
+                           DocumentType.KITCHEN_ORDER.value)),
+    )
+    eligible_rch = and_(
+        ParserVersion.name == "retailprintguard-rch-observed",
+        semantic_type.in_((DocumentType.MANAGEMENT_DOCUMENT.value,
+                           DocumentType.COMMERCIAL_DOCUMENT.value)),
+    )
+    matching_cover_line = and_(
+        DocumentLine.document_version_id == DocumentVersion.id,
+        func.upper(func.trim(DocumentLine.description)) == "COPERTO",
+    )
+    rows = session.execute(
+        select(
+            occurrence.c.transaction_id,
+            Document.id,
+            Document.captured_at,
+            ParserVersion.name,
+            DocumentVersion.raw_metadata,
+            DocumentLine.id,
+            DocumentLine.quantity,
+            DocumentLine.cancelled,
+            DocumentLine.removed,
+        )
+        .select_from(occurrence)
+        .join(
+            DocumentCorrelationMember,
+            DocumentCorrelationMember.correlation_id == occurrence.c.correlation_id,
+        )
+        .join(Document, Document.id == DocumentCorrelationMember.document_id)
+        .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+        .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
+        .outerjoin(DocumentLine, matching_cover_line)
+        .where(
+            DocumentVersion.id == _latest_version_id(),
+            DocumentVersion.complete.is_(True),
+            or_(eligible_pos, eligible_rch),
+        )
+    ).all()
+    # Multiple exact Coperto rows within one RCH closing document are summed;
+    # each document then contributes only one candidate to its sale episode.
+    documents: dict[UUID, dict[str, Any]] = {}
+    membership: dict[UUID, set[UUID]] = {}
+    for row in rows:
+        (
+            transaction_id, document_id, captured_at, parser, metadata,
+            line_id, quantity, cancelled, removed,
+        ) = row
+        membership.setdefault(document_id, set()).add(transaction_id)
+        entry = documents.setdefault(document_id, {
+            "transaction_id": transaction_id,
+            "captured_at": captured_at,
+            "parser": parser,
+            "metadata": metadata,
+            "rch_quantities": [],
+            "rch_line_ids": set(),
+        })
+        if (
+            parser == "retailprintguard-rch-observed"
+            and line_id is not None
+            and line_id not in entry["rch_line_ids"]
+            and not (cancelled or removed)
+        ):
+            entry["rch_line_ids"].add(line_id)
+            entry["rch_quantities"].append(quantity)
+
+    episodes: dict[UUID, dict[str, Any]] = {}
+    for document_id, entry in documents.items():
+        if entry["parser"] == "retailprintguard-escpos":
+            metadata = entry["metadata"]
+            covers = _bounded_observed_covers(
+                metadata.get("covers") if isinstance(metadata, dict) else None
+            )
+            source = "pos_values"
+        else:
+            values = entry["rch_quantities"]
+            parsed = [_bounded_observed_covers(value) for value in values]
+            covers = (
+                sum(parsed)
+                if parsed and all(value is not None and value > 0 for value in parsed)
+                else None
+            )
+            if covers is not None and covers > _MAX_OBSERVED_COVERS:
+                covers = None
+            source = "rch_values"
+        if covers is None:
+            continue
+        if len(membership[document_id]) != 1:
+            for member_transaction_id in membership[document_id]:
+                affected = episodes.setdefault(member_transaction_id, {
+                    "first_captured_at": entry["captured_at"],
+                    "pos_values": set(),
+                    "rch_values": set(),
+                    "ambiguous": True,
+                })
+                affected["ambiguous"] = True
+                first = affected["first_captured_at"]
+                if first is None or entry["captured_at"] < first:
+                    affected["first_captured_at"] = entry["captured_at"]
+            continue
+        transaction_id = entry["transaction_id"]
+        episode = episodes.setdefault(transaction_id, {
+            "first_captured_at": None,
+            "pos_values": set(),
+            "rch_values": set(),
+            "ambiguous": False,
+        })
+        episode[source].add(covers)
+        first = episode["first_captured_at"]
+        if first is None or entry["captured_at"] < first:
+            episode["first_captured_at"] = entry["captured_at"]
+
+    total = counted = ambiguous = source_disagreements = 0
+    for episode in episodes.values():
+        first = episode["first_captured_at"]
+        if first is None or (
+            filters.get("from") is not None and first < filters["from"]
+        ) or (
+            filters.get("to") is not None and first >= filters["to"]
+        ):
+            continue
+        pos_values = episode["pos_values"]
+        rch_values = episode["rch_values"]
+        chosen_values = pos_values if pos_values else rch_values
+        if episode["ambiguous"] or len(chosen_values) != 1:
+            ambiguous += 1
+            continue
+        chosen = next(iter(chosen_values))
+        if pos_values and rch_values and rch_values != {chosen}:
+            source_disagreements += 1
+        total += chosen
+        counted += 1
+
+    # Preserve visibility of explicit POS and RCH observations that current
+    # correlations cannot assign to a unique sale. Their raw sum is diagnostic
+    # only and is never added to the deduplicated cover total.
+    linked_documents = set(membership)
+    unlinked_documents = unlinked_observations = 0
+    unlinked: dict[UUID, dict[str, Any]] = {}
+    for row in session.execute(
+        select(
+            Document.id, Document.captured_at, ParserVersion.name,
+            DocumentVersion.raw_metadata, DocumentLine.id, DocumentLine.quantity,
+            DocumentLine.cancelled, DocumentLine.removed,
+        )
+        .select_from(Document)
+        .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+        .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
+        .outerjoin(DocumentLine, matching_cover_line)
+        .where(
+            DocumentVersion.id == _latest_version_id(),
+            DocumentVersion.complete.is_(True),
+            or_(eligible_pos, eligible_rch),
+        )
+    ):
+        (
+            document_id, captured_at, parser, metadata,
+            line_id, quantity, cancelled, removed,
+        ) = row
+        if document_id in linked_documents or (
+            filters.get("from") is not None and captured_at < filters["from"]
+        ) or (
+            filters.get("to") is not None and captured_at >= filters["to"]
+        ):
+            continue
+        entry = unlinked.setdefault(document_id, {
+            "parser": parser, "metadata": metadata, "rch_lines": {},
+        })
+        if (
+            parser == "retailprintguard-rch-observed"
+            and line_id is not None
+            and not (cancelled or removed)
+        ):
+            entry["rch_lines"][line_id] = quantity
+    for entry in unlinked.values():
+        if entry["parser"] == "retailprintguard-escpos":
+            metadata = entry["metadata"]
+            covers = _bounded_observed_covers(
+                metadata.get("covers") if isinstance(metadata, dict) else None
+            )
+        else:
+            parsed = [_bounded_observed_covers(value) for value in entry["rch_lines"].values()]
+            covers = (
+                sum(parsed)
+                if parsed and all(value is not None and value > 0 for value in parsed)
+                else None
+            )
+            if covers is not None and covers > _MAX_OBSERVED_COVERS:
+                covers = None
+        if covers is not None:
+            unlinked_documents += 1
+            unlinked_observations += covers
+    return (
+        total, counted, ambiguous, source_disagreements,
+        unlinked_documents, unlinked_observations,
+    )
+
+
 def _dashboard_sales_department_quantities(
     session: Session,
     *,
@@ -1521,6 +1757,14 @@ class SqlAlchemyApiRepository:
                 session,
                 document_period=document_period,
             )
+            (
+                observed_covers,
+                covers_counted_episodes,
+                covers_ambiguous_episodes,
+                covers_source_disagreements,
+                covers_unlinked_documents,
+                covers_unlinked_observations,
+            ) = _dashboard_observed_covers(session, occurrence=occurrence, filters=filters)
             employee_discount_total = _dashboard_employee_discount_total(
                 session,
                 occurrence=occurrence,
@@ -1752,6 +1996,12 @@ class SqlAlchemyApiRepository:
                 available_data_from=available_from,
                 available_data_to=available_to,
                 documents=documents,
+                observed_covers=observed_covers,
+                covers_counted_episodes=covers_counted_episodes,
+                covers_ambiguous_episodes=covers_ambiguous_episodes,
+                covers_source_disagreements=covers_source_disagreements,
+                covers_unlinked_documents=covers_unlinked_documents,
+                covers_unlinked_observations=covers_unlinked_observations,
                 orders=orders,
                 pre_bills=type_counts.get(DocumentType.PRE_BILL.value, 0),
                 management_documents=type_counts.get(DocumentType.MANAGEMENT_DOCUMENT.value, 0),

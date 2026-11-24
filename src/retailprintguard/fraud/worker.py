@@ -11,9 +11,10 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from retailprintguard.analysis.discounts import analyze_document_discounts
 from retailprintguard.common.domain import (
     NON_SALE_DOCUMENT_TYPES,
     AlertSeverity,
@@ -215,6 +216,7 @@ class FraudWorker:
             findings_suppressed = 0
             alerts_inserted = 0
             evidence_inserted = 0
+            completed_evaluations: dict[UUID, set[str]] = {}
             for correlation in correlations:
                 prepared_item = prepared.get(correlation.id)
                 if prepared_item is None:
@@ -291,11 +293,19 @@ class FraudWorker:
                     )
                     alerts_inserted += int(inserted)
                     evidence_inserted += evidence_count
+                completed_evaluations[correlation.id] = {
+                    finding.rule_code for finding in evaluation.findings
+                } | {
+                    suppressed.finding.rule_code for suppressed in evaluation.suppressed
+                }
             # Resolve stale alerts only after replacement correlations have been
             # evaluated in this transaction.  This lets us distinguish an amount
             # discrepancy genuinely fixed by late evidence (for example the second
             # half of a split payment) from an anomaly that is still present.
-            alerts_superseded = self._resolve_superseded_alerts(session, now)
+            alerts_superseded = self._resolve_prior_rule_versions(
+                session, now, rule_rows, completed_evaluations
+            )
+            alerts_superseded += self._resolve_superseded_alerts(session, now)
             return FraudRunReport(
                 correlations_loaded=len(correlations),
                 transactions_evaluated=evaluated,
@@ -430,6 +440,83 @@ class FraudWorker:
         return justified
 
     @staticmethod
+    def _only_reconciled_epson_subtotal_discounts(
+        session: Session, alert: FraudAlert
+    ) -> bool:
+        """Prove a legacy non-positive finding contained only Epson adjustments.
+
+        Re-read the selected immutable document version.  The old finding's
+        text alone cannot establish that a negative amount was a discount.
+        A mixed finding containing any actual non-positive item stays open.
+        """
+
+        evidence_rows = session.scalars(
+            select(FraudAlertEvidence)
+            .where(FraudAlertEvidence.fraud_alert_id == alert.id)
+            .order_by(FraudAlertEvidence.sequence)
+        ).all()
+        if not evidence_rows or any(
+            row.evidence_type != "non_positive_item"
+            or row.document_id is None
+            or not isinstance(row.evidence, dict)
+            for row in evidence_rows
+        ):
+            return False
+        document_ids = {row.document_id for row in evidence_rows}
+        loaded = load_latest_documents(session, document_ids=document_ids)
+        if len(loaded) != len(document_ids):
+            return False
+        documents = {item.value.id: item.value for item in loaded}
+        for document in documents.values():
+            if (
+                document.type.value != "COMMERCIAL_DOCUMENT"
+                or document.parser_name != "retailprintguard-epson-observed"
+                or document.parser_version != "1.1.0"
+                or document.subtype != "EPSON_COMMERCIAL_SALE_SOAP_OBSERVED"
+                or not analyze_document_discounts(document).arithmetic_reconciled
+            ):
+                return False
+        for row in evidence_rows:
+            evidence = row.evidence
+            if (
+                evidence.get("kind") != "non_positive_item"
+                or evidence.get("document_id") != str(row.document_id)
+                or type(evidence.get("line_sequence")) is not int
+                or evidence.get("line_sequence") < 1
+            ):
+                return False
+            document = documents[row.document_id]
+            lines = [
+                line for line in document.lines
+                if line.sequence == evidence["line_sequence"]
+            ]
+            if len(lines) != 1:
+                return False
+            line = lines[0]
+            reported_total = evidence.get("line_total")
+            if not isinstance(reported_total, str) or len(reported_total) > 64:
+                return False
+            try:
+                amount = Decimal(reported_total)
+            except (ArithmeticError, ValueError):
+                return False
+            if (
+                not amount.is_finite()
+                or line.state != "SUBTOTAL_DISCOUNT"
+                or line.discount is None
+                or line.discount <= 0
+                or line.line_total != -line.discount
+                or line.line_total != amount
+                or line.quantity is not None
+                or line.unit_price is not None
+                or line.modified_unit_price is not None
+                or line.description != evidence.get("description")
+                or evidence.get("unit_price") != "None"
+            ):
+                return False
+        return True
+
+    @staticmethod
     def _reclassify_known_false_positives(session: Session, now: datetime) -> int:
         primary_rule_enabled = bool(
             session.scalar(
@@ -437,6 +524,13 @@ class FraudWorker:
                     FraudRule.code == "MODIFICA_POST_PRECONTO"
                 )
             )
+        )
+        legacy_codes = (
+            "DUPLICATE_DOCUMENT",
+            "UNUSUAL_OPERATOR_PATTERN",
+            "LATE_ORDER_MODIFICATION",
+            "NEGATIVE_OR_ZERO_VALUE_ITEM",
+            *_AUXILIARY_ECONOMIC_RULE_CODES,
         )
         candidates = session.execute(
             select(FraudAlert, FraudRule.code, FraudRuleVersion.implementation_version)
@@ -447,17 +541,20 @@ class FraudWorker:
             .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
             .where(
                 FraudAlert.status == "OPEN",
-                FraudRule.code.in_(
-                    (
-                        "DUPLICATE_DOCUMENT",
-                        "UNUSUAL_OPERATOR_PATTERN",
-                        "LATE_ORDER_MODIFICATION",
-                        "NEGATIVE_OR_ZERO_VALUE_ITEM",
-                        *_AUXILIARY_ECONOMIC_RULE_CODES,
-                    )
-                ),
-                FraudRuleVersion.implementation_version.in_(
-                    ("rpg-fraud-1.0.0", "rpg-fraud-1.1.0")
+                or_(
+                    and_(
+                        FraudRule.code.in_(legacy_codes),
+                        FraudRuleVersion.implementation_version.in_(
+                            ("rpg-fraud-1.0.0", "rpg-fraud-1.1.0")
+                        ),
+                    ),
+                    and_(
+                        FraudRule.code == "NEGATIVE_OR_ZERO_VALUE_ITEM",
+                        FraudRuleVersion.implementation_version.in_(
+                            ("rpg-fraud-1.5.0", "rpg-fraud-1.5.1")
+                        ),
+                        FraudAlert.is_canonical.is_(True),
+                    ),
                 ),
             )
             .order_by(FraudAlert.opened_at, FraudAlert.id)
@@ -529,37 +626,49 @@ class FraudWorker:
                     diagnostic["defect"] = "printed_output_treated_as_late_action"
                     diagnostic["source_document_types"] = sorted(source_types)
             elif rule_code == "NEGATIVE_OR_ZERO_VALUE_ITEM":
-                evidence_rows = session.scalars(
-                    select(FraudAlertEvidence).where(
-                        FraudAlertEvidence.fraud_alert_id == alert.id,
-                        FraudAlertEvidence.evidence_type == "non_positive_item",
-                    )
-                ).all()
-                observed_values: list[Decimal] = []
-                descriptions: list[str] = []
-                for evidence in evidence_rows:
-                    description = (evidence.evidence or {}).get("description")
-                    if description is not None:
-                        descriptions.append(str(description))
-                    for key in ("unit_price", "line_total"):
-                        value = (evidence.evidence or {}).get(key)
-                        if value is not None:
-                            try:
-                                observed_values.append(Decimal(str(value)))
-                            except (ArithmeticError, TypeError, ValueError):
-                                continue
-                if (
-                    observed_values
-                    and all(value >= 0 for value in observed_values)
-                    and descriptions
-                    and all(technical_non_sale_line(item) for item in descriptions)
-                ):
-                    reason = (
-                        "L'alert conteneva esclusivamente righe a valore zero, tipiche di "
-                        "footer/proiezioni tecniche riconosciute. Le riduzioni economiche "
-                        "restano coperte dal confronto preconto-chiusura."
-                    )
-                    diagnostic["defect"] = "zero_value_technical_line_noise"
+                if implementation_version in ("rpg-fraud-1.5.0", "rpg-fraud-1.5.1"):
+                    if FraudWorker._only_reconciled_epson_subtotal_discounts(
+                        session, alert
+                    ):
+                        reason = (
+                            "Le sole righe segnalate erano sconti di subtotale di una ricevuta "
+                            "fiscale Epson SOAP riconciliata, non articoli a valore negativo."
+                        )
+                        diagnostic["defect"] = "epson_subtotal_discount_treated_as_item"
+                    if reason is None:
+                        continue
+                else:
+                    evidence_rows = session.scalars(
+                        select(FraudAlertEvidence).where(
+                            FraudAlertEvidence.fraud_alert_id == alert.id,
+                            FraudAlertEvidence.evidence_type == "non_positive_item",
+                        )
+                    ).all()
+                    observed_values: list[Decimal] = []
+                    descriptions: list[str] = []
+                    for evidence in evidence_rows:
+                        description = (evidence.evidence or {}).get("description")
+                        if description is not None:
+                            descriptions.append(str(description))
+                        for key in ("unit_price", "line_total"):
+                            value = (evidence.evidence or {}).get(key)
+                            if value is not None:
+                                try:
+                                    observed_values.append(Decimal(str(value)))
+                                except (ArithmeticError, TypeError, ValueError):
+                                    continue
+                    if (
+                        observed_values
+                        and all(value >= 0 for value in observed_values)
+                        and descriptions
+                        and all(technical_non_sale_line(item) for item in descriptions)
+                    ):
+                        reason = (
+                            "L'alert conteneva esclusivamente righe a valore zero, tipiche di "
+                            "footer/proiezioni tecniche riconosciute. Le riduzioni economiche "
+                            "restano coperte dal confronto preconto-chiusura."
+                        )
+                        diagnostic["defect"] = "zero_value_technical_line_noise"
             elif rule_code == "DUPLICATE_DOCUMENT" and alert.correlation_id is not None:
                 member_ids = set(
                     session.scalars(
@@ -831,6 +940,137 @@ class FraudWorker:
                 )
             )
             resolved += 1
+        return resolved
+
+    @staticmethod
+    def _resolve_prior_rule_versions(
+        session: Session,
+        now: datetime,
+        rule_rows: dict[str, tuple[RuleDefinition, FraudRuleVersion]],
+        completed: dict[UUID, set[str]],
+    ) -> int:
+        """Close old open rule revisions only after a full current evaluation.
+
+        A changed rule version has a different immutable finding key.  Retain
+        both alert/evidence histories, but present only the current rule's
+        finding as open.  Human-reviewed dispositions are left untouched.
+        """
+
+        if not completed:
+            return 0
+        resolved = 0
+        correlation_ids = list(completed)
+        for start in range(0, len(correlation_ids), 500):
+            batch = correlation_ids[start:start + 500]
+            rows = session.execute(
+                select(
+                    FraudAlert, FraudRule.code,
+                    FraudRuleVersion.version,
+                    FraudRuleVersion.implementation_version,
+                )
+                .join(FraudRuleVersion, FraudRuleVersion.id == FraudAlert.fraud_rule_version_id)
+                .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+                .where(FraudAlert.correlation_id.in_(batch))
+                .order_by(FraudAlert.opened_at, FraudAlert.id)
+                .with_for_update()
+            ).all()
+            replacements = {
+                (alert.correlation_id, code): alert.id
+                for alert, code, _, _ in rows
+                if (
+                    code in completed.get(alert.correlation_id, set())
+                    and code in rule_rows
+                    and alert.fraud_rule_version_id == rule_rows[code][1].id
+                )
+            }
+            for alert, code, old_number, old_implementation in rows:
+                current = rule_rows.get(code)
+                if (
+                    current is None
+                    or not current[0].enabled
+                    or alert.status != "OPEN"
+                    or not alert.is_canonical
+                    or alert.fraud_rule_version_id == current[1].id
+                    or old_number >= current[1].version
+                ):
+                    continue
+                finding_detected = code in completed[alert.correlation_id]
+                replacement_id = replacements.get((alert.correlation_id, code))
+                if finding_detected and replacement_id is None:
+                    # An unpersisted current result must never retire an old alert.
+                    continue
+                reason = (
+                    "La stessa correlazione è stata rivalutata con la versione corrente "
+                    "della regola; l'alert precedente è sostituito dalla nuova valutazione."
+                    if finding_detected else
+                    "La stessa correlazione è stata rivalutata con la versione corrente "
+                    "della regola, che non riproduce il finding precedente."
+                )
+                alert.status = "JUSTIFIED"
+                alert.closed_at = now
+                alert.updated_at = now
+                alert.closure_reason = reason
+                sequence = (
+                    session.scalar(
+                        select(func.max(FraudAlertEvidence.sequence)).where(
+                            FraudAlertEvidence.fraud_alert_id == alert.id
+                        )
+                    ) or 0
+                ) + 1
+                session.add(FraudAlertEvidence(
+                    fraud_alert_id=alert.id,
+                    sequence=sequence,
+                    evidence_type="RULE_VERSION_SUPERSEDED",
+                    summary="Alert storico sostituito dalla regola corrente",
+                    evidence={
+                        "kind": "rule_version_superseded",
+                        "correlation_id": str(alert.correlation_id),
+                        "rule_code": code,
+                        "old_rule_version": old_number,
+                        "old_implementation_version": old_implementation,
+                        "current_rule_version": current[1].version,
+                        "current_implementation_version": current[1].implementation_version,
+                        "current_finding_detected": finding_detected,
+                        "replacement_alert_id": (
+                            str(replacement_id) if replacement_id is not None else None
+                        ),
+                    },
+                ))
+                latest = session.scalar(
+                    select(FraudAlertHistory)
+                    .where(FraudAlertHistory.fraud_alert_id == alert.id)
+                    .order_by(FraudAlertHistory.sequence.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+                history_sequence = 1 if latest is None else latest.sequence + 1
+                previous_hash = ZERO_HASH if latest is None else latest.record_hash
+                payload = {
+                    "alert_id": str(alert.id),
+                    "sequence": history_sequence,
+                    "actor_user_id": None,
+                    "event_type": "ALERT_AUTO_RULE_VERSION_SUPERSEDED",
+                    "previous_status": "OPEN",
+                    "new_status": "JUSTIFIED",
+                    "note": None,
+                    "reason": reason,
+                    "occurred_at": now.isoformat(),
+                    "previous_hash": previous_hash,
+                }
+                session.add(FraudAlertHistory(
+                    fraud_alert_id=alert.id,
+                    sequence=history_sequence,
+                    event_type="ALERT_AUTO_RULE_VERSION_SUPERSEDED",
+                    previous_status="OPEN",
+                    new_status="JUSTIFIED",
+                    reason=reason,
+                    occurred_at=now,
+                    previous_record_hash=previous_hash,
+                    record_hash=chained_hash(payload, previous_hash),
+                ))
+                resolved += 1
+        if resolved:
+            session.flush()
         return resolved
 
     def _ensure_and_load_rules(

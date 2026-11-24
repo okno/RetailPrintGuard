@@ -2048,6 +2048,320 @@ def test_old_zero_value_footer_alert_is_reclassified_but_sale_item_is_preserved(
     engine.dispose()
 
 
+def test_reconciled_epson_subtotal_discount_legacy_alert_is_closed_with_audit() -> None:
+    engine, factory = _database()
+    with factory.begin() as session:
+        device_id = _device(session, "epson_synthetic", "epson", 9110)
+        parser = ParserVersion(
+            name="retailprintguard-epson-observed",
+            version="1.1.0",
+            build_sha256=_sha("epson-synthetic-parser"),
+            protocol="EPSON_FPMATE_SOAP_HTTP",
+        )
+        session.add(parser)
+        session.flush()
+        document_id = _document(
+            session,
+            device_id=device_id,
+            parser_id=parser.id,
+            source="epson-discount-synthetic",
+            document_type="COMMERCIAL_DOCUMENT",
+            total="2.80",
+            when=NOW,
+            lines=(("The freddo sintetico", "4.00"),
+                   ("Sconto dipendenti 30% (-30%)", "-1.20")),
+            payment="2.80",
+            order_code="",
+            table_code="TEST-01",
+        )
+        version = session.scalar(
+            select(DocumentVersion).where(DocumentVersion.document_id == document_id)
+        )
+        assert version is not None
+        version.subtype = "EPSON_COMMERCIAL_SALE_SOAP_OBSERVED"
+        version.external_document_code_suffix = "1"
+        version.net_total = Decimal("2.80")
+        version.discount_total = Decimal("1.20")
+        version.status = "ACKNOWLEDGED"
+        version.parse_confidence = 95
+        version.raw_metadata = {
+            "protocol": "EPSON_FPMATE_SOAP_HTTP",
+            "request_root": "printerFiscalReceipt",
+            "response_paired": True,
+            "command_acknowledged": True,
+            "arithmetic_reconciled": True,
+            "payment_reconciled": True,
+            "fiscal_identity_evidence": "EPSON_SOAP_RESPONSE_FIELDS",
+            "text_projection": "RECONSTRUCTED_FROM_SOAP_NOT_PRINTED_TEXT",
+            "fiscal_receipt_number": "1",
+            "z_report_number": "91",
+            "direction": "CLIENT_TO_DEVICE",
+            "raw_offset": 0,
+            "raw_length": 100,
+            "response_span": {
+                "direction": "DEVICE_TO_CLIENT", "offset": 0, "length": 100,
+            },
+            "fiscal_total_source_span": {
+                "direction": "DEVICE_TO_CLIENT", "offset": 10, "length": 5,
+            },
+            "observed_item_subtotal": "4.00",
+            "subtotal_modifiers": [{
+                "sign": "-", "description": "Sconto dipendenti 30% (-30%)",
+                "amount": "1.20",
+            }],
+        }
+        session.flush()
+        lines = session.scalars(
+            select(DocumentLine).where(DocumentLine.document_version_id == version.id)
+            .order_by(DocumentLine.sequence)
+        ).all()
+        assert len(lines) == 2
+        for line in lines:
+            line.source_direction = "CLIENT_TO_DEVICE"
+            line.source_offset = 10 * line.sequence
+            line.source_length = 5
+            line.raw_text = line.description
+        lines[0].line_state = "SALE_ITEM"
+        lines[1].line_state = "SUBTOTAL_DISCOUNT"
+        lines[1].quantity = None
+        lines[1].unit_price = None
+        lines[1].discount = Decimal("1.20")
+
+        worker = FraudWorker(factory)
+        worker._ensure_and_load_rules(session, NOW)
+        rule_version = session.scalar(
+            select(FraudRuleVersion)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "NEGATIVE_OR_ZERO_VALUE_ITEM")
+        )
+        assert rule_version is not None
+        rule_version.implementation_version = "rpg-fraud-1.5.1"
+        alert = FraudAlert(
+            fraud_rule_version_id=rule_version.id,
+            transaction_id=uuid4(),
+            finding_key=_sha("legacy-epson-subtotal-discount"),
+            severity="HIGH",
+            score=73,
+            status="OPEN",
+            description="Articolo con valore nullo o negativo",
+            explanation="Vecchia classificazione sintetica",
+            confidence=90,
+            opened_at=NOW,
+        )
+        session.add(alert)
+        session.flush()
+        session.add(FraudAlertEvidence(
+            fraud_alert_id=alert.id,
+            sequence=1,
+            document_id=document_id,
+            evidence_type="non_positive_item",
+            summary="Vecchia classificazione sintetica",
+            evidence={
+                "kind": "non_positive_item",
+                "document_id": str(document_id),
+                "line_sequence": 2,
+                "description": "Sconto dipendenti 30% (-30%)",
+                "unit_price": "None",
+                "line_total": "-1.20",
+            },
+        ))
+        mixed = FraudAlert(
+            fraud_rule_version_id=rule_version.id,
+            transaction_id=uuid4(),
+            finding_key=_sha("legacy-epson-mixed-item"),
+            severity="HIGH", score=80, status="OPEN",
+            description="Articolo con valore nullo o negativo",
+            explanation="Sconto e altro articolo da verificare",
+            confidence=90, opened_at=NOW,
+        )
+        session.add(mixed)
+        session.flush()
+        session.add_all((
+            FraudAlertEvidence(
+                fraud_alert_id=mixed.id, sequence=1, document_id=document_id,
+                evidence_type="non_positive_item", summary="Sconto sintetico",
+                evidence={
+                    "kind": "non_positive_item", "document_id": str(document_id),
+                    "line_sequence": 2, "description": "Sconto dipendenti 30% (-30%)",
+                    "unit_price": "None", "line_total": "-1.20",
+                },
+            ),
+            FraudAlertEvidence(
+                fraud_alert_id=mixed.id, sequence=2, document_id=document_id,
+                evidence_type="non_positive_item", summary="Articolo da verificare",
+                evidence={
+                    "kind": "non_positive_item", "document_id": str(document_id),
+                    "line_sequence": 1, "description": "The freddo sintetico",
+                    "unit_price": "0.00", "line_total": "0.00",
+                },
+            ),
+        ))
+        session.flush()
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 1
+        assert FraudWorker._reclassify_known_false_positives(session, NOW) == 0
+        alert_id, mixed_id = alert.id, mixed.id
+
+    with factory() as session:
+        alert = session.get(FraudAlert, alert_id)
+        assert alert is not None and alert.status == "FALSE_POSITIVE"
+        evidence = session.scalars(
+            select(FraudAlertEvidence).where(FraudAlertEvidence.fraud_alert_id == alert_id)
+            .order_by(FraudAlertEvidence.sequence)
+        ).all()
+        assert len(evidence) == 2
+        assert evidence[-1].evidence_type == "ENGINE_FALSE_POSITIVE"
+        assert evidence[-1].evidence["defect"] == "epson_subtotal_discount_treated_as_item"
+        history = session.scalar(
+            select(FraudAlertHistory).where(FraudAlertHistory.fraud_alert_id == alert_id)
+        )
+        assert history is not None and history.event_type == "ALERT_AUTO_FALSE_POSITIVE"
+        assert history.previous_record_hash == "0" * 64
+        assert len(history.record_hash) == 64
+        mixed = session.get(FraudAlert, mixed_id)
+        assert mixed is not None and mixed.status == "OPEN"
+    engine.dispose()
+
+
+def test_old_rule_versions_close_only_after_current_correlation_evaluation() -> None:
+    engine, factory = _database()
+    _seed_scenario(factory, split=False)
+    assert CorrelationWorker(factory).run_once().correlations_inserted == 1
+    fraud = FraudWorker(factory)
+    assert fraud.run_once().alerts_inserted >= 1
+    with factory.begin() as session:
+        correlation = session.scalar(select(DocumentCorrelation))
+        assert correlation is not None
+        current_economic = session.execute(
+            select(FraudAlert, FraudRuleVersion)
+            .join(FraudRuleVersion, FraudRuleVersion.id == FraudAlert.fraud_rule_version_id)
+            .join(FraudRule, FraudRule.id == FraudRuleVersion.fraud_rule_id)
+            .where(FraudRule.code == "MODIFICA_POST_PRECONTO")
+        ).one()
+        current_alert, current_version = current_economic
+        current_version.version = 2
+        old_version = FraudRuleVersion(
+            fraud_rule_id=current_version.fraud_rule_id,
+            version=1,
+            implementation_version="rpg-fraud-1.5.1",
+            configuration_fingerprint=_sha("old-economic-rule"),
+            enabled=True,
+            severity=current_version.severity,
+            weight=current_version.weight,
+            configuration=dict(current_version.configuration or {}),
+            effective_from=NOW - timedelta(days=1),
+            effective_until=NOW,
+        )
+        session.add(old_version)
+        session.flush()
+        old_alert = FraudAlert(
+            fraud_rule_version_id=old_version.id,
+            correlation_id=correlation.id,
+            transaction_id=correlation.transaction_id,
+            finding_key=_sha("old-economic-finding"),
+            severity="HIGH", score=75, status="OPEN",
+            description="Riduzione sintetica", explanation="Vecchia versione",
+            confidence=90, opened_at=NOW,
+        )
+        session.add(old_alert)
+        session.flush()
+        old_id, current_id = old_alert.id, current_alert.id
+        rules = fraud._ensure_and_load_rules(session, datetime.now(UTC))
+        # An alert outside the completed set must remain open.
+        assert fraud._resolve_prior_rule_versions(session, NOW, rules, {}) == 0
+        assert old_alert.status == "OPEN"
+        assert fraud._resolve_prior_rule_versions(
+            session, NOW, rules, {correlation.id: {"MODIFICA_POST_PRECONTO"}}
+        ) == 1
+        assert fraud._resolve_prior_rule_versions(
+            session, NOW, rules, {correlation.id: {"MODIFICA_POST_PRECONTO"}}
+        ) == 0
+    with factory() as session:
+        old_alert = session.get(FraudAlert, old_id)
+        current_alert = session.get(FraudAlert, current_id)
+        assert old_alert is not None and old_alert.status == "JUSTIFIED"
+        assert current_alert is not None and current_alert.status == "OPEN"
+        evidence = session.scalar(
+            select(FraudAlertEvidence).where(
+                FraudAlertEvidence.fraud_alert_id == old_id,
+                FraudAlertEvidence.evidence_type == "RULE_VERSION_SUPERSEDED",
+            )
+        )
+        assert evidence is not None
+        assert evidence.evidence["current_finding_detected"] is True
+        assert evidence.evidence["replacement_alert_id"] == str(current_id)
+        history = session.scalar(
+            select(FraudAlertHistory).where(FraudAlertHistory.fraud_alert_id == old_id)
+        )
+        assert history is not None
+        assert history.event_type == "ALERT_AUTO_RULE_VERSION_SUPERSEDED"
+        assert history.previous_record_hash == "0" * 64
+        assert len(history.record_hash) == 64
+    engine.dispose()
+
+
+def test_old_rule_version_without_current_finding_is_closed_after_complete_evaluation() -> None:
+    engine, factory = _database()
+    _seed_scenario(factory, split=False)
+    assert CorrelationWorker(factory).run_once().correlations_inserted == 1
+    fraud = FraudWorker(factory)
+    fraud.run_once()
+    with factory.begin() as session:
+        correlation = session.scalar(select(DocumentCorrelation))
+        assert correlation is not None
+        rule = session.scalar(select(FraudRule).where(
+            FraudRule.code == "NEGATIVE_OR_ZERO_VALUE_ITEM"
+        ))
+        assert rule is not None
+        current = session.scalar(select(FraudRuleVersion).where(
+            FraudRuleVersion.fraud_rule_id == rule.id
+        ))
+        assert current is not None
+        current.version = 2
+        previous = FraudRuleVersion(
+            fraud_rule_id=rule.id, version=1,
+            implementation_version="rpg-fraud-1.5.1",
+            configuration_fingerprint=_sha("old-nonpositive-rule"),
+            enabled=True, severity=current.severity, weight=current.weight,
+            configuration=dict(current.configuration or {}),
+            effective_from=NOW - timedelta(days=1), effective_until=NOW,
+        )
+        session.add(previous)
+        session.flush()
+        old = FraudAlert(
+            fraud_rule_version_id=previous.id,
+            correlation_id=correlation.id,
+            transaction_id=correlation.transaction_id,
+            finding_key=_sha("old-no-current-finding"),
+            severity="HIGH", score=70, status="OPEN",
+            description="Riga sintetica", explanation="Vecchia versione",
+            confidence=90, opened_at=NOW,
+        )
+        human_review = FraudAlert(
+            fraud_rule_version_id=previous.id,
+            correlation_id=correlation.id,
+            transaction_id=correlation.transaction_id,
+            finding_key=_sha("old-human-reviewed-finding"),
+            severity="HIGH", score=70, status="UNDER_REVIEW",
+            description="Riga sintetica", explanation="Revisione manuale",
+            confidence=90, opened_at=NOW,
+        )
+        session.add_all((old, human_review))
+        session.flush()
+        rules = fraud._ensure_and_load_rules(session, datetime.now(UTC))
+        assert fraud._resolve_prior_rule_versions(
+            session, NOW, rules, {correlation.id: set()}
+        ) == 1
+        assert old.status == "JUSTIFIED"
+        assert human_review.status == "UNDER_REVIEW"
+        evidence = session.scalar(select(FraudAlertEvidence).where(
+            FraudAlertEvidence.fraud_alert_id == old.id
+        ))
+        assert evidence is not None
+        assert evidence.evidence["current_finding_detected"] is False
+        assert evidence.evidence["replacement_alert_id"] is None
+    engine.dispose()
+
+
 def test_global_duplicate_outside_correlation_is_reclassified_without_deletion() -> None:
     engine, factory = _database()
     _seed_scenario(factory, split=False)

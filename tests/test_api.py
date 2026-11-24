@@ -76,6 +76,12 @@ class FakeRepository(EmptyRepository):
         self.last_dashboard_filters = filters or {}
         return DashboardView(
             documents=7,
+            observed_covers=7,
+            covers_counted_episodes=3,
+            covers_ambiguous_episodes=1,
+            covers_source_disagreements=1,
+            covers_unlinked_documents=2,
+            covers_unlinked_observations=4,
             pre_bills=2,
             commercial_documents=3,
             open_alerts=1,
@@ -328,6 +334,12 @@ def test_login_dashboard_and_bad_password() -> None:
     response = client.get("/api/v1/dashboard", headers=headers)
     assert response.status_code == 200
     assert response.json()["economic_difference"] == "50.00"
+    assert response.json()["observed_covers"] == 7
+    assert response.json()["covers_counted_episodes"] == 3
+    assert response.json()["covers_ambiguous_episodes"] == 1
+    assert response.json()["covers_source_disagreements"] == 1
+    assert response.json()["covers_unlinked_documents"] == 2
+    assert response.json()["covers_unlinked_observations"] == 4
     assert response.json()["sold_product_quantity_bar"] == "12"
     assert response.json()["sold_product_quantity_kitchen"] == "8.5"
     assert response.json()["sold_product_quantity_pizzeria"] == "6"

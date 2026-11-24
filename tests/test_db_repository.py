@@ -504,6 +504,7 @@ def _add_correlated_document(
     minute: int = 1,
     raw_metadata: dict[str, object] | None = None,
     line_total: str | None = None,
+    correlation_id=None,
 ):
     document_id = uuid4()
     document = Document(
@@ -563,7 +564,7 @@ def _add_correlated_document(
         )
     session.add(
         DocumentCorrelationMember(
-            correlation_id=ids["correlation"],
+            correlation_id=correlation_id or ids["correlation"],
             document_id=document_id,
             role=document_type,
             contribution_score=95,
@@ -1583,6 +1584,118 @@ def test_dashboard_counts_net_department_sales_and_employee_discount_once() -> N
     assert outside.sold_product_quantity_kitchen_takeaway == Decimal("-5.0000")
     assert outside.sold_product_quantity_pizzeria_dine_in == Decimal("9.0000")
     assert outside.employee_discount_total == Decimal("0")
+    engine.dispose()
+
+
+def test_dashboard_covers_count_each_sale_once_with_rch_fallback_and_periods() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    rch_parser_id = uuid4()
+    second_correlation, third_correlation, fourth_correlation = uuid4(), uuid4(), uuid4()
+    with factory.begin() as session:
+        pos_parser = session.get(ParserVersion, ids["parser"])
+        assert pos_parser is not None
+        pos_parser.name = "retailprintguard-escpos"
+        pos_parser.version = "1.3.1"
+        session.add(ParserVersion(
+            id=rch_parser_id, name="retailprintguard-rch-observed", version="1.7.3",
+            build_sha256="1" * 64, protocol="test",
+        ))
+        for correlation_id, transaction_id, fingerprint in (
+            (second_correlation, uuid4(), "2" * 64),
+            (third_correlation, uuid4(), "3" * 64),
+            (fourth_correlation, uuid4(), "4" * 64),
+        ):
+            session.add(DocumentCorrelation(
+                id=correlation_id, transaction_id=transaction_id,
+                algorithm_version="test-1", input_fingerprint=fingerprint,
+                score=95, explanation="Vendita sintetica distinta",
+            ))
+        session.flush()
+
+        def add(
+            kind: str, minute: int, *, covers: int | None = None,
+            rch_quantity: str | None = None, correlation_id=None,
+        ):
+            document_id, version_id = _add_correlated_document(
+                session, ids, document_type=kind, total=None, complete=True,
+                minute=minute, raw_metadata={"covers": covers} if covers is not None else {},
+                correlation_id=correlation_id,
+            )
+            version = session.get(DocumentVersion, version_id)
+            assert version is not None
+            if rch_quantity is not None:
+                version.parser_version_id = rch_parser_id
+                session.add_all((
+                    DocumentLine(
+                        document_version_id=version_id, sequence=1,
+                        description="Coperto", quantity=Decimal(rch_quantity),
+                        line_total=Decimal(rch_quantity) * Decimal("2.00"),
+                    ),
+                    DocumentLine(
+                        document_version_id=version_id, sequence=2,
+                        description="Coperto extra", quantity=Decimal("100"),
+                        line_total=Decimal("100.00"),
+                    ),
+                ))
+            return document_id, version_id
+
+        first_id, _ = add("KITCHEN_ORDER", 1, covers=2)
+        add("ORDER_CHANGE", 2, covers=2)
+        add("REPRINT", 2, covers=100)
+        add("MANAGEMENT_DOCUMENT", 3, rch_quantity="2")
+        add("MANAGEMENT_DOCUMENT", 4, rch_quantity="3", correlation_id=second_correlation)
+        add("COMMERCIAL_DOCUMENT", 5, rch_quantity="3", correlation_id=second_correlation)
+        add("KITCHEN_ORDER", 5, covers=0, correlation_id=second_correlation)
+        add("KITCHEN_ORDER", 6, covers=2, correlation_id=third_correlation)
+        add("KITCHEN_ORDER", 7, covers=3, correlation_id=third_correlation)
+        unlinked_id, _ = add("KITCHEN_ORDER", 8, covers=4)
+        unlinked_rch_id, _ = add("MANAGEMENT_DOCUMENT", 9, rch_quantity="1")
+        oversized_id, _ = add("KITCHEN_ORDER", 9, covers=1001)
+        zero_id, _ = add("KITCHEN_ORDER", 9, covers=0)
+        add("KITCHEN_ORDER", 10, covers=2, correlation_id=fourth_correlation)
+        add("MANAGEMENT_DOCUMENT", 11, rch_quantity="3", correlation_id=fourth_correlation)
+        session.flush()
+        for document_id in (unlinked_id, unlinked_rch_id, oversized_id, zero_id):
+            member = session.get(DocumentCorrelationMember, (ids["correlation"], document_id))
+            assert member is not None
+            session.delete(member)
+        session.add(DocumentVersion(
+            document_id=first_id, parser_version_id=ids["parser"],
+            raw_payload_id=ids["raw"], version_sequence=0,
+            document_type="KITCHEN_ORDER", subtype="KITCHEN_ORDER",
+            status="COMPLETE", normalized_text="Vecchia interpretazione sintetica",
+            parse_confidence=85, evidence_level="CONFIRMED",
+            source_manifest_sha256="a" * 64, source_payload_sha256="9" * 64,
+            source_path="/spool/old-synthetic.raw", complete=True,
+            raw_metadata={"covers": 900},
+            chain_scope=f"document:old:{first_id}", chain_sequence=1,
+            previous_record_hash="0" * 64, record_hash="8" * 64,
+        ))
+
+    repository = SqlAlchemyApiRepository(factory)
+    full = repository.dashboard()
+    assert (
+        full.observed_covers,
+        full.covers_counted_episodes,
+        full.covers_ambiguous_episodes,
+        full.covers_source_disagreements,
+        full.covers_unlinked_documents,
+        full.covers_unlinked_observations,
+    ) == (7, 3, 1, 1, 2, 5)
+    first = repository.dashboard(filters={
+        "from": NOW + timedelta(minutes=1), "to": NOW + timedelta(minutes=2),
+    })
+    assert (first.observed_covers, first.covers_counted_episodes) == (2, 1)
+    second = repository.dashboard(filters={
+        "from": NOW + timedelta(minutes=4), "to": NOW + timedelta(minutes=5),
+    })
+    assert (second.observed_covers, second.covers_counted_episodes) == (3, 1)
+    outside = repository.dashboard(filters={
+        "from": NOW + timedelta(minutes=8), "to": NOW + timedelta(minutes=9),
+    })
+    assert outside.observed_covers == 0
+    assert (outside.covers_unlinked_documents, outside.covers_unlinked_observations) == (1, 4)
     engine.dispose()
 
 

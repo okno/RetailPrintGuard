@@ -5,6 +5,22 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.5.11] — 2026-11-24
+
+### Added
+
+- La dashboard mostra i coperti osservati nel periodo, contando ogni vendita
+  correlata una sola volta. Usa il numero esplicito POS e, in sua assenza, la
+  quantità `Coperto` sul documento RCH completo. Ristampe, documenti incompleti
+  e prove non correlate restano fuori dal totale; le incertezze sono visibili.
+
+### Fixed
+
+- La rivalutazione delle regole antifrode archivia con evidenza e cronologia le
+  vecchie segnalazioni aperte sulla stessa correlazione. Gli sconti di subtotale
+  Epson interpretati come articoli negativi vengono riclassificati solo quando
+  la prova corrente conferma che sono sconti riconciliati.
+
 ## [0.5.10] — 2026-11-24
 
 ### Fixed

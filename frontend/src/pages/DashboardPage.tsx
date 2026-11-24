@@ -6,6 +6,7 @@ import {
   DevicesOutlined,
   EuroOutlined,
   HistoryOutlined,
+  GroupsOutlined,
   LocalCafeOutlined,
   LocalPizzaOutlined,
   PercentOutlined,
@@ -123,6 +124,14 @@ export function DashboardPage() {
   const incompleteJobs = data.incomplete_jobs ?? diagnostics.data?.incomplete_jobs ?? 0
   const archivedKnown = data.false_positive_alerts !== undefined || data.justified_alerts !== undefined
   const archived = (data.false_positive_alerts ?? 0) + (data.justified_alerts ?? 0)
+  const coversHelper = data.observed_covers === undefined
+    ? 'Conteggio non ancora disponibile'
+    : [
+      `${data.covers_counted_episodes ?? 0} episodi contati una volta`,
+      data.covers_ambiguous_episodes ? `${data.covers_ambiguous_episodes} episodi ambigui esclusi` : null,
+      data.covers_source_disagreements ? `${data.covers_source_disagreements} discrepanze POS/RCH da verificare` : null,
+      data.covers_unlinked_documents ? `${data.covers_unlinked_documents} documenti non correlati esclusi (somma indicata ${data.covers_unlinked_observations ?? 0})` : null,
+    ].filter(Boolean).join(' · ')
   return (
     <>
       <PageHeader
@@ -151,6 +160,7 @@ export function DashboardPage() {
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Documenti completi" value={documentCount} helper={`${preBills} preconti completi nel periodo`} icon={<DescriptionOutlined />} to={routeWithPeriod('/documenti', period, { document_scope: 'complete' })} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Primo documento acquisito" value={data.first_document_captured_at ? shortDateTime.format(new Date(data.first_document_captured_at)) : 'Nessun documento'} helper="Data e ora di acquisizione · ora italiana" icon={<AccessTimeOutlined />} to={routeWithPeriod('/documenti', period, { document_scope: 'all' })} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ultimo documento acquisito" value={data.last_document_captured_at ? shortDateTime.format(new Date(data.last_document_captured_at)) : 'Nessun documento'} helper="Data e ora di acquisizione · ora italiana" icon={<UpdateOutlined />} to={routeWithPeriod('/documenti', period, { document_scope: 'all' })} /></Grid>
+        <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Coperti osservati" value={data.observed_covers ?? '—'} helper={coversHelper} icon={<GroupsOutlined />} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Segnalazioni operative" value={operationalAlerts} helper={`${data.critical_alerts} critiche; consultazione di supporto`} icon={<ShieldOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'operational' })} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Episodi con possibile ammanco" value={reductionEpisodes} helper="una vendita conta una sola volta" icon={<PriceChangeOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ammanco potenziale totale" value={euros.format(Number(economicDifference))} helper="somma unica degli episodi del periodo" icon={<EuroOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>

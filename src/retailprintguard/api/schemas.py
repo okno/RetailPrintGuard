@@ -80,6 +80,12 @@ class DeviceView(BaseModel):
 
 class DashboardView(BaseModel):
     documents: int = 0
+    observed_covers: int = 0
+    covers_counted_episodes: int = 0
+    covers_ambiguous_episodes: int = 0
+    covers_source_disagreements: int = 0
+    covers_unlinked_documents: int = 0
+    covers_unlinked_observations: int = 0
     orders: int = 0
     pre_bills: int = 0
     management_documents: int = 0
