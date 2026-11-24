@@ -5,6 +5,13 @@ la struttura di Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.5.9] — 2026-11-24
+
+### Fixed
+
+- La rivalutazione antifrode gestisce le righe storiche prive di descrizione,
+  ammesse dal modello dei documenti, senza interrompere il ricalcolo.
+
 ## [0.5.8] — 2026-11-24
 
 ### Added

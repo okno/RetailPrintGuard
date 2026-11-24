@@ -281,9 +281,11 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
-def technical_non_sale_line(description: str) -> bool:
+def technical_non_sale_line(description: str | None) -> bool:
     """Identify fiscal/payment projection rows that are not sold articles."""
 
+    if not description:
+        return False
     normalized = " ".join(
         "".join(
             character if character.isalnum() else " " for character in description.upper()

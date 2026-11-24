@@ -111,6 +111,30 @@ def _document(
     )
 
 
+def test_zero_value_line_without_description_does_not_abort_fraud_run() -> None:
+    document = _document(
+        "synthetic-undescribed-zero-line",
+        DocumentType.PRE_BILL,
+        "0.00",
+        (
+            DocumentLine(
+                sequence=1,
+                quantity=Decimal("1"),
+                unit_price=Decimal("0"),
+                line_total=Decimal("0"),
+            ),
+        ),
+        minute=0,
+        device="rch_synthetic",
+        external_code=None,
+    )
+    transaction = CorrelationEngine().correlate((document,))[0]
+    findings = FraudEngine().evaluate(
+        FraudContext(transaction=transaction, evaluated_at=BASE_TIME + timedelta(hours=1))
+    )
+    assert "NEGATIVE_OR_ZERO_VALUE_ITEM" in {finding.rule_code for finding in findings}
+
+
 def test_printed_management_subtotal_discount_above_90_percent_is_alerted() -> None:
     def receipt(name: str, products: tuple[str, ...], discount: str, total: str):
         basis = sum((Decimal(item) for item in products), Decimal("0.00"))
