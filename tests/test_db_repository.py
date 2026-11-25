@@ -1743,6 +1743,7 @@ def test_dashboard_traffic_trend_counts_takeaway_orders_once_per_episode_and_dep
                 minute=minute, raw_metadata={"covers": covers} if covers is not None else {},
                 line_total="5.00", correlation_id=correlation_id,
             )
+            session.flush()
             document = session.get(Document, document_id)
             version = session.get(DocumentVersion, version_id)
             line = session.scalar(select(DocumentLine).where(
