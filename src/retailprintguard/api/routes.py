@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -40,6 +41,7 @@ from retailprintguard.api.schemas import (
     AlertUpdate,
     AlertView,
     AuditEntry,
+    DashboardTrafficTrend,
     DashboardView,
     DeviceView,
     DiagnosticsView,
@@ -500,6 +502,28 @@ def create_router(context: ApiContext) -> APIRouter:
         if counts is None:
             return result
         return result.model_copy(update={"devices_online": counts[0], "devices_offline": counts[1]})
+
+    @router.get(
+        "/dashboard/traffic-trend",
+        response_model=DashboardTrafficTrend,
+        tags=["dashboard"],
+    )
+    def dashboard_traffic_trend(
+        _: AnyUser,
+        repo: Annotated[ApiRepository, Depends(repository)],
+        period_from: Annotated[datetime | None, Query(alias="from")] = None,
+        period_to: Annotated[datetime | None, Query(alias="to")] = None,
+        timezone: Annotated[str, Query(min_length=1, max_length=64)] = "Europe/Rome",
+    ) -> DashboardTrafficTrend:
+        normalized_from, normalized_to = _utc_period(period_from, period_to)
+        try:
+            ZoneInfo(timezone)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail="Fuso orario non valido") from exc
+        return repo.dashboard_traffic_trend(
+            filters={"from": normalized_from, "to": normalized_to},
+            timezone=timezone,
+        )
 
     @router.get("/discounts", response_model=DiscountPage, tags=["documents"])
     def discounts(

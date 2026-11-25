@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 from sqlalchemy import JSON, Select, and_, case, func, or_, select, text
@@ -43,6 +44,9 @@ from retailprintguard.api.schemas import (
     AlertUpdate,
     AlertView,
     AuditEntry,
+    DashboardTakeawayCounts,
+    DashboardTrafficBucket,
+    DashboardTrafficTrend,
     DashboardView,
     DeviceView,
     DiagnosticsView,
@@ -718,6 +722,7 @@ def _dashboard_observed_covers(
     *,
     occurrence: Any,
     filters: dict[str, Any],
+    counted_points: list[tuple[datetime, int]] | None = None,
 ) -> tuple[int, int, int, int, int, int]:
     """Count an explicit cover figure once per current correlated sale.
 
@@ -863,6 +868,13 @@ def _dashboard_observed_covers(
             source_disagreements += 1
         total += chosen
         counted += 1
+        if counted_points is not None:
+            counted_points.append((first, chosen))
+
+    if counted_points is not None:
+        # The trend needs only counted correlated sales, never the separate
+        # diagnostic sum of unlinked documents.  Skip that second full scan.
+        return total, counted, ambiguous, source_disagreements, 0, 0
 
     # Preserve visibility of explicit POS and RCH observations that current
     # correlations cannot assign to a unique sale. Their raw sum is diagnostic
@@ -993,6 +1005,214 @@ def _dashboard_sales_department_quantities(
         normalized = quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
         result[str(name)][str(mode)] = normalized
     return result
+
+
+def _dashboard_takeaway_order_points(
+    session: Session,
+    *,
+    occurrence: Any,
+) -> list[tuple[datetime, str]]:
+    """Return one takeaway order per current sale episode and department.
+
+    Only complete latest POS sale projections with an explicit printed
+    ``Ordine`` and no ``Tavolo`` can contribute.  Signed active product
+    quantities must leave a positive net amount in that department.  Mixed
+    table/order evidence or membership in multiple current episodes is
+    ambiguous and excluded.  The printed order number itself is never a
+    deduplication key: the correlation episode is the identity.
+    """
+
+    semantic_type = _version_column(DocumentVersion.document_type, Document.document_type)
+    order_code = _version_column(DocumentVersion.order_code, Document.order_code)
+    table_code = _version_column(DocumentVersion.table_code, Document.table_code)
+    rows = session.execute(
+        select(
+            occurrence.c.transaction_id,
+            Document.id,
+            Document.captured_at,
+            func.upper(func.trim(Device.department)),
+            order_code,
+            table_code,
+            DocumentLine.id,
+            DocumentLine.quantity,
+            DocumentLine.description,
+            DocumentLine.raw_text,
+            DocumentLine.cancelled,
+            DocumentLine.removed,
+        )
+        .select_from(occurrence)
+        .join(
+            DocumentCorrelationMember,
+            DocumentCorrelationMember.correlation_id == occurrence.c.correlation_id,
+        )
+        .join(Document, Document.id == DocumentCorrelationMember.document_id)
+        .join(Device, Device.id == Document.device_id)
+        .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+        .join(ParserVersion, ParserVersion.id == DocumentVersion.parser_version_id)
+        .outerjoin(DocumentLine, DocumentLine.document_version_id == DocumentVersion.id)
+        .where(
+            DocumentVersion.id == _latest_version_id(),
+            DocumentVersion.complete.is_(True),
+            ParserVersion.name == "retailprintguard-escpos",
+            semantic_type.in_(DASHBOARD_POS_SALE_TYPES),
+            func.upper(func.trim(Device.department)).in_(DASHBOARD_SALES_DEPARTMENTS),
+        )
+    )
+    documents: dict[UUID, dict[str, Any]] = {}
+    for (
+        transaction_id, document_id, captured_at, department, printed_order,
+        printed_table, line_id, quantity, description, raw_text, cancelled, removed,
+    ) in rows:
+        entry = documents.setdefault(document_id, {
+            "transaction_ids": set(),
+            "captured_at": captured_at,
+            "department": str(department),
+            "mode": classify_service_mode(
+                order_code=printed_order, table_code=printed_table,
+            ).mode,
+            "conflicting_markers": bool(
+                printed_order and str(printed_order).strip()
+                and printed_table and str(printed_table).strip()
+            ),
+            "line_ids": set(),
+            "net_quantity": MONEY_ZERO,
+            "positive_product": False,
+        })
+        entry["transaction_ids"].add(transaction_id)
+        if line_id is None or line_id in entry["line_ids"]:
+            continue
+        entry["line_ids"].add(line_id)
+        label = (description or raw_text or "").strip()
+        normalized_label = " ".join(label.upper().split())
+        if (
+            not label or quantity is None or quantity == MONEY_ZERO
+            or cancelled or removed
+            or _dashboard_technical_sale_line(label)
+            or re.match(r"^(?:COPERTO|COPERTI|SCONTI?|SUBTOTALE)\b", normalized_label)
+        ):
+            continue
+        value = quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
+        entry["net_quantity"] += value
+        if value > MONEY_ZERO:
+            entry["positive_product"] = True
+
+    episodes: dict[UUID, dict[str, Any]] = {}
+    for entry in documents.values():
+        for transaction_id in entry["transaction_ids"]:
+            episode = episodes.setdefault(transaction_id, {
+                "modes": set(),
+                "ambiguous": False,
+                "departments": {},
+            })
+            if len(entry["transaction_ids"]) != 1 or entry["conflicting_markers"]:
+                episode["ambiguous"] = True
+            if entry["mode"] != "UNDETERMINED":
+                episode["modes"].add(entry["mode"])
+            if entry["mode"] != "TAKEAWAY":
+                continue
+            department = entry["department"]
+            department_entry = episode["departments"].setdefault(department, {
+                "net_quantity": MONEY_ZERO,
+                "first_captured_at": None,
+            })
+            department_entry["net_quantity"] += entry["net_quantity"]
+            if entry["positive_product"]:
+                first = department_entry["first_captured_at"]
+                captured_at = entry["captured_at"]
+                if first is None or captured_at < first:
+                    department_entry["first_captured_at"] = captured_at
+
+    result: list[tuple[datetime, str]] = []
+    for episode in episodes.values():
+        if episode["ambiguous"] or episode["modes"] != {"TAKEAWAY"}:
+            continue
+        for department, entry in episode["departments"].items():
+            if entry["net_quantity"] > MONEY_ZERO and entry["first_captured_at"] is not None:
+                result.append((entry["first_captured_at"], department))
+    return result
+
+
+def _dashboard_traffic_bucket_key(
+    captured_at: datetime, *, granularity: str, timezone: ZoneInfo,
+) -> datetime:
+    utc = captured_at.astimezone(UTC)
+    if granularity == "hour":
+        return utc.replace(minute=0, second=0, microsecond=0)
+    local_date = utc.astimezone(timezone).date()
+    return datetime(local_date.year, local_date.month, local_date.day,
+                    tzinfo=timezone).astimezone(UTC)
+
+
+def _dashboard_traffic_buckets(
+    *,
+    filters: dict[str, Any],
+    timezone: ZoneInfo,
+    cover_points: list[tuple[datetime, int]],
+    takeaway_points: list[tuple[datetime, str]],
+) -> tuple[str, list[DashboardTrafficBucket], bool]:
+    timestamps = [point[0] for point in cover_points]
+    timestamps.extend(point[0] for point in takeaway_points)
+    lower = filters.get("from") or (min(timestamps) if timestamps else None)
+    upper = filters.get("to") or (max(timestamps) + timedelta(microseconds=1)
+                                  if timestamps else None)
+    if lower is None or upper is None or upper <= lower:
+        return "day", [], True
+    granularity = "hour" if upper - lower <= timedelta(hours=48) else "day"
+    first = _dashboard_traffic_bucket_key(lower, granularity=granularity, timezone=timezone)
+    last = _dashboard_traffic_bucket_key(
+        upper - timedelta(microseconds=1), granularity=granularity, timezone=timezone,
+    )
+    if granularity == "hour":
+        bucket_count = int((last - first).total_seconds() // 3600) + 1
+    else:
+        bucket_count = (last.astimezone(timezone).date()
+                        - first.astimezone(timezone).date()).days + 1
+    # A pathological custom period cannot force an unbounded zero-filled
+    # response.  Sparse mode still includes every observed bucket and signals
+    # the omission of empty intervals explicitly.
+    zero_filled = bucket_count <= 20_000
+    keys: set[datetime] = set()
+    if zero_filled:
+        if granularity == "hour":
+            keys.update(first + timedelta(hours=offset) for offset in range(bucket_count))
+        else:
+            first_date = first.astimezone(timezone).date()
+            for offset in range(bucket_count):
+                day = first_date + timedelta(days=offset)
+                keys.add(datetime(day.year, day.month, day.day,
+                                  tzinfo=timezone).astimezone(UTC))
+    counts: dict[datetime, dict[str, Any]] = {}
+
+    def bucket(key: datetime) -> dict[str, Any]:
+        keys.add(key)
+        return counts.setdefault(key, {
+            "covers": 0,
+            "takeaways": {name: 0 for name in DASHBOARD_SALES_DEPARTMENTS},
+        })
+
+    for captured_at, covers in cover_points:
+        key = _dashboard_traffic_bucket_key(
+            captured_at, granularity=granularity, timezone=timezone,
+        )
+        bucket(key)["covers"] += covers
+    for captured_at, department in takeaway_points:
+        key = _dashboard_traffic_bucket_key(
+            captured_at, granularity=granularity, timezone=timezone,
+        )
+        bucket(key)["takeaways"][department] += 1
+    result = [
+        DashboardTrafficBucket(
+            start=key.astimezone(timezone),
+            covers=counts.get(key, {}).get("covers", 0),
+            takeaways=DashboardTakeawayCounts(**{
+                "bar": counts.get(key, {}).get("takeaways", {}).get("BAR", 0),
+                "kitchen": counts.get(key, {}).get("takeaways", {}).get("CUCINA", 0),
+                "pizzeria": counts.get(key, {}).get("takeaways", {}).get("PIZZERIA", 0),
+            }),
+        )
+        for key in sorted(keys)
+    ]
+    return granularity, result, zero_filled
 
 
 def _employee_discount_adjustments(
@@ -1695,6 +1915,54 @@ class SqlAlchemyApiRepository:
                 roles=tuple(roles),
                 active=user.active,
             )
+
+    def dashboard_traffic_trend(
+        self, *, filters: dict[str, Any] | None = None, timezone: str = "Europe/Rome",
+    ) -> DashboardTrafficTrend:
+        filters = filters or {}
+        zone = ZoneInfo(timezone)
+        with self._snapshot_read() as session:
+            occurrence = _latest_transaction_occurrences()
+            cover_points: list[tuple[datetime, int]] = []
+            covers_total, _, _, _, _, _ = _dashboard_observed_covers(
+                session,
+                occurrence=occurrence,
+                filters=filters,
+                counted_points=cover_points,
+            )
+            takeaway_points = [
+                (captured_at, department)
+                for captured_at, department in _dashboard_takeaway_order_points(
+                    session, occurrence=occurrence,
+                )
+                if (filters.get("from") is None or captured_at >= filters["from"])
+                and (filters.get("to") is None or captured_at < filters["to"])
+            ]
+        granularity, buckets, zero_filled = _dashboard_traffic_buckets(
+            filters=filters,
+            timezone=zone,
+            cover_points=cover_points,
+            takeaway_points=takeaway_points,
+        )
+        takeaway_totals = {
+            department: sum(
+                point_department == department
+                for _, point_department in takeaway_points
+            )
+            for department in DASHBOARD_SALES_DEPARTMENTS
+        }
+        return DashboardTrafficTrend(
+            granularity=granularity,
+            timezone=timezone,
+            buckets=buckets,
+            covers_total=covers_total,
+            takeaways_total=DashboardTakeawayCounts(
+                bar=takeaway_totals["BAR"],
+                kitchen=takeaway_totals["CUCINA"],
+                pizzeria=takeaway_totals["PIZZERIA"],
+            ),
+            zero_filled=zero_filled,
+        )
 
     def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView:
         filters = filters or {}

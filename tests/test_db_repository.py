@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import func, select
@@ -51,6 +52,7 @@ from retailprintguard.db.models import StreamChunk as StoredChunk
 from retailprintguard.db.repository import (
     SqlAlchemyApiRepository,
     SqlAlchemyIngestionRepository,
+    _dashboard_traffic_buckets,
     _employee_discount_30_label,
     _validated_management_employee_discount_total,
 )
@@ -1697,6 +1699,138 @@ def test_dashboard_covers_count_each_sale_once_with_rch_fallback_and_periods() -
     assert outside.observed_covers == 0
     assert (outside.covers_unlinked_documents, outside.covers_unlinked_observations) == (1, 4)
     engine.dispose()
+
+
+def test_dashboard_traffic_trend_counts_takeaway_orders_once_per_episode_and_department() -> None:
+    engine, factory = _factory()
+    ids = _seed_api(factory)
+    kitchen_device, pizzeria_device = uuid4(), uuid4()
+    cancellation_correlation, dine_in_correlation = uuid4(), uuid4()
+    with factory.begin() as session:
+        parser = session.get(ParserVersion, ids["parser"])
+        assert parser is not None
+        parser.name = "retailprintguard-escpos"
+        for device_id, department, index in (
+            (kitchen_device, "Cucina", 2),
+            (pizzeria_device, "Pizzeria", 3),
+        ):
+            session.add(Device(
+                id=device_id, external_id=f"pos_{index}", name=f"POS {department}",
+                device_type="pos", parser_kind="escpos",
+                mac_address=f"02:00:00:00:01:0{index}",
+                department=department, role=f"comande_{department.lower()}",
+                listen_ip="192.0.2.10", listen_port=9100 + index,
+                target_ip="192.0.2.20", target_port=9100 + index,
+            ))
+        for correlation_id, fingerprint in (
+            (cancellation_correlation, "2" * 64),
+            (dine_in_correlation, "3" * 64),
+        ):
+            session.add(DocumentCorrelation(
+                id=correlation_id, transaction_id=uuid4(),
+                algorithm_version="test-1", input_fingerprint=fingerprint,
+                score=95, explanation="Vendita sintetica distinta",
+            ))
+        session.flush()
+
+        def add_sale(
+            *, minute: int, department_device, correlation_id,
+            mode: str, quantity: str, covers: int | None = None,
+            kind: str = "KITCHEN_ORDER",
+        ) -> None:
+            document_id, version_id = _add_correlated_document(
+                session, ids, document_type=kind, total=None, complete=True,
+                minute=minute, raw_metadata={"covers": covers} if covers is not None else {},
+                line_total="5.00", correlation_id=correlation_id,
+            )
+            document = session.get(Document, document_id)
+            version = session.get(DocumentVersion, version_id)
+            line = session.scalar(select(DocumentLine).where(
+                DocumentLine.document_version_id == version_id,
+            ))
+            assert document is not None and version is not None and line is not None
+            document.device_id = department_device
+            document.order_code = version.order_code = "ORDER-TEST" if mode == "TAKEAWAY" else None
+            document.table_code = version.table_code = "TABLE-TEST" if mode == "DINE_IN" else None
+            line.quantity = Decimal(quantity)
+
+        add_sale(
+            minute=1, department_device=ids["device"],
+            correlation_id=ids["correlation"], mode="TAKEAWAY", quantity="1", covers=2,
+        )
+        add_sale(
+            minute=2, department_device=kitchen_device,
+            correlation_id=ids["correlation"], mode="TAKEAWAY", quantity="2",
+        )
+        add_sale(
+            minute=3, department_device=ids["device"],
+            correlation_id=ids["correlation"], mode="TAKEAWAY", quantity="1",
+            kind="ORDER_CHANGE",
+        )
+        add_sale(
+            minute=65, department_device=ids["device"],
+            correlation_id=cancellation_correlation, mode="TAKEAWAY", quantity="1",
+        )
+        add_sale(
+            minute=66, department_device=ids["device"],
+            correlation_id=cancellation_correlation, mode="TAKEAWAY", quantity="-1",
+            kind="ORDER_CHANGE",
+        )
+        add_sale(
+            minute=125, department_device=pizzeria_device,
+            correlation_id=dine_in_correlation, mode="DINE_IN", quantity="1", covers=3,
+        )
+
+    repository = SqlAlchemyApiRepository(factory)
+    filters = {"from": NOW, "to": NOW + timedelta(hours=3)}
+    trend = repository.dashboard_traffic_trend(filters=filters, timezone="Europe/Rome")
+    assert trend.granularity == "hour"
+    assert trend.covers_total == repository.dashboard(filters=filters).observed_covers == 5
+    assert trend.takeaways_total.model_dump() == {"bar": 1, "kitchen": 1, "pizzeria": 0}
+    assert sum(bucket.covers for bucket in trend.buckets) == 5
+    assert [bucket.covers for bucket in trend.buckets] == [2, 0, 3]
+    assert sum(bucket.takeaways.bar for bucket in trend.buckets) == 1
+    assert sum(bucket.takeaways.kitchen for bucket in trend.buckets) == 1
+    engine.dispose()
+
+
+def test_dashboard_traffic_buckets_distinguish_repeated_local_dst_hour() -> None:
+    zone = ZoneInfo("Europe/Rome")
+    first = datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
+    second = datetime(2026, 10, 25, 1, 30, tzinfo=UTC)
+    granularity, buckets, zero_filled = _dashboard_traffic_buckets(
+        filters={"from": datetime(2026, 10, 25, 0, tzinfo=UTC),
+                 "to": datetime(2026, 10, 25, 3, tzinfo=UTC)},
+        timezone=zone,
+        cover_points=[(first, 2), (second, 3)],
+        takeaway_points=[(second, "BAR")],
+    )
+    assert granularity == "hour" and zero_filled
+    assert [bucket.start.hour for bucket in buckets] == [2, 2, 3]
+    assert [bucket.start.utcoffset() for bucket in buckets[:2]] == [
+        timedelta(hours=2), timedelta(hours=1),
+    ]
+    assert [bucket.covers for bucket in buckets] == [2, 3, 0]
+    assert [bucket.takeaways.bar for bucket in buckets] == [0, 1, 0]
+
+
+def test_dashboard_traffic_buckets_all_history_fills_days_without_losing_totals() -> None:
+    first = datetime(2026, 11, 20, 9, tzinfo=UTC)
+    last = datetime(2026, 11, 23, 10, tzinfo=UTC)
+    granularity, buckets, zero_filled = _dashboard_traffic_buckets(
+        filters={},
+        timezone=ZoneInfo("Europe/Rome"),
+        cover_points=[(first, 2), (last, 3)],
+        takeaway_points=[(first, "BAR"), (last, "PIZZERIA")],
+    )
+    assert granularity == "day" and zero_filled
+    assert [bucket.start.date().isoformat() for bucket in buckets] == [
+        "2026-11-20", "2026-11-21", "2026-11-22", "2026-11-23",
+    ]
+    assert [bucket.covers for bucket in buckets] == [2, 0, 0, 3]
+    assert sum(bucket.covers for bucket in buckets) == 5
+    assert sum(bucket.takeaways.bar for bucket in buckets) == 1
+    assert sum(bucket.takeaways.pizzeria for bucket in buckets) == 1
 
 
 def test_transaction_reduction_drilldown_requires_closure_and_operational_economic_alert() -> None:

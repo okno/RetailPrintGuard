@@ -144,6 +144,21 @@ export interface Dashboard {
   anomaly_concentration: Array<Record<string, unknown>>
 }
 
+export interface DashboardTrafficTrendBucket {
+  start: string
+  covers: number
+  takeaways: { bar: number; kitchen: number; pizzeria: number }
+}
+
+export interface DashboardTrafficTrend {
+  granularity: 'hour' | 'day'
+  timezone: string
+  zero_filled: boolean
+  buckets: DashboardTrafficTrendBucket[]
+  covers_total: number
+  takeaways_total: { bar: number; kitchen: number; pizzeria: number }
+}
+
 export interface Device {
   id: string
   name: string

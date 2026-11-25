@@ -11,6 +11,7 @@ from retailprintguard.api.schemas import (
     AlertUpdate,
     AlertView,
     AuditEntry,
+    DashboardTrafficTrend,
     DashboardView,
     DeviceView,
     DiagnosticsView,
@@ -46,6 +47,10 @@ class ApiRepository(Protocol):
     def authenticate(self, username: str, password: str) -> UserPrincipal | None: ...
 
     def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView: ...
+
+    def dashboard_traffic_trend(
+        self, *, filters: dict[str, Any] | None = None, timezone: str = "Europe/Rome"
+    ) -> DashboardTrafficTrend: ...
 
     def list_discounts(
         self, *, limit: int, offset: int, filters: dict[str, Any]
@@ -144,6 +149,12 @@ class EmptyRepository:
     def dashboard(self, *, filters: dict[str, Any] | None = None) -> DashboardView:
         del filters
         return DashboardView()
+
+    def dashboard_traffic_trend(
+        self, *, filters: dict[str, Any] | None = None, timezone: str = "Europe/Rome"
+    ) -> DashboardTrafficTrend:
+        del filters
+        return DashboardTrafficTrend(timezone=timezone)
 
     def list_discounts(
         self, *, limit: int, offset: int, filters: dict[str, Any]

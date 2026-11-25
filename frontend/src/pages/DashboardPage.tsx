@@ -23,6 +23,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import { api, scopedQueryKey } from '../api/client'
 import { PageHeader } from '../components/PageHeader'
+import { DashboardTrafficTrendChart } from '../components/DashboardTrafficTrendChart'
 import { PeriodPicker } from '../components/PeriodPicker'
 import { StatCard } from '../components/StatCard'
 import { ErrorState, LoadingState } from '../components/State'
@@ -33,7 +34,7 @@ import { discountDrilldownPath, discountMoney } from '../discountPresentation'
 import { shortDateTime } from '../format'
 import { apiPeriodParams } from '../period'
 import { transactionDetailPath } from '../routes'
-import type { Dashboard, Device, Diagnostics, Page, Transaction } from '../types'
+import type { Dashboard, DashboardTrafficTrend, Device, Diagnostics, Page, Transaction } from '../types'
 
 const euros = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' })
 const quantities = new Intl.NumberFormat('it-IT', { maximumFractionDigits: 4 })
@@ -99,6 +100,10 @@ export function DashboardPage() {
   const dashboard = useQuery({
     queryKey: scopedQueryKey('dashboard', period.toString()),
     queryFn: () => api<Dashboard>(`/dashboard?${period.toString()}`),
+  })
+  const trafficTrend = useQuery({
+    queryKey: scopedQueryKey('dashboard', 'traffic-trend', period.toString()),
+    queryFn: () => api<DashboardTrafficTrend>(`/dashboard/traffic-trend?${period.toString()}`),
   })
   const episodeParams = operationalReductionQuery(period, { limit: 8, offset: 0 })
   const episodes = useQuery({
@@ -166,6 +171,11 @@ export function DashboardPage() {
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Ammanco potenziale totale" value={euros.format(Number(economicDifference))} helper="somma unica degli episodi del periodo" icon={<EuroOutlined />} tone={theme.palette.error.main} to={operationalReductionTransactionsPath(period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Incompleti da revisionare" value={incompleteJobs} helper="il RAW originale non viene eliminato" icon={<AssignmentLateOutlined />} tone={theme.palette.secondary.main} to={routeWithPeriod('/incompleti', period)} /></Grid>
         <Grid size={{ xs: 12, sm: 6, lg: 4 }}><StatCard label="Storico non operativo" value={archivedKnown ? archived : '—'} helper="falsi positivi e giustificati" icon={<HistoryOutlined />} tone={theme.palette.text.secondary} to={routeWithPeriod('/alert', period, { view: 'archive' })} /></Grid>
+        <Grid size={{ xs: 12 }} sx={{ mt: 1 }}>
+          {trafficTrend.isLoading ? <LoadingState label="Caricamento andamento coperti e asporti…" />
+            : trafficTrend.error || !trafficTrend.data ? <Alert severity="warning">Impossibile caricare il grafico dei coperti e degli asporti.</Alert>
+              : <DashboardTrafficTrendChart trend={trafficTrend.data} />}
+        </Grid>
         <Grid size={{ xs: 12 }} sx={{ mt: 1 }}>
           <Box>
             <Typography variant="h2">Quantità nelle comande per reparto</Typography>

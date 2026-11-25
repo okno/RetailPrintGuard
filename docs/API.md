@@ -8,7 +8,8 @@
 - autenticazione: `Authorization: Bearer <JWT>`;
 - correlation ID: header `X-Correlation-ID`, accettato solo se contiene 8–128
   caratteri sicuri; altrimenti viene generato un UUID;
-- timestamp: ISO 8601 UTC nell'API, conversione locale nella UI;
+- timestamp: ISO 8601 UTC nell'API, conversione locale nella UI; i bucket di
+  `/dashboard/traffic-trend` espongono l'offset del fuso richiesto;
 - intervalli temporali: `from` incluso e `to` escluso; entrambi devono includere
   un offset/fuso e vengono normalizzati in UTC;
 - paginazione: oggetto `{items, total, limit, offset}`;
@@ -58,6 +59,7 @@ tramite il repository.
 | `POST /auth/login` | username/password | token e utente |
 | `GET /auth/me` | — | principal corrente |
 | `GET /dashboard` | `from`, `to` | contatori operativi, episodi, differenze, trend, stato |
+| `GET /dashboard/traffic-trend` | `from`, `to`, `timezone` (default `Europe/Rome`) | bucket orari o giornalieri di coperti globali e ordini da asporto per reparto |
 | `GET /devices` | — | device, ping ICMP fisico ogni 10 secondi e attività/spool |
 | `GET /sessions` | `limit`, `offset`, `device_id` | sessioni TCP |
 | `GET /jobs` | `limit`, `offset`, `device_id`, `status`, `incomplete`, `review_state`, `from`, `to` | job cattura/import/revisione |
@@ -105,6 +107,18 @@ viene chiamato direttamente senza filtri. Il drill-down economico usa
 `operational_economic_only=true`, `reduction_only=true` e una differenza minima
 positiva: include soltanto episodi chiusi con un alert economico operativo,
 preservando `from` e `to` della card selezionata.
+
+Il trend usa bucket orari per intervalli fino a 48 ore, giornalieri per quelli
+più lunghi. Il raggruppamento giornaliero segue il calendario del fuso richiesto;
+i bucket orari sono identificati dall'istante UTC e riportano l'offset locale,
+così le due ore ripetute al cambio d'ora restano distinte. I coperti conservano
+la stessa deduplicazione per vendita della card `observed_covers` e sono una
+serie globale: non esiste un'attribuzione contabile dei coperti ai reparti.
+Gli asporti sono vendite correlate con quantità netta positiva e riferimento
+stampato `Ordine`, contate una volta per ciascun reparto BAR, CUCINA o PIZZERIA
+coinvolto. Un ordine presente in più reparti appare in più serie; i totali di
+reparto non sono un totale unico del locale. `zero_filled` indica se gli
+intervalli senza osservazioni sono inclusi nella risposta.
 
 I documenti distinguono `external_document_code` (progressivo proprio completo
 osservato), `external_document_code_suffix` (solo suffisso RCH),

@@ -137,6 +137,27 @@ class DashboardView(BaseModel):
     available_data_to: datetime | None = None
 
 
+class DashboardTakeawayCounts(BaseModel):
+    bar: int = 0
+    kitchen: int = 0
+    pizzeria: int = 0
+
+
+class DashboardTrafficBucket(BaseModel):
+    start: datetime
+    covers: int = 0
+    takeaways: DashboardTakeawayCounts = Field(default_factory=DashboardTakeawayCounts)
+
+
+class DashboardTrafficTrend(BaseModel):
+    granularity: Literal["hour", "day"] = "day"
+    timezone: str = "Europe/Rome"
+    buckets: list[DashboardTrafficBucket] = Field(default_factory=list)
+    covers_total: int = 0
+    takeaways_total: DashboardTakeawayCounts = Field(default_factory=DashboardTakeawayCounts)
+    zero_filled: bool = True
+
+
 class SessionView(BaseModel):
     id: UUID
     device_id: str
